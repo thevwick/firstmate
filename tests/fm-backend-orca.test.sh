@@ -197,6 +197,20 @@ test_composer_state_popup_placeholder_fill_is_pending() {
   pass "fm_backend_orca_composer_state: a slash-command popup's argument-hint placeholder still reads pending"
 }
 
+# Dead-shell injection safety (task fm-composer-shellglyph-safety): a pane whose
+# agent has exited to a bare login shell has no bordered composer row, so the
+# classifier finds nothing and reports `unknown` - NOT a safe (empty) injection
+# target. Covers the same guarantee herdr/cmux/tmux tests pin for their backends.
+test_composer_state_bare_shell_prompt_is_unknown() {
+  local out
+  orca_case composer-bare-shell
+  printf '{"ok":true,"result":{"terminal":{"tail":["some earlier output","kunchen@mac firstmate $ "]}}}\n' > "$RESP/1.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    bash -c '. "$0/bin/backends/orca.sh"; fm_backend_orca_composer_state term-123' "$ROOT" )
+  [ "$out" = unknown ] || fail "a bare dead-shell prompt (no bordered composer row) must read unknown, got '$out'"
+  pass "fm_backend_orca_composer_state: a bare dead-shell prompt reads unknown (unsafe-for-injection), never empty"
+}
+
 test_send_text_submit_popup_autocomplete_requires_second_enter() {
   local out log_text enter_count
   orca_case send-submit-popup-autocomplete
@@ -1267,6 +1281,7 @@ test_send_text_submit_verifies_empty_composer_after_enter
 test_send_text_submit_keeps_current_tail_when_limited
 test_send_text_submit_retries_when_composer_stays_pending
 test_composer_state_popup_placeholder_fill_is_pending
+test_composer_state_bare_shell_prompt_is_unknown
 test_send_text_submit_popup_autocomplete_requires_second_enter
 test_send_literal_constructs_non_enter_send
 test_send_text_submit_reports_send_failed
