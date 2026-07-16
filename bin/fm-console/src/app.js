@@ -2,11 +2,22 @@
 // so the package syncs as plain source with no build/transpile step, matching
 // the rest of firstmate's bin/ tooling.
 //
+// Layout, top to bottom, designed to fill the whole terminal:
+//   1. Title bar - "FIRSTMATE" branding + the operating home.
+//   2. Status strip - one compact line: disk, watcher dot, afk, in-flight,
+//      queued/blocked counts. No prose here, ever.
+//   3. Board - fills all remaining height. IN FLIGHT, QUEUED, RECENT DONE.
+//      When IN FLIGHT is empty the other two sections expand to fill the
+//      space instead of leaving a void.
+//   4. Footer - one line, only present when something needs a warning
+//      (watcher down, bridge disabled, a snapshot read error).
+//   5. Input line - pinned at the bottom.
+//
 // Responsibilities: poll firstmate state on REFRESH_INTERVAL_MS and redraw;
 // recompute per-worktree du on the slower DU_INTERVAL_MS without blocking a
-// redraw; render the header, the grouped cards, and the command input line;
-// route composed/typed commands to the primary session via the bridge. All
-// approval gates stay with firstmate - the input only DELIVERS text.
+// redraw; route composed/typed commands to the primary session via the
+// bridge. All approval gates stay with firstmate - the input only DELIVERS
+// text.
 
 import React from 'react';
 import { Box, Text, useApp, useInput, useStdout } from 'ink';
@@ -17,11 +28,17 @@ import {
   DATA_VOLUME,
   GROUP_ORDER,
   GROUP_LABELS,
+  RECENT_DONE_LIMIT,
+  MIN_ROWS_FOR_FULL_LAYOUT,
+  MIN_COLS_FOR_FULL_LAYOUT,
 } from './constants.js';
 import {
   buildCard,
   buildHeader,
-  groupCards,
+  boardSections,
+  queuedBacklogRecords,
+  recentDoneBacklogRecords,
+  computeRowBudget,
 } from './state.js';
 import {
   QUICK_ACTIONS,
@@ -52,115 +69,215 @@ const GROUP_COLORS = {
   done: 'gray',
 };
 
+const BRAND = 'magentaBright';
+
 function nowSecs() {
   return Math.floor(Date.now() / 1000);
 }
 
-// Header line: disk, watcher, afk, backlog counts.
-function Header({ header, home, supervisor }) {
+// Title bar: brand + operating home. One line, never wraps content below it.
+function TitleBar({ home, width }) {
+  return h(
+    Box,
+    { justifyContent: 'space-between', paddingX: 1 },
+    h(
+      Box,
+      null,
+      h(Text, { bold: true, color: BRAND }, '⚓ FIRSTMATE'),
+      h(Text, { dimColor: true }, '  control console')
+    ),
+    h(Text, { dimColor: true }, truncate(home, Math.max(10, width - 34)))
+  );
+}
+
+// Compact single-line status strip: disk, watcher dot, afk, in-flight,
+// queued/blocked. This replaces the old multi-line header prose entirely -
+// nothing here should ever grow past one line.
+function StatusStrip({ header }) {
   const diskText =
     header.diskFree == null
       ? 'disk ?'
       : `disk ${humanBytes(header.diskFree)} free${
-          header.diskUsePct == null ? '' : ` (${header.diskUsePct}% used)`
+          header.diskUsePct == null ? '' : ` (${header.diskUsePct}%)`
         }`;
-  const diskColor =
-    header.diskUsePct != null && header.diskUsePct >= 90 ? 'red' : 'white';
-  return h(
-    Box,
-    { flexDirection: 'column' },
-    h(
-      Box,
-      { justifyContent: 'space-between' },
-      h(
-        Box,
-        null,
-        h(Text, { bold: true, color: 'magentaBright' }, 'fm-console '),
-        h(Text, { dimColor: true }, truncate(home, 48))
-      ),
-      h(
-        Box,
-        null,
-        h(Text, { color: diskColor }, diskText),
-        h(Text, { dimColor: true }, '  ·  '),
-        h(
-          Text,
-          { color: header.watcherAlive ? 'green' : 'red' },
-          header.watcherAlive ? 'watcher alive' : 'watcher DOWN'
-        ),
-        h(Text, { dimColor: true }, '  ·  '),
-        h(
-          Text,
-          { color: header.afk ? 'yellow' : 'gray' },
-          header.afk ? 'afk' : 'present'
-        ),
-        h(Text, { dimColor: true }, '  ·  '),
-        h(
-          Text,
-          null,
-          `queued ${header.queued}`,
-          header.blocked ? h(Text, { color: 'yellow' }, ` (${header.blocked} blocked)`) : null
-        )
-      )
-    ),
-    supervisor.error
-      ? h(
-          Text,
-          { color: 'yellow' },
-          `command bridge disabled: ${supervisor.error}`
-        )
-      : h(
-          Text,
-          { dimColor: true },
-          `bridge → ${supervisor.target}${supervisor.backend ? ` [${supervisor.backend}]` : ''}`
-        )
-  );
-}
+  const diskColor = header.diskUsePct != null && header.diskUsePct >= 90 ? 'red' : 'white';
+  const watcherColor = header.watcherAlive ? 'green' : 'red';
 
-// One task card row.
-function Card({ card, selected, width }) {
-  const color = GROUP_COLORS[card.group] || 'white';
-  const chips = [];
-  if (card.ticket) chips.push(h(Text, { key: 'tk', color: 'blueBright' }, ` [${card.ticket}]`));
-  const prText = card.prUrl
-    ? ` PR${card.prChecks ? `:${card.prChecks}` : ''}`
-    : '';
-  const prColor =
-    card.prChecks === 'failing'
-      ? 'red'
-      : card.prChecks === 'passing'
-        ? 'green'
-        : 'cyan';
+  const sep = h(Text, { dimColor: true }, '  │  ');
+
   return h(
     Box,
-    { flexDirection: 'column', marginBottom: 0 },
+    { paddingX: 1 },
+    h(Text, { color: diskColor }, diskText),
+    sep,
+    h(Text, { color: watcherColor }, '●'),
+    h(Text, { color: watcherColor }, header.watcherAlive ? ' watcher' : ' watcher down'),
+    sep,
+    h(Text, { color: header.afk ? 'yellow' : 'gray' }, header.afk ? '● afk' : '○ present'),
+    sep,
+    h(Text, { bold: true, color: header.inFlight > 0 ? 'cyan' : 'gray' }, `${header.inFlight} in flight`),
+    sep,
     h(
-      Box,
+      Text,
       null,
-      h(Text, { color: selected ? 'black' : color, backgroundColor: selected ? color : undefined, bold: true }, ` ${card.id} `),
-      ...chips,
-      h(Text, { dimColor: true }, ` ${card.repo}`),
-      h(Text, { dimColor: true }, ` · ${card.kind}`),
-      h(Text, { dimColor: true }, ` · ${humanBytes(card.duBytes)}`),
-      card.prUrl ? h(Text, { color: prColor }, prText) : null
-    ),
-    card.lastEvent
-      ? h(Text, { dimColor: true }, `    ${truncate(card.lastEvent, Math.max(10, width - 6))}`)
-      : h(Text, { dimColor: true }, `    ${card.stateRaw}${card.stateDetail ? ` · ${card.stateDetail}` : ''}`)
-  );
-}
-
-function Group({ name, cards, selectedId, width }) {
-  if (!cards.length) return null;
-  const color = GROUP_COLORS[name] || 'white';
-  return h(
-    Box,
-    { flexDirection: 'column', marginTop: 1 },
-    h(Text, { bold: true, color }, `── ${GROUP_LABELS[name]} (${cards.length}) ──`),
-    ...cards.map((c) =>
-      h(Card, { key: c.id, card: c, selected: c.id === selectedId, width })
+      `${header.queued} queued`,
+      header.blocked ? h(Text, { color: 'yellow' }, ` (${header.blocked} blocked)`) : null
     )
   );
+}
+
+// Footer: one line, present only when something needs a warning. Multi-line
+// prose never lives here - every active warning collapses to its shortest
+// form and they are joined onto the one line rather than hiding all but the
+// highest-priority one, so a real bridge problem is never masked by, say, a
+// down watcher in the same render.
+function Footer({ header, supervisor, snapError }) {
+  const parts = [];
+  if (snapError) parts.push({ text: `state read error: ${snapError}`, color: 'red' });
+  if (!header.watcherAlive) parts.push({ text: 'watcher down - supervision may be stale', color: 'red' });
+  if (supervisor.error) parts.push({ text: `command bridge disabled: ${supervisor.error}`, color: 'yellow' });
+  if (!parts.length) return null;
+  return h(
+    Box,
+    { paddingX: 1 },
+    ...parts.flatMap((p, i) => [
+      i > 0 ? h(Text, { key: `sep-${i}`, dimColor: true }, '  ·  ') : null,
+      h(Text, { key: `w-${i}`, color: p.color, wrap: 'truncate-end' }, p.text),
+    ]).filter(Boolean)
+  );
+}
+
+// One task card: ONE line, colour-coded by state. Ink has no scrolling and a
+// fixed-height flex tree that receives more rows than it has space for can
+// visibly corrupt the render (rows silently losing content) rather than
+// clipping cleanly, so sections cap their row COUNT in JS (see capRows below)
+// instead of relying on Yoga/terminal overflow to hide the excess. Keeping
+// each card to one line keeps that row budget cheap to reason about.
+function Card({ card, selected, width }) {
+  const color = GROUP_COLORS[card.group] || 'white';
+  const chips = card.ticket ? ` [${card.ticket}]` : '';
+  const prText = card.prUrl ? ` PR${card.prChecks ? `:${card.prChecks}` : ''}` : '';
+  const prColor = card.prChecks === 'failing' ? 'red' : card.prChecks === 'passing' ? 'green' : 'cyan';
+  const detail = card.lastEvent || `${card.stateRaw}${card.stateDetail ? ` · ${card.stateDetail}` : ''}`;
+  const prefixLen = card.id.length + chips.length + card.repo.length + card.kind.length + 12;
+  const detailWidth = Math.max(6, width - prefixLen - 4);
+  return h(
+    Box,
+    null,
+    h(
+      Text,
+      { color: selected ? 'black' : color, backgroundColor: selected ? color : undefined, bold: true },
+      ` ${card.id} `
+    ),
+    chips ? h(Text, { color: 'blueBright' }, chips) : null,
+    h(Text, { dimColor: true }, ` ${card.repo} · ${card.kind}`),
+    card.prUrl ? h(Text, { color: prColor }, prText) : null,
+    h(Text, { dimColor: true, wrap: 'truncate-end' }, ` - ${truncate(detail, detailWidth)}`)
+  );
+}
+
+// A backlog-only row (QUEUED, RECENT DONE) that has no live task card: one
+// line, dimmer and colorless relative to a live Card so the two are visually
+// distinct at a glance.
+function BacklogRow({ record, width }) {
+  const title = record?.title || record?.raw || '(untitled)';
+  const meta = [];
+  if (record?.repo) meta.push(record.repo);
+  if (record?.blocked_by) meta.push(`blocked-by ${record.blocked_by}`);
+  if (record?.completion?.date) meta.push(`${record.completion.verb || 'done'} ${record.completion.date}`);
+  const metaText = meta.length ? ` (${meta.join(', ')})` : '';
+  const text = `${record?.id ? `${record.id} - ` : ''}${title}${metaText}`;
+  // width is the section's content width already net of its own border+
+  // padding (see Section's contentWidth below); only the marker prefix (" • "
+  // / " ⏸ ", 3 cols) needs accounting for here, plus a 1-col safety margin so
+  // Ink's own wrapping never kicks in even when a terminal's wide glyphs
+  // measure a hair wider than truncate()'s plain character count.
+  return h(
+    Box,
+    null,
+    h(Text, { color: record?.blocked_by ? 'yellow' : 'gray' }, record?.blocked_by ? ' ⏸ ' : ' • '),
+    h(Text, { dimColor: true, wrap: 'truncate-end' }, truncate(text, Math.max(4, width - 4)))
+  );
+}
+
+// Cap a flat list of section rows to `maxRows`, appending a "+N more" marker
+// (itself counted in the budget) instead of silently dropping the overflow or
+// handing Ink more rows than the section's allotted space - see the Card
+// comment above for why that overflow path corrupts the render.
+function capRows(rows, maxRows, moreLabel) {
+  if (maxRows == null || rows.length <= maxRows) return rows;
+  if (maxRows <= 0) return [];
+  const kept = rows.slice(0, Math.max(0, maxRows - 1));
+  kept.push(h(Text, { key: '__more', dimColor: true, italic: true }, `  … +${rows.length - kept.length} more ${moreLabel}`));
+  return kept;
+}
+
+// One board section: a bordered, colour-titled box. `flexGrow` lets the
+// IN FLIGHT section (usually the most content) claim the most space while
+// still letting QUEUED/RECENT DONE expand to fill the screen when IN FLIGHT
+// is empty - the degraded-state requirement from the redesign: no giant void.
+// `maxRows`, when given, caps how many body rows are handed to Ink (see
+// capRows) so this section alone can never overflow its allotted height.
+function Section({ title, color, count, rows, maxRows, flexGrow = 1, emptyText }) {
+  const body = rows && rows.length ? capRows(rows, maxRows, 'below') : null;
+  return h(
+    Box,
+    { flexDirection: 'column', flexGrow, borderStyle: 'round', borderColor: color, paddingX: 1 },
+    h(Text, { bold: true, color }, `${title}${count != null ? ` (${count})` : ''}`),
+    body || h(Text, { dimColor: true }, emptyText || 'nothing here')
+  );
+}
+
+function InFlightSection({ grouped, selectedId, width, flexGrow, maxRows }) {
+  const anyCards = GROUP_ORDER.some((g) => (grouped.get(g) || []).length > 0);
+  const rows = anyCards
+    ? GROUP_ORDER.flatMap((g) => {
+        const cards = grouped.get(g) || [];
+        if (!cards.length) return [];
+        const color = GROUP_COLORS[g] || 'white';
+        return [
+          h(Text, { key: `${g}-label`, bold: true, color }, `${GROUP_LABELS[g]} (${cards.length})`),
+          ...cards.map((c) => h(Card, { key: c.id, card: c, selected: c.id === selectedId, width })),
+        ];
+      })
+    : [];
+  return h(Section, {
+    title: 'IN FLIGHT',
+    color: 'cyan',
+    flexGrow,
+    maxRows,
+    rows,
+    emptyText: 'Nothing in flight - a healthy resting state.',
+  });
+}
+
+function QueuedSection({ records, blockedCount, width, flexGrow, maxRows }) {
+  const rows = records.map((r, i) => h(BacklogRow, { key: r.id || `q${i}`, record: r, width }));
+  const title = blockedCount ? `QUEUED (${records.length}, ${blockedCount} blocked)` : 'QUEUED';
+  return h(Section, {
+    title,
+    color: 'yellow',
+    count: blockedCount ? null : records.length,
+    flexGrow,
+    maxRows,
+    rows,
+    emptyText: 'Backlog is empty.',
+  });
+}
+
+function RecentDoneSection({ doneCards, doneRecords, width, flexGrow, maxRows }) {
+  const rows = [
+    ...doneCards.map((c) => h(Card, { key: `c-${c.id}`, card: c, selected: false, width })),
+    ...doneRecords.map((r, i) => h(BacklogRow, { key: `r-${r.id || i}`, record: r, width })),
+  ];
+  return h(Section, {
+    title: 'RECENT DONE',
+    color: 'gray',
+    flexGrow,
+    maxRows,
+    rows,
+    emptyText: 'Nothing done yet.',
+  });
 }
 
 // The input/command line, quick-action menu, and hints. Quick-actions live
@@ -169,10 +286,8 @@ function Group({ name, cards, selectedId, width }) {
 function InputLine({ input, pendingConfirm, quickMenu, selectedId, message }) {
   return h(
     Box,
-    { flexDirection: 'column', marginTop: 1 },
-    message
-      ? h(Text, { color: message.color || 'white' }, message.text)
-      : null,
+    { flexDirection: 'column', borderStyle: 'single', borderColor: 'gray', paddingX: 1 },
+    message ? h(Text, { color: message.color || 'white' }, message.text) : null,
     quickMenu
       ? h(
           Text,
@@ -209,7 +324,25 @@ function InputLine({ input, pendingConfirm, quickMenu, selectedId, message }) {
 export default function App({ bin, home }) {
   const { exit } = useApp();
   const { stdout } = useStdout();
-  const width = (stdout && stdout.columns) || 80;
+  const [dims, setDims] = useState({
+    width: (stdout && stdout.columns) || 80,
+    height: (stdout && stdout.rows) || 24,
+  });
+
+  // React to terminal resize so the board keeps filling the screen rather
+  // than drawing at whatever size was current at first paint.
+  useEffect(() => {
+    if (!stdout || typeof stdout.on !== 'function') return undefined;
+    const onResize = () => setDims({ width: stdout.columns || 80, height: stdout.rows || 24 });
+    stdout.on('resize', onResize);
+    return () => {
+      if (typeof stdout.off === 'function') stdout.off('resize', onResize);
+      else if (typeof stdout.removeListener === 'function') stdout.removeListener('resize', onResize);
+    };
+  }, [stdout]);
+
+  const { width, height } = dims;
+  const compact = width < MIN_COLS_FOR_FULL_LAYOUT || height < MIN_ROWS_FOR_FULL_LAYOUT;
 
   const [snapshot, setSnapshot] = useState(null);
   const [snapError, setSnapError] = useState(null);
@@ -237,7 +370,11 @@ export default function App({ bin, home }) {
       fileExists(`${home}/state/.afk`),
     ]);
     if (!mounted.current) return;
-    setSnapshot(snap);
+    // Keep the last good snapshot on screen if this read failed (a timed-out
+    // or wedged read is transient) - degrading the whole board to empty on one
+    // bad read would look exactly like the "reports nothing in flight" bug
+    // this console exists to avoid; only replace it when we actually got JSON.
+    if (snap) setSnapshot(snap);
     setSnapError(error);
     setDisk(d);
     setWatcherBeat(beat);
@@ -284,8 +421,10 @@ export default function App({ bin, home }) {
   const cards = tasks.map((t) =>
     buildCard(t, { duBytes: duById[t.id] ?? null, prChecks: prById[t.id] ?? null })
   );
-  const grouped = groupCards(cards);
-  const orderedIds = GROUP_ORDER.flatMap((g) => (grouped.get(g) || []).map((c) => c.id));
+  const { inFlight, inFlightGrouped, done } = boardSections(cards);
+  const queuedRecords = queuedBacklogRecords(snapshot);
+  const doneRecords = recentDoneBacklogRecords(snapshot, RECENT_DONE_LIMIT);
+  const orderedIds = GROUP_ORDER.flatMap((g) => (inFlightGrouped.get(g) || []).map((c) => c.id));
 
   // Keep selection valid as the fleet changes.
   useEffect(() => {
@@ -299,6 +438,7 @@ export default function App({ bin, home }) {
     nowSecs: nowSecs(),
     afkPresent: afk,
     snapshot,
+    inFlightCount: inFlight.length,
   });
 
   const doSend = useCallback(async (raw) => {
@@ -407,28 +547,89 @@ export default function App({ bin, home }) {
     }
   });
 
-  const anyCards = cards.length > 0;
+  // Row budget: Ink has no scrolling, and handing a fixed-height flex tree
+  // more rows than it has space for can corrupt the render rather than clip
+  // it cleanly (see the Card/capRows comments above) - it silently loses
+  // content on WHATEVER auto-sized rows come first, not just the last ones,
+  // because Yoga distributes the shortfall across the tree rather than
+  // truncating at the bottom. So every row that will be drawn is counted
+  // BEFORE Ink ever sees it - computeRowBudget (state.js) is the pure,
+  // unit-tested math; each section is then capped to fit via capRows.
+  const footerLines = snapError || !header.watcherAlive || supervisor.error ? 1 : 0;
+  const { inFlightRows, queuedRows, doneRows } = computeRowBudget({
+    height,
+    hasFooter: footerLines > 0,
+    hasInFlight: inFlight.length > 0,
+  });
+
+  const inFlightGrow = inFlight.length ? 3 : 1;
+
+  // Each Section pays 1 col of border + 1 col of padding on each side (4
+  // total), so the content width handed to Card/BacklogRow must already net
+  // that out - otherwise their own truncate() budget under-counts and Ink's
+  // own wrapping kicks in on the overflow (a second, wrapped line inside the
+  // box) instead of a clean single-line truncation.
+  const SECTION_CHROME_WIDTH = 4;
+  const fullContentWidth = Math.max(10, width - SECTION_CHROME_WIDTH);
+  const halfContentWidth = Math.max(10, Math.floor(width / 2) - SECTION_CHROME_WIDTH);
+
+  const boardRow = compact
+    ? h(
+        Box,
+        { flexDirection: 'column', flexGrow: 1 },
+        h(InFlightSection, {
+          grouped: inFlightGrouped,
+          selectedId,
+          width: fullContentWidth,
+          flexGrow: inFlightGrow,
+          maxRows: inFlightRows,
+        }),
+        h(QueuedSection, {
+          records: queuedRecords,
+          blockedCount: header.blocked,
+          width: fullContentWidth,
+          flexGrow: 1,
+          maxRows: queuedRows,
+        }),
+        h(RecentDoneSection, { doneCards: done, doneRecords, width: fullContentWidth, flexGrow: 1, maxRows: doneRows })
+      )
+    : h(
+        Box,
+        { flexDirection: 'column', flexGrow: 1 },
+        h(InFlightSection, {
+          grouped: inFlightGrouped,
+          selectedId,
+          width: fullContentWidth,
+          flexGrow: inFlightGrow,
+          maxRows: inFlightRows,
+        }),
+        h(
+          Box,
+          { flexGrow: 2 },
+          h(QueuedSection, {
+            records: queuedRecords,
+            blockedCount: header.blocked,
+            width: halfContentWidth,
+            flexGrow: 1,
+            maxRows: queuedRows,
+          }),
+          h(RecentDoneSection, {
+            doneCards: done,
+            doneRecords,
+            width: halfContentWidth,
+            flexGrow: 1,
+            maxRows: doneRows,
+          })
+        )
+      );
 
   return h(
     Box,
-    { flexDirection: 'column', width },
-    h(Header, { header, home, supervisor }),
-    snapError
-      ? h(Text, { color: 'red' }, `state read error: ${truncate(snapError, width - 20)}`)
-      : null,
-    anyCards
-      ? h(
-          Box,
-          { flexDirection: 'column' },
-          ...GROUP_ORDER.map((g) =>
-            h(Group, { key: g, name: g, cards: grouped.get(g) || [], selectedId, width })
-          )
-        )
-      : h(
-          Box,
-          { marginTop: 1 },
-          h(Text, { color: 'green' }, 'Fleet is empty. Nothing in flight - a healthy resting state.')
-        ),
+    { flexDirection: 'column', width, height, overflowY: 'hidden' },
+    h(TitleBar, { home, width }),
+    h(StatusStrip, { header }),
+    boardRow,
+    h(Footer, { header, supervisor, snapError }),
     h(InputLine, { input, pendingConfirm, quickMenu, selectedId, message })
   );
 }

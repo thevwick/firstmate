@@ -266,6 +266,86 @@ test_workspace_label_different_secondmates_get_different_labels() {
   pass "fm_backend_herdr_workspace_label: two different secondmate homes get two different, non-colliding labels"
 }
 
+# --- workspace_label: optional per-home config/herdr-workspace-label override -
+
+test_workspace_label_primary_override_respected() {
+  local home
+  home="$TMP_ROOT/primary-override"; mkdir -p "$home/config"
+  printf 'acme-hub\n' > "$home/config/herdr-workspace-label"
+  out=$( FM_HOME="$home" bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_workspace_label' "$ROOT" )
+  [ "$out" = "acme-hub" ] || fail "a primary home with config/herdr-workspace-label should use its value, got '$out'"
+  pass "fm_backend_herdr_workspace_label: a primary home's config/herdr-workspace-label override is respected"
+}
+
+test_workspace_label_primary_override_trims_and_takes_first_line() {
+  local home
+  home="$TMP_ROOT/primary-override-trim"; mkdir -p "$home/config"
+  printf '\n  acme-hub  \nsecond-line\n' > "$home/config/herdr-workspace-label"
+  out=$( FM_HOME="$home" bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_workspace_label' "$ROOT" )
+  [ "$out" = "acme-hub" ] || fail "the override should be the first non-empty line trimmed of whitespace, got '$out'"
+  pass "fm_backend_herdr_workspace_label: the override is the first non-empty line, trimmed"
+}
+
+test_workspace_label_absent_override_is_constant_firstmate() {
+  local home
+  home="$TMP_ROOT/primary-no-override"; mkdir -p "$home"
+  out=$( FM_HOME="$home" bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_workspace_label' "$ROOT" )
+  [ "$out" = "firstmate" ] || fail "no override file should resolve to the constant 'firstmate', got '$out'"
+  pass "fm_backend_herdr_workspace_label: an absent override file yields the constant 'firstmate'"
+}
+
+test_workspace_label_empty_override_is_constant_firstmate() {
+  local home
+  home="$TMP_ROOT/primary-empty-override"; mkdir -p "$home/config"
+  printf '\n  \n' > "$home/config/herdr-workspace-label"
+  out=$( FM_HOME="$home" bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_workspace_label' "$ROOT" )
+  [ "$out" = "firstmate" ] || fail "an empty/whitespace-only override should fall back to 'firstmate', got '$out'"
+  pass "fm_backend_herdr_workspace_label: an empty override file yields the constant 'firstmate'"
+}
+
+test_workspace_label_secondmate_ignores_override() {
+  local home
+  home="$TMP_ROOT/secondmate-with-override"; mkdir -p "$home/config"
+  printf 'sshhip-h7\n' > "$home/.fm-secondmate-home"
+  printf 'acme-hub\n' > "$home/config/herdr-workspace-label"
+  out=$( FM_HOME="$home" bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_workspace_label' "$ROOT" )
+  [ "$out" = "2ndmate-sshhip-h7" ] || fail "a secondmate home must ignore config/herdr-workspace-label and keep its marker label, got '$out'"
+  pass "fm_backend_herdr_workspace_label: a secondmate home ignores the override (marker label wins)"
+}
+
+test_workspace_label_override_with_whitespace_rejected() {
+  local home err
+  home="$TMP_ROOT/override-whitespace"; mkdir -p "$home/config"
+  printf 'acme hub\n' > "$home/config/herdr-workspace-label"
+  err="$TMP_ROOT/override-whitespace.err"
+  out=$( FM_HOME="$home" bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_workspace_label' "$ROOT" 2>"$err" )
+  [ "$out" = "firstmate" ] || fail "a label with interior whitespace should fall back to 'firstmate', got '$out'"
+  assert_contains "$(cat "$err")" "whitespace or a colon" "expected a stderr warning for the whitespace label"
+  pass "fm_backend_herdr_workspace_label: a whitespace label is rejected with a stderr warning and falls back"
+}
+
+test_workspace_label_override_with_colon_rejected() {
+  local home err
+  home="$TMP_ROOT/override-colon"; mkdir -p "$home/config"
+  printf 'acme:hub\n' > "$home/config/herdr-workspace-label"
+  err="$TMP_ROOT/override-colon.err"
+  out=$( FM_HOME="$home" bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_workspace_label' "$ROOT" 2>"$err" )
+  [ "$out" = "firstmate" ] || fail "a label containing a colon should fall back to 'firstmate', got '$out'"
+  assert_contains "$(cat "$err")" "whitespace or a colon" "expected a stderr warning for the colon label"
+  pass "fm_backend_herdr_workspace_label: a colon-bearing label is rejected with a stderr warning and falls back"
+}
+
+test_workspace_label_override_reserved_secondmate_prefix_rejected() {
+  local home err
+  home="$TMP_ROOT/override-reserved"; mkdir -p "$home/config"
+  printf '2ndmate-sneaky\n' > "$home/config/herdr-workspace-label"
+  err="$TMP_ROOT/override-reserved.err"
+  out=$( FM_HOME="$home" bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_workspace_label' "$ROOT" 2>"$err" )
+  [ "$out" = "firstmate" ] || fail "a reserved 2ndmate-* label should fall back to 'firstmate', got '$out'"
+  assert_contains "$(cat "$err")" "reserved" "expected a stderr warning for the reserved 2ndmate-* label"
+  pass "fm_backend_herdr_workspace_label: a reserved 2ndmate-* label is rejected with a stderr warning and falls back"
+}
+
 # --- fm_backend_herdr_cli: session targeting (2026-07-02 incident fix) -------
 
 test_cli_helper_sets_env_and_appends_trailing_session_flag() {
@@ -1607,6 +1687,14 @@ test_workspace_label_secondmate_home_uses_marker_id
 test_workspace_label_secondmate_marker_trims_whitespace
 test_workspace_label_empty_marker_falls_back_to_primary
 test_workspace_label_different_secondmates_get_different_labels
+test_workspace_label_primary_override_respected
+test_workspace_label_primary_override_trims_and_takes_first_line
+test_workspace_label_absent_override_is_constant_firstmate
+test_workspace_label_empty_override_is_constant_firstmate
+test_workspace_label_secondmate_ignores_override
+test_workspace_label_override_with_whitespace_rejected
+test_workspace_label_override_with_colon_rejected
+test_workspace_label_override_reserved_secondmate_prefix_rejected
 test_cli_helper_sets_env_and_appends_trailing_session_flag
 test_container_ensure_starts_server_and_workspace
 test_container_ensure_reuses_existing_workspace

@@ -20,7 +20,9 @@ export const WATCHER_GRACE_SECS = 300;
 export const DATA_VOLUME = '/System/Volumes/Data';
 
 // Card group order, top to bottom. Keys map to task states derived in state.js.
-export const GROUP_ORDER = ['needs-you', 'ready', 'working', 'blocked', 'done'];
+// Excludes 'done': the redesigned board shows finished work in its own RECENT
+// DONE section (state.js's boardSections), not mixed into the IN FLIGHT groups.
+export const GROUP_ORDER = ['needs-you', 'ready', 'working', 'blocked'];
 
 export const GROUP_LABELS = {
   'needs-you': 'NEEDS YOU',
@@ -29,3 +31,14 @@ export const GROUP_LABELS = {
   blocked: 'BLOCKED',
   done: 'DONE',
 };
+
+// How many RECENT DONE rows the board shows (task cards and backlog Done
+// records combined, most-recent-first). A taste of recent history, not the
+// archive - data/backlog.md and GitHub remain the full record.
+export const RECENT_DONE_LIMIT = 6;
+
+// Below this terminal height/width the board degrades to a minimal single-
+// column layout: no side-by-side sections, tighter card rows, and dropped
+// optional chrome, rather than clipping content unreadably.
+export const MIN_ROWS_FOR_FULL_LAYOUT = 24;
+export const MIN_COLS_FOR_FULL_LAYOUT = 70;

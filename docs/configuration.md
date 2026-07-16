@@ -53,6 +53,11 @@ Only metadata-routed task selectors carry secondmate-marker and Codex-harness co
 `fm-teardown.sh <id>` takes a task id directly and uses the same recorded backend target fields after loading `state/<id>.meta`.
 Herdr workspaces are derived from `FM_HOME`: the primary home uses `firstmate`, and a secondmate home marked by `.fm-secondmate-home` uses `2ndmate-<secondmate-id>`.
 Spawn, list-live, and recovery paths read that label from the active home, so a secondmate's own crewmates stay inside that secondmate home's herdr space.
+An optional local, gitignored `config/herdr-workspace-label` file lets a PRIMARY home override its constant `firstmate` label, so several primary homes on one machine keep their herdr task tabs in separate workspaces instead of co-mingling in one.
+Its first non-empty line is the label, read from the effective config dir (respecting `FM_CONFIG_OVERRIDE` / `FM_HOME`); absent or empty means the constant `firstmate`, byte-for-byte, so single-home setups are unchanged.
+The value is trimmed of surrounding whitespace, and a label that still contains interior whitespace or a colon, or that matches the reserved `2ndmate-*` secondmate namespace, is rejected with a stderr warning and falls back to `firstmate`.
+A secondmate home ignores this file: its marker-derived `2ndmate-<secondmate-id>` label is already unique.
+Like `config/backend`, `config/herdr-workspace-label` is per-home and not inherited by secondmate homes.
 For normal herdr operations, `HERDR_SESSION` selects the named session, but destructive test cleanup must not rely on `HERDR_SESSION` alone.
 Use the explicit guarded cleanup path described in [`docs/herdr-backend.md`](herdr-backend.md) instead of `herdr server stop`.
 For normal zellij operations, `FM_ZELLIJ_SESSION` selects the named session and defaults to `firstmate`.
