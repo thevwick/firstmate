@@ -34,6 +34,20 @@ async function makeHome(snapshotJson) {
   return { home, bin };
 }
 
+// Stub bin/fm-send.sh so the command-bridge tests can drive doSend's real
+// sendCommand()->run() path without a real fm-send.sh or primary session.
+// exitCode 0 simulates a successful send; non-zero simulates the "Enter
+// swallowed / text not submitted" style failure this regression guards.
+async function stubFmSend(bin, exitCode, stderrText) {
+  const stub = path.join(bin, 'fm-send.sh');
+  await writeFile(
+    stub,
+    `#!/usr/bin/env bash\n${stderrText ? `echo '${stderrText}' >&2\n` : ''}exit ${exitCode}\n`,
+    { mode: 0o755 }
+  );
+  await chmod(stub, 0o755);
+}
+
 // ink-testing-library's stdout stub has no `.rows` getter, so the app's own
 // dims fallback (`stdout.rows || 24`) always measures a short 24-row terminal
 // in tests, unless a test opts into a taller one - the app reacts to a real
@@ -548,4 +562,181 @@ test('shows the command-bridge-disabled warning when nothing resolves a supervis
       if (prev[k] !== undefined) process.env[k] = prev[k];
     }
   }
+});
+
+// Regression coverage for the runaway-input bug: a FAILED send used to leave
+// the typed command sitting in the input line, so a captain who kept typing
+// (or a repeat Enter while the send was still in flight) compounded it into a
+// screen-filling wall ("hellohellohello..."). doSend now clears the input the
+// moment a send starts, whether it ultimately succeeds or fails, and guards
+// against re-entrant sends with sendingRef.
+test('a FAILED send still clears the input line, not leaving the failed command sitting in the buffer', async () => {
+  const keys = ['FM_SUPERVISOR_TARGET', 'FM_SUPERVISOR_BACKEND', 'TMUX_PANE', 'HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_SESSION'];
+  const prev = {};
+  for (const k of keys) {
+    prev[k] = process.env[k];
+    delete process.env[k];
+  }
+  process.env.TMUX_PANE = '%3';
+  try {
+    const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+    await stubFmSend(bin, 1, 'Enter swallowed / text not submitted');
+    const { lastFrame, stdin, unmount } = render(React.createElement(App, { bin, home }));
+    await waitForFrame(lastFrame, /IN FLIGHT/);
+    await waitForSettled(lastFrame);
+
+    stdin.write('hello');
+    await waitForFrame(lastFrame, /hello/);
+    stdin.write('\r');
+    const failedFrame = await waitForFrame(lastFrame, /send failed/);
+    assert.match(failedFrame, /send failed/);
+    // The input line is the row starting with the '❯ ' prompt; it must show
+    // no leftover "hello" once the failed send has been reported.
+    const inputLine = failedFrame.split('\n').find((l) => l.includes('❯'));
+    assert.doesNotMatch(inputLine, /hello/);
+    unmount();
+  } finally {
+    for (const k of keys) {
+      if (prev[k] !== undefined) process.env[k] = prev[k];
+      else delete process.env[k];
+    }
+  }
+});
+
+test('a successful send still clears the input line', async () => {
+  const keys = ['FM_SUPERVISOR_TARGET', 'FM_SUPERVISOR_BACKEND', 'TMUX_PANE', 'HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_SESSION'];
+  const prev = {};
+  for (const k of keys) {
+    prev[k] = process.env[k];
+    delete process.env[k];
+  }
+  process.env.TMUX_PANE = '%3';
+  try {
+    const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+    await stubFmSend(bin, 0, '');
+    const { lastFrame, stdin, unmount } = render(React.createElement(App, { bin, home }));
+    await waitForFrame(lastFrame, /IN FLIGHT/);
+    await waitForSettled(lastFrame);
+
+    stdin.write('status x');
+    await waitForFrame(lastFrame, /status x/);
+    stdin.write('\r');
+    const sentFrame = await waitForFrame(lastFrame, /sent: status x/);
+    assert.match(sentFrame, /sent: status x/);
+    const inputLine = sentFrame.split('\n').find((l) => l.includes('❯'));
+    assert.doesNotMatch(inputLine, /status x/);
+    unmount();
+  } finally {
+    for (const k of keys) {
+      if (prev[k] !== undefined) process.env[k] = prev[k];
+      else delete process.env[k];
+    }
+  }
+});
+
+test('a second Enter while a send is still in flight does not start a second send', async () => {
+  const keys = ['FM_SUPERVISOR_TARGET', 'FM_SUPERVISOR_BACKEND', 'TMUX_PANE', 'HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_SESSION'];
+  const prev = {};
+  for (const k of keys) {
+    prev[k] = process.env[k];
+    delete process.env[k];
+  }
+  process.env.TMUX_PANE = '%3';
+  try {
+    const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+    // A slow fm-send.sh that stays in flight long enough for a second Enter to
+    // race it, and that records one line per invocation so the test can assert
+    // on the actual call count rather than racing UI message text.
+    const stub = path.join(bin, 'fm-send.sh');
+    const callLog = path.join(bin, 'send-calls.log');
+    await writeFile(
+      stub,
+      `#!/usr/bin/env bash\necho "call $$" >> '${callLog}'\nsleep 0.5\nexit 1\n`,
+      { mode: 0o755 }
+    );
+    await chmod(stub, 0o755);
+    const { lastFrame, stdin, unmount } = render(React.createElement(App, { bin, home }));
+    await waitForFrame(lastFrame, /IN FLIGHT/);
+    await waitForSettled(lastFrame);
+
+    stdin.write('hello');
+    await waitForFrame(lastFrame, /hello/);
+    stdin.write('\r');
+    await waitForFrame(lastFrame, /sending: hello/);
+    // Fire several more Enters while the first send is still in flight (the
+    // sleep gives ample margin). None of these may start a second doSend.
+    stdin.write('\r');
+    stdin.write('\r');
+    stdin.write('\r');
+    const failedFrame = await waitForFrame(lastFrame, /send failed/, 3000);
+    assert.match(failedFrame, /send failed/);
+    // Give any wrongly-started second call a moment to have written its line.
+    await new Promise((r) => setTimeout(r, 300));
+    const { readFile } = await import('node:fs/promises');
+    const calls = (await readFile(callLog, 'utf8')).trim().split('\n').filter(Boolean);
+    assert.equal(calls.length, 1, `expected exactly one fm-send.sh invocation, got ${calls.length}`);
+    unmount();
+  } finally {
+    for (const k of keys) {
+      if (prev[k] !== undefined) process.env[k] = prev[k];
+      else delete process.env[k];
+    }
+  }
+});
+
+// Regression coverage for the ACTUAL root cause: handleInput's useCallback
+// depended on `input` (and other per-render-changing values), so `input`
+// changing on every keystroke recreated handleInput on every keystroke,
+// which churned Ink's useInput stdin listener (detach + reattach) on every
+// character. A keystroke landing in that reattach gap could be delivered to
+// more than one listener instance, appending more than once per keypress and
+// compounding exponentially - the actual mechanism behind the reported
+// "hellohellohello..." wall, independent of the doSend clear/guard fix above.
+test('a single keypress appends exactly one character, not two or more', async () => {
+  const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+  const { lastFrame, stdin, unmount } = render(React.createElement(App, { bin, home }));
+  await waitForFrame(lastFrame, /IN FLIGHT/);
+  await waitForSettled(lastFrame);
+
+  stdin.write('a');
+  await waitForFrame(lastFrame, /❯ a/);
+  await waitForSettled(lastFrame);
+  const frame = lastFrame();
+  const inputLine = frame.split('\n').find((l) => l.includes('❯')) || '';
+  // Exactly one 'a' after the prompt glyph, not 'aa' or more. Match the
+  // prompt-to-end-of-input span rather than counting 'a' anywhere on the
+  // line, since dim hint text elsewhere on the line is irrelevant here (the
+  // input line has no other text at this point).
+  assert.match(inputLine, /❯ a\s/);
+  assert.doesNotMatch(inputLine, /❯ aa/);
+  unmount();
+});
+
+test('typing N characters yields exactly N characters in the input, across many keystrokes and re-renders', async () => {
+  // Reattach-on-every-keystroke, if it regressed, would show up as
+  // super-linear growth well before 20 keystrokes; this also spans the
+  // REFRESH_INTERVAL_MS poll tick so an in-flight snapshot re-render landing
+  // mid-typing is exercised too, not just a burst of keystrokes with no
+  // competing re-render.
+  const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+  const { lastFrame, stdin, unmount } = render(React.createElement(App, { bin, home }));
+  await waitForFrame(lastFrame, /IN FLIGHT/);
+  await waitForSettled(lastFrame);
+
+  const word = 'abcdefghijklmnopqrst'; // 20 distinct characters
+  for (const ch of word) {
+    stdin.write(ch);
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  await waitForFrame(lastFrame, new RegExp(`❯ ${word}`));
+  const frame = lastFrame();
+  const inputLine = frame.split('\n').find((l) => l.includes('❯')) || '';
+  const afterPrompt = inputLine.split('❯ ')[1] || '';
+  // Strip the box's trailing border/padding, not just whitespace - the input
+  // line is drawn inside a bordered box, so anything after the typed text is
+  // chrome (padding spaces + the closing "│"), never part of the buffer.
+  const typed = afterPrompt.replace(/[\s│]+$/, '');
+  assert.equal(typed, word, `expected exactly "${word}" (${word.length} chars), got "${typed}" (${typed.length} chars)`);
+  unmount();
 });

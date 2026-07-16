@@ -477,6 +477,21 @@ export default function App({ bin, home }) {
   const [quickMenu, setQuickMenu] = useState(false);
   const [message, setMessage] = useState(null);
 
+  // inputRef mirrors `input` so doSend/handleInput can read the CURRENT value
+  // without closing over the `input` state itself. Closing over `input`
+  // directly would put it in useCallback's dependency array, and since
+  // `input` changes on every keystroke that would recreate handleInput on
+  // every keystroke too - see the handleInput comment below for why that is
+  // the actual root cause of the runaway-input bug, not just a performance
+  // wrinkle: a recreated callback churns Ink's useInput stdin listener
+  // (detach + reattach) on every single character, and a keystroke landing in
+  // that gap can be delivered to more than one listener instance, appending
+  // more than once per keypress and compounding exponentially.
+  const inputRef = useRef('');
+  useEffect(() => {
+    inputRef.current = input;
+  }, [input]);
+
   // Memoized (computed once per mount): process.env-derived and does not
   // change within a session. A fresh object every render would otherwise
   // cascade into doSend/handleInput below never stabilizing their own
@@ -588,6 +603,28 @@ export default function App({ bin, home }) {
   const doneRecords = recentDoneBacklogRecords(snapshot, RECENT_DONE_LIMIT);
   const orderedIds = GROUP_ORDER.flatMap((g) => (inFlightGrouped.get(g) || []).map((c) => c.id));
 
+  // orderedIds is a fresh array every render (recomputed from the polled
+  // snapshot), and selectedId/pendingConfirm/quickMenu all change on their own
+  // interactions - mirrored into refs for the same reason inputRef exists
+  // above: handleInput reads the CURRENT value through the ref rather than
+  // closing over the state, so none of these belong in its useCallback deps.
+  const orderedIdsRef = useRef(orderedIds);
+  useEffect(() => {
+    orderedIdsRef.current = orderedIds;
+  });
+  const selectedIdRef = useRef(selectedId);
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
+  const pendingConfirmRef = useRef(pendingConfirm);
+  useEffect(() => {
+    pendingConfirmRef.current = pendingConfirm;
+  }, [pendingConfirm]);
+  const quickMenuRef = useRef(quickMenu);
+  useEffect(() => {
+    quickMenuRef.current = quickMenu;
+  }, [quickMenu]);
+
   // Keep selection valid as the fleet changes.
   useEffect(() => {
     if (selectedId && !orderedIds.includes(selectedId)) setSelectedId(null);
@@ -603,34 +640,62 @@ export default function App({ bin, home }) {
     inFlightCount: inFlight.length,
   });
 
-  const doSend = useCallback(async (raw) => {
-    const command = normalizeCommand(raw);
+  // sendingRef guards re-entrancy: doSend is async, so without this a second
+  // Enter (or key auto-repeat) firing mid-flight could start a second send
+  // and/or let the char handler keep appending, compounding the input buffer
+  // into a screen-filling wall. The ref (not state) is read synchronously by
+  // handleInput on every keystroke, with no render lag between check and set.
+  const sendingRef = useRef(false);
+
+  const doSend = useCallback(async () => {
+    const command = normalizeCommand(inputRef.current);
     if (!isSendable(command)) return;
+    if (sendingRef.current) {
+      setMessage({ text: 'still sending, please wait...', color: 'yellow' });
+      return;
+    }
     if (supervisor.error) {
       setMessage({ text: `cannot send: ${supervisor.error}`, color: 'red' });
       return;
     }
+    // Clear the input the moment the send starts, not conditionally after the
+    // async call resolves - a failed send must leave the input empty exactly
+    // like a successful one, never re-populated with the failed command.
+    setInput('');
+    sendingRef.current = true;
     setMessage({ text: `sending: ${command}`, color: 'cyan' });
-    const res = await sendCommand({
-      bin,
-      home,
-      target: supervisor.target,
-      command,
-    });
-    if (!mounted.current) return;
-    if (res.ok) {
-      setMessage({ text: `sent: ${command}`, color: 'green' });
-      setInput('');
-    } else {
-      setMessage({ text: `send failed (${res.code}): ${truncate(res.stderr, 60)}`, color: 'red' });
+    try {
+      const res = await sendCommand({
+        bin,
+        home,
+        target: supervisor.target,
+        command,
+      });
+      if (!mounted.current) return;
+      if (res.ok) {
+        setMessage({ text: `sent: ${command}`, color: 'green' });
+      } else {
+        setMessage({ text: `send failed (${res.code}): ${truncate(res.stderr, 60)}`, color: 'red' });
+      }
+    } finally {
+      sendingRef.current = false;
     }
   }, [bin, home, supervisor]);
 
-  // Memoized so Ink's useInput effect (keyed on this callback's identity)
-  // does not tear down and re-attach its stdin listener on every unrelated
-  // re-render (e.g. the age/du/PR async side-channels resolving) - an
-  // unmemoized inline handler here reattaches on every render, and a
-  // keystroke landing in that brief detach/reattach gap is silently dropped.
+  // Stable across every keystroke: this is the fix for the runaway-input bug.
+  // Ink's useInput effect re-attaches its stdin listener whenever this
+  // callback's identity changes, and a keystroke landing in that detach/
+  // reattach gap can be delivered more than once. The old handler closed over
+  // `input`, `selectedId`, `pendingConfirm`, `quickMenu`, and `orderedIds`
+  // directly, so its useCallback deps included `input` - which changes on
+  // EVERY keystroke - meaning the listener reattached on every single
+  // character typed, letting a keystroke double- or quadruple-append and
+  // compound exponentially into a screen-filling wall. Reading every one of
+  // those current values through a ref (inputRef, selectedIdRef,
+  // pendingConfirmRef, quickMenuRef, orderedIdsRef, all synced above) instead
+  // of closing over the state means this handler needs no per-render or
+  // per-keystroke value in its dependency array, so it is created exactly
+  // once and the stdin listener attaches exactly once for the life of the app.
   const handleInput = useCallback((inputChar, key) => {
     // Ctrl-C handled by Ink's exit, but be explicit for clean quit.
     if (key.ctrl && inputChar === 'c') {
@@ -638,11 +703,14 @@ export default function App({ bin, home }) {
       return;
     }
 
+    const pending = pendingConfirmRef.current;
+    const selId = selectedIdRef.current;
+
     // A pending destructive-confirm intercepts the next keystroke.
-    if (pendingConfirm) {
+    if (pending) {
       if (inputChar === 'y') {
-        setInput(composeQuickAction(pendingConfirm.verb, selectedId));
-        setMessage({ text: `composed ${pendingConfirm.verb} ${selectedId} - review and press Enter to send`, color: 'yellow' });
+        setInput(composeQuickAction(pending.verb, selId));
+        setMessage({ text: `composed ${pending.verb} ${selId} - review and press Enter to send`, color: 'yellow' });
       } else {
         setMessage({ text: 'cancelled', color: 'gray' });
       }
@@ -653,19 +721,19 @@ export default function App({ bin, home }) {
     // The Tab-opened quick-action menu intercepts the next keystroke. This is
     // why free-typing never collides with the action keys: s/m/t only mean
     // "quick action" inside this menu, never in the plain input line.
-    if (quickMenu) {
+    if (quickMenuRef.current) {
       setQuickMenu(false);
       if (key.escape) {
         setMessage({ text: 'cancelled', color: 'gray' });
         return;
       }
       const action = actionForKey(inputChar);
-      if (action && selectedId) {
+      if (action && selId) {
         if (action.destructive) {
           setPendingConfirm(action);
         } else {
-          setInput(composeQuickAction(action.verb, selectedId));
-          setMessage({ text: `composed ${action.verb} ${selectedId} - review and press Enter to send`, color: 'yellow' });
+          setInput(composeQuickAction(action.verb, selId));
+          setMessage({ text: `composed ${action.verb} ${selId} - review and press Enter to send`, color: 'yellow' });
         }
       } else {
         setMessage({ text: 'cancelled', color: 'gray' });
@@ -675,7 +743,7 @@ export default function App({ bin, home }) {
 
     // Tab opens the quick-action menu for the selected task.
     if (key.tab) {
-      if (selectedId) {
+      if (selId) {
         setQuickMenu(true);
       } else {
         setMessage({ text: 'select a task first (↑/↓)', color: 'gray' });
@@ -684,20 +752,22 @@ export default function App({ bin, home }) {
     }
 
     if (key.upArrow) {
-      if (!orderedIds.length) return;
-      const i = selectedId ? orderedIds.indexOf(selectedId) : 0;
-      setSelectedId(orderedIds[Math.max(0, i - 1)]);
+      const ids = orderedIdsRef.current;
+      if (!ids.length) return;
+      const i = selId ? ids.indexOf(selId) : 0;
+      setSelectedId(ids[Math.max(0, i - 1)]);
       return;
     }
     if (key.downArrow) {
-      if (!orderedIds.length) return;
-      const i = selectedId ? orderedIds.indexOf(selectedId) : -1;
-      setSelectedId(orderedIds[Math.min(orderedIds.length - 1, i + 1)]);
+      const ids = orderedIdsRef.current;
+      if (!ids.length) return;
+      const i = selId ? ids.indexOf(selId) : -1;
+      setSelectedId(ids[Math.min(ids.length - 1, i + 1)]);
       return;
     }
 
     if (key.return) {
-      doSend(input);
+      doSend();
       return;
     }
 
@@ -712,7 +782,7 @@ export default function App({ bin, home }) {
     if (inputChar && !key.ctrl && !key.meta && !key.tab) {
       setInput((s) => s + inputChar);
     }
-  }, [exit, pendingConfirm, quickMenu, selectedId, orderedIds, input, doSend]);
+  }, [exit, doSend]);
 
   useInput(handleInput);
 
