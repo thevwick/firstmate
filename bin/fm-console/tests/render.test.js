@@ -44,6 +44,15 @@ function setTestRows(stdout, rows) {
   stdout.emit('resize');
 }
 
+// Same idea for width: the stub's `.columns` is a fixed class getter (always
+// 100), so an own-property override (which shadows a prototype getter) plus
+// the resize event is what lets a test exercise the narrow-terminal degrade
+// path (CARD_NARROW_WIDTH and below).
+function setTestCols(stdout, columns) {
+  Object.defineProperty(stdout, 'columns', { value: columns, configurable: true });
+  stdout.emit('resize');
+}
+
 // Poll until the frame stops changing for two consecutive checks. Right after
 // first paint, the app's own async side-channels (snapshot re-read, age/du/PR
 // mtime effects) are still landing renders; Ink's useInput effect briefly
@@ -173,6 +182,168 @@ test('a card renders gracefully with no harness/model/effort/branch/pr/endpoint 
   assert.match(frame, /scout-audit-x9/);
   assert.match(frame, /yourapp/);
   assert.doesNotMatch(frame, /fm\/scout-audit-x9/);
+  unmount();
+});
+
+test('a card needing the captain shows a NEEDS YOU badge, not the raw state text', async () => {
+  const snap = {
+    schema: 'fm-fleet-snapshot.v1',
+    tasks: [
+      {
+        id: 'audit-perms-x9',
+        kind: 'ship',
+        project: '/repos/yourapp',
+        current_state: { state: 'needs-decision' },
+        hints: { pending_decision: true, last_event_text: 'needs-decision: findings' },
+        paths: { worktree: { path: '/nonexistent/wt' } },
+        pr: { url: null },
+      },
+    ],
+    backlog: { records: [] },
+  };
+  const { home, bin } = await makeHome(snap);
+  const { lastFrame, unmount } = render(React.createElement(App, { bin, home }));
+  const frame = await waitForFrame(lastFrame, /audit-perms-x9/);
+  assert.match(frame, /NEEDS YOU/);
+  unmount();
+});
+
+test('a wedged-but-not-escalated crew shows a STALE badge even though its group is working', async () => {
+  // groupForTask files a raw 'stale' state under the 'working' group (a
+  // crewmate that stopped reporting is not yet a captain decision), but the
+  // badge must still say STALE - that distinction is the whole point of the
+  // badge existing, so a stale card is never mistaken for a healthy one.
+  const snap = {
+    schema: 'fm-fleet-snapshot.v1',
+    tasks: [
+      {
+        id: 'wedged-k4',
+        kind: 'ship',
+        project: '/repos/yourapp',
+        current_state: { state: 'stale' },
+        hints: {},
+        paths: { worktree: { path: '/nonexistent/wt' } },
+        pr: { url: null },
+      },
+    ],
+    backlog: { records: [] },
+  };
+  const { home, bin } = await makeHome(snap);
+  const { lastFrame, unmount } = render(React.createElement(App, { bin, home }));
+  const frame = await waitForFrame(lastFrame, /wedged-k4/);
+  // The card's own id/badge line must say STALE; the group header above it
+  // legitimately still says "WORKING (1)" (groupForTask files a stale-but-
+  // not-yet-escalated crew under 'working'), so scope the negative check to
+  // the card's own line rather than the whole frame.
+  const cardLine = frame.split('\n').find((l) => l.includes('wedged-k4'));
+  assert.match(cardLine, /STALE/);
+  assert.doesNotMatch(cardLine, /WORKING/);
+  unmount();
+});
+
+test('the metadata row is labeled (age/seen), not a bare dot-joined run-on sentence', async () => {
+  const snap = {
+    schema: 'fm-fleet-snapshot.v1',
+    tasks: [
+      {
+        id: 'login-k3',
+        kind: 'ship',
+        project: '/repos/yourapp',
+        current_state: { state: 'working' },
+        hints: {},
+        paths: { worktree: { path: '/nonexistent/wt' } },
+        pr: { url: null },
+        endpoint: { exists: true, target: 'default:w0:p2' },
+      },
+    ],
+    backlog: { records: [] },
+  };
+  const { home, bin } = await makeHome(snap);
+  const { lastFrame, unmount } = render(React.createElement(App, { bin, home }));
+  const frame = await waitForFrame(lastFrame, /login-k3/);
+  assert.match(frame, /age /);
+  // The old design joined every metadata field with '  ·  ' into one run-on
+  // sentence; the redesigned metadata row (the line with the branch chip)
+  // uses plain double-space separation instead. Scope to that line - the
+  // input line's own hint text legitimately uses ' · ' as a keybinding
+  // separator and must not make this assertion a false negative.
+  const metaLine = frame.split('\n').find((l) => l.includes('fm/login-k3'));
+  assert.doesNotMatch(metaLine, / · /);
+  unmount();
+});
+
+test('degraded state (a single in-flight card) still leaves QUEUED/RECENT DONE room, not a half-empty IN FLIGHT box', async () => {
+  // The core layout fix: IN FLIGHT must hug its own small content instead of
+  // reserving a fixed fair-share block, so the freed rows actually reach
+  // QUEUED/RECENT DONE. Assert this structurally rather than by pixel-
+  // counting: with only one card in flight and several queued/done records,
+  // every one of those backlog rows must still be visible in a normal-height
+  // terminal - if IN FLIGHT were still hogging a fixed 60% block, some of
+  // these would be truncated behind a "+N more" marker instead.
+  const snap = {
+    schema: 'fm-fleet-snapshot.v1',
+    tasks: [
+      {
+        id: 'solo-task-1',
+        kind: 'ship',
+        project: '/repos/yourapp',
+        current_state: { state: 'working' },
+        hints: {},
+        paths: { worktree: { path: '/nonexistent/wt' } },
+        pr: { url: null },
+      },
+    ],
+    backlog: {
+      records: [
+        ...Array.from({ length: 4 }, (_, i) => ({
+          structured: true,
+          state: 'queued',
+          id: `queued-${i}`,
+          title: `queued item ${i}`,
+          repo: 'yourapp',
+        })),
+      ],
+    },
+  };
+  const { home, bin } = await makeHome(snap);
+  const { lastFrame, stdout, unmount } = render(React.createElement(App, { bin, home }));
+  setTestRows(stdout, 40);
+  const frame = await waitForFrame(lastFrame, /solo-task-1/);
+  for (let i = 0; i < 4; i++) {
+    assert.match(frame, new RegExp(`queued-${i}`), `queued-${i} should be visible, not hidden behind a fixed-height void`);
+  }
+  assert.doesNotMatch(frame, /more/);
+  unmount();
+});
+
+test('the status strip stays a single line at a narrow width instead of wrapping onto a second row', async () => {
+  // Ink's default row Box wraps overflowing children onto a second line
+  // rather than clipping; that silently broke the "status strip is always
+  // exactly one line" contract (and the fixed board-chrome row math every
+  // other section's budget depends on) at a narrow terminal width before
+  // StatusStrip gained flexWrap:'nowrap' + per-segment truncation. Assert the
+  // frame's line count matches a normal-width render at the same height, so a
+  // wrap regression shows up as an extra row rather than needing pixel-exact
+  // string matching.
+  const snap = { schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } };
+  const { home, bin } = await makeHome(snap);
+  const { lastFrame, stdout, unmount } = render(React.createElement(App, { bin, home }));
+  setTestRows(stdout, 30);
+  await waitForFrame(lastFrame, /IN FLIGHT/);
+  await waitForSettled(lastFrame);
+  // Both widths stay below MIN_COLS_FOR_FULL_LAYOUT (70), so both renders use
+  // the same stacked `compact` layout - isolating StatusStrip's own narrow
+  // threshold (CARD_NARROW_WIDTH, 64) from the unrelated full/compact board
+  // switch, which legitimately changes total row count on its own. Settle
+  // fully after each resize before reading a frame, or a read can race the
+  // resize and compare a stale pre-resize frame instead.
+  setTestCols(stdout, 69);
+  await waitForSettled(lastFrame);
+  const wideLineCount = lastFrame().split('\n').length;
+  setTestCols(stdout, 50);
+  await waitForSettled(lastFrame);
+  const narrowLineCount = lastFrame().split('\n').length;
+  assert.equal(narrowLineCount, wideLineCount, 'narrowing the terminal at a fixed height must not add a wrapped row');
   unmount();
 });
 
