@@ -692,15 +692,6 @@ fi
 # (docs/herdr-backend.md "Known gaps").
 PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_ABS"
 
-real_path_or_raw() {  # <path>
-  local path=$1 real
-  if real=$(cd "$path" 2>/dev/null && pwd -P); then
-    printf '%s\n' "$real"
-  else
-    printf '%s\n' "$path"
-  fi
-}
-
 # Session-provider container-ensure + task creation. tmux stays exactly as P1
 # left it (same session-name / new-window sequence, see bin/backends/tmux.sh);
 # a herdr spawn goes through the version-gated, workspace-per-HOME,
@@ -709,19 +700,28 @@ real_path_or_raw() {  # <path>
 # herdr-sm-spaces-k4). Both branches converge on the same $T ("target") string
 # that every downstream operation (send/capture/kill) already treats as opaque
 # per-backend routing (fm_backend_resolve_selector).
+# Quiet predicate: 0 if <path> is a real, isolated git worktree (distinct from
+# the primary checkout), 1 otherwise. No output, no exit - safe to poll every
+# second while a fresh pane's cwd is still settling (e.g. a transient
+# /private/etc/paths.d reading before `treehouse get` has actually landed it).
+is_isolated_worktree() {  # <path>
+  local path=$1 real top top_real
+  real=
+  if ! real=$(cd "$path" 2>/dev/null && pwd -P); then
+    return 1
+  fi
+  top=$(git -C "$path" rev-parse --show-toplevel 2>/dev/null || true)
+  top_real=
+  if ! top_real=$(cd "$top" 2>/dev/null && pwd -P); then
+    return 1
+  fi
+  [ "$real" = "$top_real" ] && [ "$real" != "$PROJ_ABS_REAL" ]
+}
+
 validate_spawn_worktree() {  # <source> <inspect-target>
-  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
-  wt_real=
-  if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
-    wt_real=
-  fi
-  proj_real=$PROJ_ABS_REAL
-  wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
-  wt_top_real=
-  if ! wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P); then
-    wt_top_real=
-  fi
-  if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
+  local source=$1 inspect_target=$2 wt_top
+  if ! is_isolated_worktree "$WT"; then
+    wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
     exit 1
   fi
@@ -957,17 +957,34 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # automatic-rename slips through), display-message -t <bad-name> falls back to the
   # active client's window, which would misread firstmate's OWN pane path as the
   # worktree and tangle a hook into the primary checkout. The window id never lies.
-  # Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked project
-  # prefix would otherwise make the pane's OS-level cwd read differ from
-  # PROJ_ABS on the very first poll, before the pane has actually moved.
+  # Accept only a candidate that is already a genuine isolated worktree, not
+  # merely "different from the project dir": a freshly-created pane can
+  # momentarily report a transient/garbage cwd (observed: /private/etc/paths.d,
+  # touched during shell/PATH init) before `treehouse get` has actually landed
+  # it, and that transient path also differs from the project dir. Gating on
+  # is_isolated_worktree (the same check validate_spawn_worktree makes final)
+  # skips such transients and keeps polling instead of aborting on them.
+  last_seen=
   for _ in $(seq 1 60); do
     p=$(spawn_current_path "$WT_TARGET" || true)
-    if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
-      WT="$p"
-      break
+    if [ -n "$p" ]; then
+      last_seen=$p
+      if is_isolated_worktree "$p"; then
+        WT="$p"
+        break
+      fi
     fi
     sleep 1
   done
+  # The poll timed out without ever seeing a genuine isolated worktree. When it
+  # did observe a cwd, hand that one to validate_spawn_worktree so the refusal
+  # names the offending path and the primary checkout - the actionable
+  # diagnostic - instead of only the generic timeout. A poll that saw no cwd at
+  # all has nothing to name, so it keeps the timeout message.
+  if [ -z "$WT" ] && [ -n "$last_seen" ]; then
+    WT="$last_seen"
+    validate_spawn_worktree "treehouse get" "$T"
+  fi
   if [ -z "$WT" ]; then
     echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
     exit 1
