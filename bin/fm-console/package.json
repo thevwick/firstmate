@@ -1,0 +1,24 @@
+{
+  "name": "fm-console",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Full-screen terminal control surface for a single firstmate home. Reads on-disk fleet state and bridges captain commands into the running primary session. No network, no server.",
+  "type": "module",
+  "bin": {
+    "fm-console": "./src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/cli.js",
+    "test": "node --test --test-force-exit tests/state.test.js tests/commands.test.js tests/format.test.js tests/render.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ink": "6.3.1",
+    "react": "19.2.7"
+  },
+  "devDependencies": {
+    "ink-testing-library": "4.0.0"
+  }
+}
