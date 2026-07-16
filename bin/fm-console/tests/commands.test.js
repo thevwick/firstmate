@@ -56,6 +56,7 @@ test('resolveSupervisor uses FM_SUPERVISOR_TARGET and optional backend', () => {
   const r = resolveSupervisor({ FM_SUPERVISOR_TARGET: 'default:wG:p2', FM_SUPERVISOR_BACKEND: 'herdr' });
   assert.equal(r.target, 'default:wG:p2');
   assert.equal(r.backend, 'herdr');
+  assert.equal(r.source, 'FM_SUPERVISOR_TARGET');
   assert.equal(r.error, undefined);
 });
 
@@ -65,12 +66,60 @@ test('resolveSupervisor omits backend when not set', () => {
   assert.equal(r.backend, null);
 });
 
-test('resolveSupervisor is fail-closed: no target means no bridge, never a guess', () => {
+test('resolveSupervisor is fail-closed: no target and nothing auto-detectable means no bridge, never a guess', () => {
   const r = resolveSupervisor({});
   assert.equal(r.target, undefined);
   assert.ok(r.error);
-  // Must not fall back to the console's own pane signals.
-  const r2 = resolveSupervisor({ TMUX_PANE: '%9', HERDR_PANE_ID: 'wZ:p9' });
-  assert.ok(r2.error);
-  assert.equal(r2.target, undefined);
+});
+
+test('resolveSupervisor auto-detects tmux from TMUX_PANE, mirroring the afk daemon', () => {
+  const r = resolveSupervisor({ TMUX_PANE: '%9' });
+  assert.equal(r.target, '%9');
+  assert.equal(r.backend, 'tmux');
+  assert.equal(r.source, 'TMUX_PANE');
+  assert.equal(r.error, undefined);
+});
+
+test('resolveSupervisor auto-detects herdr from HERDR_ENV=1 + HERDR_PANE_ID, mirroring the afk daemon', () => {
+  const r = resolveSupervisor({ HERDR_ENV: '1', HERDR_PANE_ID: 'p9', HERDR_SESSION: 'wZ' });
+  assert.equal(r.target, 'wZ:p9');
+  assert.equal(r.backend, 'herdr');
+  assert.equal(r.source, 'HERDR_ENV');
+  assert.equal(r.error, undefined);
+});
+
+test('resolveSupervisor defaults the herdr session to "default" when HERDR_SESSION is unset', () => {
+  const r = resolveSupervisor({ HERDR_ENV: '1', HERDR_PANE_ID: 'p9' });
+  assert.equal(r.target, 'default:p9');
+  assert.equal(r.backend, 'herdr');
+});
+
+test('resolveSupervisor requires HERDR_ENV=1, not just HERDR_PANE_ID, before trusting herdr signals', () => {
+  const r = resolveSupervisor({ HERDR_PANE_ID: 'p9' });
+  assert.ok(r.error);
+  assert.equal(r.target, undefined);
+});
+
+test('resolveSupervisor prefers an explicit FM_SUPERVISOR_TARGET over auto-detected pane signals', () => {
+  const r = resolveSupervisor({
+    FM_SUPERVISOR_TARGET: 'firstmate:0',
+    TMUX_PANE: '%9',
+    HERDR_ENV: '1',
+    HERDR_PANE_ID: 'p9',
+  });
+  assert.equal(r.target, 'firstmate:0');
+  assert.equal(r.source, 'FM_SUPERVISOR_TARGET');
+});
+
+test('resolveSupervisor prefers TMUX_PANE over herdr signals, mirroring the daemon nesting rule', () => {
+  const r = resolveSupervisor({ TMUX_PANE: '%9', HERDR_ENV: '1', HERDR_PANE_ID: 'p9' });
+  assert.equal(r.target, '%9');
+  assert.equal(r.backend, 'tmux');
+});
+
+test('resolveSupervisor never falls back to a guessed default pane', () => {
+  const r = resolveSupervisor({ SOME_UNRELATED_VAR: 'x' });
+  assert.ok(r.error);
+  assert.equal(r.target, undefined);
+  assert.equal(r.backend, undefined);
 });
