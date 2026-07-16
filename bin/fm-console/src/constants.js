@@ -43,16 +43,37 @@ export const RECENT_DONE_LIMIT = 6;
 export const MIN_ROWS_FOR_FULL_LAYOUT = 24;
 export const MIN_COLS_FOR_FULL_LAYOUT = 70;
 
-// Terminal rows one in-flight card draws: id/health/model line, size/age/
-// branch/endpoint line, and the fuller status line. Ink has no scrolling, so
+// Terminal rows one in-flight card draws: a headline row (id + state badge +
+// model chip) and a metadata row (size/age/branch/PR/endpoint, with the
+// fuller last-event text trailing when it fits). Ink has no scrolling, so
 // this must match the Card component's actual row count exactly - the row
 // budget in state.js's computeRowBudget is spent against this unit, not a
 // per-card count, or a multi-line card silently overflows its section (see
 // the Card and capRows comments in app.js).
-export const CARD_ROW_HEIGHT = 3;
+export const CARD_ROW_HEIGHT = 2;
 
-// Below this content width a card drops its least-important line-2 fields
+// Below this content width a card drops its least-important metadata fields
 // (endpoint, then branch/PR, then size) one at a time rather than wrapping
 // them into an unreadable run-on line.
 export const CARD_NARROW_WIDTH = 64;
 export const CARD_VERY_NARROW_WIDTH = 48;
+
+// Terminal rows a board section's own chrome costs: 2 border lines (top and
+// bottom) plus 1 title line. The one place this is defined; state.js's
+// computeRowBudget spends its body-row math against it, and app.js's
+// content-hugging IN FLIGHT height must add exactly this back on top of the
+// capped body-row count, or the two drift and a card's headline row silently
+// clips (the Ink no-scrolling corruption the Card/capRows comments warn about).
+export const SECTION_ROW_CHROME = 3;
+
+// Terminal color per state.js's healthLevel ('green'/'yellow'/'red'/'grey'),
+// used for a card's left border stripe, its health dot, and its state badge -
+// the "heat-map" requirement: a card needing the captain must read as red at
+// a glance, not just a small dot. The one place this state->color mapping is
+// defined; app.js imports it rather than keeping its own copy.
+export const HEALTH_COLORS = {
+  green: 'green',
+  yellow: 'yellow',
+  red: 'red',
+  grey: 'gray',
+};
