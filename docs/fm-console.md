@@ -44,10 +44,16 @@ On top of the snapshot the console computes a few header facts the snapshot omit
 A failed or timed-out snapshot read keeps the last good snapshot on screen rather than blanking the board - a transient read hiccup must never look like an empty fleet.
 
 IN FLIGHT holds every live task card (from `state/<id>.meta`) whose state is not `done`, sub-grouped by state into NEEDS YOU, READY, WORKING, and BLOCKED.
-A card is one line: the task id, repo, kind, PR checks status when present, and its current state or last event line.
-Worktree size (`du`) and PR-checks (`gh-axi`) are read on a slower cadence and threaded in asynchronously, so a slow `du` or a torn-down worktree never freezes or crashes the board.
+A card is three lines, so the captain can read what a crewmate is doing and which instance runs it without opening its pane.
+Line 1 is a color-coded health dot, the task id, repo, kind, and a `harness/model` chip with effort appended when it is not the harness default (for example `claude/sonnet` or `claude/opus high`).
+The health dot is the primary at-a-glance signal: green means provably working or ready, yellow means the crew's raw state is `stale`, red means the card needs the captain (a decision, a block, or a failure), and dim grey means done or genuinely unknown.
+It is derived from the same `fm-crew-state.sh` read the snapshot already threads through `current_state`, not a separate call.
+Line 2 is worktree size, age since the task was spawned and time since its last status update (for example `6m / last 40s ago`), the crew branch (conventionally `fm/<id>` for a ship task, omitted for scout/secondmate work), the PR number and checks status when a PR is recorded, and the backend endpoint (the `window=` value, so the captain knows which tab to jump to) - narrowing by dropping the endpoint, then branch/PR, then size, one at a time below a width threshold rather than wrapping them into a run-on line.
+Line 3 is the fuller current-state or last-event text, still truncated to width rather than wrapped, so a card never grows past its fixed three rows.
+Worktree size, age/last-event mtimes, and PR-checks are read on their own async side-channels and threaded in as they resolve (`…`/a grey dot placeholder until then), so a slow `du`, a slow `gh-axi` call, or a torn-down worktree never freezes or crashes the board; age/last-event use a cheap single `stat` per file so they refresh on the board's own fast cadence, while worktree size and PR-checks run on the slower `du` cadence.
 A ticket key parsed from the branch or brief (for example `SMM-2808`) shows as a small chip, but a ticket is optional metadata: a task without one, such as `poc/*` work, renders as first-class.
 `fm-fleet-snapshot.sh` bounds each task's `fm-crew-state.sh` read to `FM_SNAPSHOT_CREW_STATE_TIMEOUT` seconds (default 8) so one slow or wedged `no-mistakes` call cannot blank the entire fleet out of the board - only that one task degrades to an `unknown` state.
+Because each card is now three rows instead of one, the row budget (`computeRowBudget` in `state.js`) still returns a terminal-line count, but the section-capping logic in `app.js` (`capRows`) accounts for each entry's actual row height - a group label is one row, a card is `CARD_ROW_HEIGHT` (three) - so a section can never be handed more rows than it has space for.
 
 QUEUED holds structured queued backlog records; RECENT DONE holds the most recent structured Done backlog records plus any live `done`-state task cards, most-recent-first.
 An empty fleet is shown as the healthy resting state it is, not an error.
@@ -72,6 +78,6 @@ Destructive quick-actions require an explicit confirm keystroke in the console b
 
 ## Tests
 
-The Node package's unit tests cover the pure logic (state parsing, ticket extraction, card grouping, board-section derivation, row-budget math, command composition, and fail-closed-but-auto-detecting bridge target resolution), plus render tests that boot the app against a stubbed home with `ink-testing-library`, including a regression test for a rendering bug where multiple IN FLIGHT groups plus non-empty QUEUED/RECENT DONE content overflowed Ink's fixed-height layout and silently blanked card id lines.
+The Node package's unit tests cover the pure logic (state parsing, ticket extraction, card grouping, board-section derivation, row-budget math, command composition, health-level mapping, model/effort profile formatting, branch derivation, and fail-closed-but-auto-detecting bridge target resolution), plus render tests that boot the app against a stubbed home with `ink-testing-library`, including a regression test for a rendering bug where multiple IN FLIGHT groups plus non-empty QUEUED/RECENT DONE content overflowed Ink's fixed-height layout and silently blanked card id lines, and a render test confirming a card degrades gracefully (no crash, no blank chip) when harness/model/effort/branch/PR/endpoint are all absent from its snapshot task.
 `tests/fm-console.test.sh` is the shell smoke test: it verifies the launcher self-locates, the app boots headlessly without a crash, and the Node suite passes.
 Run the Node suite alone with `npm test` inside `bin/fm-console/`.
