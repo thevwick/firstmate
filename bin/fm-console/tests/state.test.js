@@ -15,6 +15,7 @@ import {
   queuedBacklogRecords,
   recentDoneBacklogRecords,
   computeRowBudget,
+  inFlightContentRowCount,
   healthLevel,
   formatProfile,
   branchForTask,
@@ -297,4 +298,45 @@ test('computeRowBudget grows all three sections as the terminal gets taller', ()
   assert.ok(tall.inFlightRows > short.inFlightRows);
   assert.ok(tall.queuedRows >= short.queuedRows);
   assert.ok(tall.doneRows >= short.doneRows);
+});
+
+test('computeRowBudget shrinks IN FLIGHT to its actual content and hands the freed rows to the bottom sections', () => {
+  // The core fix for the "half-empty box" problem: a single small card must
+  // not reserve the same acreage as computeRowBudget's fair-share ceiling.
+  const fairShare = computeRowBudget({ height: 60, hasFooter: false, hasInFlight: true });
+  const oneCard = computeRowBudget({ height: 60, hasFooter: false, hasInFlight: true, inFlightContentRows: 3 });
+  assert.ok(oneCard.inFlightRows < fairShare.inFlightRows, 'a small card must shrink below the fair-share ceiling');
+  assert.equal(oneCard.inFlightRows, 4, 'content rows (3) plus 1 row of margin');
+  // Whatever IN FLIGHT no longer claims flows to QUEUED/RECENT DONE.
+  assert.ok(oneCard.queuedRows + oneCard.doneRows > fairShare.queuedRows + fairShare.doneRows);
+});
+
+test('computeRowBudget caps IN FLIGHT at the fair-share ceiling when content exceeds it, never growing past it', () => {
+  const budget = computeRowBudget({ height: 40, hasFooter: false, hasInFlight: true, inFlightContentRows: 999 });
+  const fairShare = computeRowBudget({ height: 40, hasFooter: false, hasInFlight: true });
+  assert.equal(budget.inFlightRows, fairShare.inFlightRows);
+});
+
+test('computeRowBudget never returns a non-positive row count across a range of inFlightContentRows values', () => {
+  for (const height of [10, 20, 24, 30, 40, 60, 100]) {
+    for (const inFlightContentRows of [null, 0, 1, 3, 10, 999]) {
+      const budget = computeRowBudget({ height, hasFooter: true, hasInFlight: true, inFlightContentRows });
+      assert.ok(budget.inFlightRows >= 1, `inFlightRows at height=${height}, content=${inFlightContentRows}`);
+      assert.ok(budget.queuedRows >= 1, `queuedRows at height=${height}, content=${inFlightContentRows}`);
+      assert.ok(budget.doneRows >= 1, `doneRows at height=${height}, content=${inFlightContentRows}`);
+    }
+  }
+});
+
+test('inFlightContentRowCount sums a label row plus CARD_ROW_HEIGHT per card, across only non-empty groups', () => {
+  const grouped = new Map([
+    ['needs-you', [{ id: 'a' }]],
+    ['working', [{ id: 'b' }, { id: 'c' }]],
+  ]);
+  // 1 label + 2 card rows (needs-you) + 1 label + 4 card rows (working) = 8.
+  assert.equal(inFlightContentRowCount(grouped), 8);
+});
+
+test('inFlightContentRowCount is 0 for an empty grouping', () => {
+  assert.equal(inFlightContentRowCount(new Map()), 0);
 });

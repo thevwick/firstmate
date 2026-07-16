@@ -7,8 +7,11 @@
 //   2. Status strip - one compact line: disk, watcher dot, afk, in-flight,
 //      queued/blocked counts. No prose here, ever.
 //   3. Board - fills all remaining height. IN FLIGHT, QUEUED, RECENT DONE.
-//      When IN FLIGHT is empty the other two sections expand to fill the
-//      space instead of leaving a void.
+//      IN FLIGHT sizes to its own content (a fixed height) whenever that
+//      content is smaller than its fair share, rather than always stretching
+//      to fill the row - a single card must not reserve acres of blank space
+//      below it. Whatever it does not use, and all of it when IN FLIGHT is
+//      empty, flows to QUEUED/RECENT DONE instead of sitting idle.
 //   4. Footer - one line, only present when something needs a warning
 //      (watcher down, bridge disabled, a snapshot read error).
 //   5. Input line - pinned at the bottom.
@@ -34,6 +37,8 @@ import {
   CARD_ROW_HEIGHT,
   CARD_NARROW_WIDTH,
   CARD_VERY_NARROW_WIDTH,
+  HEALTH_COLORS,
+  SECTION_ROW_CHROME,
 } from './constants.js';
 import {
   buildCard,
@@ -42,6 +47,7 @@ import {
   queuedBacklogRecords,
   recentDoneBacklogRecords,
   computeRowBudget,
+  inFlightContentRowCount,
 } from './state.js';
 import {
   QUICK_ACTIONS,
@@ -64,22 +70,15 @@ import { resolveSupervisor, sendCommand } from './bridge.js';
 const h = React.createElement;
 const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
+// Group-header color, used only for the NEEDS YOU/READY/WORKING/BLOCKED
+// section labels inside IN FLIGHT - distinct from a card's own HEALTH_COLORS
+// accent (constants.js), which drives the per-card border stripe and badge.
 const GROUP_COLORS = {
   'needs-you': 'red',
   ready: 'green',
   working: 'cyan',
   blocked: 'yellow',
   done: 'gray',
-};
-
-// Health-dot color per state.js's healthLevel: green = provably working,
-// yellow = stale/idle, red = needs a captain decision or is stuck, grey = a
-// settled/unknown card (done, or health not yet resolved).
-const HEALTH_COLORS = {
-  green: 'green',
-  yellow: 'yellow',
-  red: 'red',
-  grey: 'gray',
 };
 
 const BRAND = 'magentaBright';
@@ -92,47 +91,58 @@ function nowSecs() {
 function TitleBar({ home, width }) {
   return h(
     Box,
-    { justifyContent: 'space-between', paddingX: 1 },
+    { justifyContent: 'space-between', paddingX: 1, flexWrap: 'nowrap' },
     h(
       Box,
-      null,
-      h(Text, { bold: true, color: BRAND }, '⚓ FIRSTMATE'),
-      h(Text, { dimColor: true }, '  control console')
+      { flexWrap: 'nowrap' },
+      h(Text, { bold: true, color: BRAND, wrap: 'truncate-end' }, '⚓ FIRSTMATE'),
+      h(Text, { dimColor: true, wrap: 'truncate-end' }, '  control console')
     ),
-    h(Text, { dimColor: true }, truncate(home, Math.max(10, width - 34)))
+    h(Text, { dimColor: true, wrap: 'truncate-end' }, truncate(home, Math.max(10, width - 34)))
   );
 }
 
 // Compact single-line status strip: disk, watcher dot, afk, in-flight,
 // queued/blocked. This replaces the old multi-line header prose entirely -
-// nothing here should ever grow past one line.
-function StatusStrip({ header }) {
+// nothing here should ever grow past one line. `flexWrap: 'nowrap'` plus a
+// `wrap: 'truncate-end'` Text is deliberate on every segment: Ink's default
+// row Box wraps overflowing children onto a second line instead of clipping,
+// which silently broke the one-line contract (and the fixed board-chrome
+// row-count computeRowBudget assumes) on a narrow terminal - truncating a
+// segment is the correct degrade, never a second row. Segments narrow from
+// least to most essential below CARD_NARROW_WIDTH: afk drops first (it is
+// only ever a state flag, restated in full whenever it actually matters),
+// then disk detail shrinks to just the free-space number.
+function StatusStrip({ header, width }) {
+  const narrow = width < CARD_NARROW_WIDTH;
   const diskText =
     header.diskFree == null
       ? 'disk ?'
-      : `disk ${humanBytes(header.diskFree)} free${
-          header.diskUsePct == null ? '' : ` (${header.diskUsePct}%)`
-        }`;
+      : narrow
+        ? humanBytes(header.diskFree)
+        : `disk ${humanBytes(header.diskFree)} free${
+            header.diskUsePct == null ? '' : ` (${header.diskUsePct}%)`
+          }`;
   const diskColor = header.diskUsePct != null && header.diskUsePct >= 90 ? 'red' : 'white';
   const watcherColor = header.watcherAlive ? 'green' : 'red';
 
-  const sep = h(Text, { dimColor: true }, '  │  ');
+  const sep = h(Text, { dimColor: true, wrap: 'truncate-end' }, '  │  ');
 
   return h(
     Box,
-    { paddingX: 1 },
-    h(Text, { color: diskColor }, diskText),
+    { paddingX: 1, flexWrap: 'nowrap' },
+    h(Text, { color: diskColor, wrap: 'truncate-end' }, diskText),
     sep,
-    h(Text, { color: watcherColor }, '●'),
-    h(Text, { color: watcherColor }, header.watcherAlive ? ' watcher' : ' watcher down'),
+    h(Text, { color: watcherColor, wrap: 'truncate-end' }, '●'),
+    h(Text, { color: watcherColor, wrap: 'truncate-end' }, header.watcherAlive ? ' watcher' : ' watcher down'),
+    narrow ? null : sep,
+    narrow ? null : h(Text, { color: header.afk ? 'yellow' : 'gray', wrap: 'truncate-end' }, header.afk ? '● afk' : '○ present'),
     sep,
-    h(Text, { color: header.afk ? 'yellow' : 'gray' }, header.afk ? '● afk' : '○ present'),
-    sep,
-    h(Text, { bold: true, color: header.inFlight > 0 ? 'cyan' : 'gray' }, `${header.inFlight} in flight`),
+    h(Text, { bold: true, color: header.inFlight > 0 ? 'cyan' : 'gray', wrap: 'truncate-end' }, `${header.inFlight} in flight`),
     sep,
     h(
       Text,
-      null,
+      { wrap: 'truncate-end' },
       `${header.queued} queued`,
       header.blocked ? h(Text, { color: 'yellow' }, ` (${header.blocked} blocked)`) : null
     )
@@ -152,81 +162,100 @@ function Footer({ header, supervisor, snapError }) {
   if (!parts.length) return null;
   return h(
     Box,
-    { paddingX: 1 },
+    { paddingX: 1, flexWrap: 'nowrap' },
     ...parts.flatMap((p, i) => [
-      i > 0 ? h(Text, { key: `sep-${i}`, dimColor: true }, '  ·  ') : null,
+      i > 0 ? h(Text, { key: `sep-${i}`, dimColor: true, wrap: 'truncate-end' }, '  ·  ') : null,
       h(Text, { key: `w-${i}`, color: p.color, wrap: 'truncate-end' }, p.text),
     ]).filter(Boolean)
   );
 }
 
-// One task card: exactly CARD_ROW_HEIGHT (3) terminal rows, colour-coded by
-// state. Ink has no scrolling and a fixed-height flex tree that receives more
-// rows than it has space for can visibly corrupt the render (rows silently
-// losing content) rather than clipping cleanly, so sections cap their row
-// COUNT in JS (see capRows below) instead of relying on Yoga/terminal overflow
-// to hide the excess - which is why this component's actual row count must
-// stay in lockstep with CARD_ROW_HEIGHT in constants.js.
-//
-// Line 1: health dot + id + repo + kind + model/effort profile chip.
-// Line 2: size + age/last-event + branch/PR + backend endpoint, narrowing by
-//   dropping endpoint, then branch/PR, then size, below CARD_NARROW_WIDTH /
-//   CARD_VERY_NARROW_WIDTH rather than wrapping them into a run-on line.
-// Line 3: the fuller status line (still truncated to width, never wrapped -
-//   Ink's own wrapping would grow the card past 3 rows and corrupt the
-//   section's row budget).
+// Short badge text for a card's state pill. Prefers the raw crew state over
+// the coarser board group when the raw state is more informative - a card
+// filed under the 'working' group whose raw state is 'stale' must say STALE,
+// not WORKING, since a wedged-but-not-yet-escalated crew is exactly the case
+// the badge exists to surface (mirrors state.js's healthLevel reasoning).
+function badgeText(card) {
+  if (card.stateRaw === 'stale') return 'STALE';
+  return GROUP_LABELS[card.group] || String(card.stateRaw || 'working').toUpperCase();
+}
+
+// One task card, colour-coded by state end to end: a left border stripe in
+// the health color (the heat-map requirement - a card needing the captain
+// reads red before you even parse the text), a headline row (id, then a
+// colored state BADGE, then the model/effort chip), and a dim metadata row
+// (size, age/last-event, branch/PR, endpoint - labeled and space-separated,
+// not a run-on dot-joined sentence), narrowing by dropping fields below
+// CARD_NARROW_WIDTH / CARD_VERY_NARROW_WIDTH. Exactly CARD_ROW_HEIGHT (2)
+// terminal rows: Ink has no scrolling and a fixed-height flex tree that
+// receives more rows than it has space for can visibly corrupt the render
+// (rows silently losing content) rather than clipping cleanly, so sections
+// cap their row COUNT in JS (see capRows below) instead of relying on
+// Yoga/terminal overflow to hide the excess - which is why this component's
+// actual row count must stay in lockstep with CARD_ROW_HEIGHT in
+// constants.js. The border stripe itself costs 0 extra rows (borderTop/
+// borderBottom are disabled; only the left column draws).
 function Card({ card, selected, width }) {
-  const color = GROUP_COLORS[card.group] || 'white';
   const healthColor = HEALTH_COLORS[card.health] || 'gray';
   const chips = card.ticket ? ` [${card.ticket}]` : '';
+  const contentWidth = Math.max(6, width - 2);
 
-  const line1 = h(
+  const headline = h(
     Box,
-    null,
-    h(Text, { color: healthColor }, '● '),
+    { flexWrap: 'nowrap' },
     h(
       Text,
-      { color: selected ? 'black' : color, backgroundColor: selected ? color : undefined, bold: true },
-      `${card.id} `
+      { color: selected ? 'black' : 'whiteBright', backgroundColor: selected ? healthColor : undefined, bold: true, wrap: 'truncate-end' },
+      ` ${card.id} `
     ),
-    chips ? h(Text, { color: 'blueBright' }, chips) : null,
-    h(Text, { dimColor: true }, ` ${card.repo} · ${card.kind}`),
-    card.profile ? h(Text, { color: 'magentaBright' }, `  ${card.profile}`) : null
+    h(Text, { color: healthColor, bold: true, wrap: 'truncate-end' }, ` ${badgeText(card)} `),
+    chips ? h(Text, { color: 'blueBright', wrap: 'truncate-end' }, chips) : null,
+    card.profile ? h(Text, { color: 'magentaBright', wrap: 'truncate-end' }, ` ${card.profile}`) : null,
+    h(Text, { dimColor: true, wrap: 'truncate-end' }, ` ${card.repo}${card.kind !== 'ship' ? ` · ${card.kind}` : ''}`)
   );
 
-  const line2Parts = [];
+  const metaParts = [];
   if (card.duBytes != null || width >= CARD_NARROW_WIDTH) {
-    line2Parts.push(card.duBytes != null ? humanBytes(card.duBytes) : '…');
+    metaParts.push(card.duBytes != null ? humanBytes(card.duBytes) : '…');
   }
   const ageText = card.ageSecs != null ? humanDuration(card.ageSecs) : '…';
-  const lastEventText = card.lastEventSecs != null ? `last ${humanDuration(card.lastEventSecs)} ago` : null;
-  line2Parts.push(lastEventText ? `${ageText} / ${lastEventText}` : ageText);
+  metaParts.push(`age ${ageText}`);
+  if (card.lastEventSecs != null) metaParts.push(`seen ${humanDuration(card.lastEventSecs)} ago`);
   if (width >= CARD_NARROW_WIDTH) {
-    if (card.branch) line2Parts.push(card.branch);
+    if (card.branch) metaParts.push(card.branch);
     if (card.prUrl) {
       const prNum = (String(card.prUrl).match(/\/pull\/(\d+)/) || [])[1];
       const prChecksText = card.prChecks ? `:${card.prChecks}` : '';
-      line2Parts.push(`PR${prNum ? `#${prNum}` : ''}${prChecksText}`);
+      metaParts.push(`PR${prNum ? `#${prNum}` : ''}${prChecksText}`);
     }
   }
   if (width >= CARD_VERY_NARROW_WIDTH && card.endpointTarget) {
-    line2Parts.push(card.endpointTarget);
+    metaParts.push(card.endpointTarget);
   }
+  const detail = card.lastEvent || card.stateDetail || '';
+  if (detail) metaParts.push(detail);
+
   const prColor = card.prChecks === 'failing' ? 'red' : card.prChecks === 'passing' ? 'green' : 'cyan';
-  const line2 = h(
+  const meta = h(
     Text,
     { dimColor: true, color: card.prUrl ? prColor : undefined, wrap: 'truncate-end' },
-    `   ${truncate(line2Parts.join('  ·  '), Math.max(6, width - 3))}`
+    ` ${truncate(metaParts.join('  '), Math.max(6, contentWidth - 1))}`
   );
 
-  const detail = card.lastEvent || `${card.stateRaw}${card.stateDetail ? ` · ${card.stateDetail}` : ''}`;
-  const line3 = h(
-    Text,
-    { dimColor: true, wrap: 'truncate-end' },
-    `   ${truncate(detail, Math.max(6, width - 3))}`
+  return h(
+    Box,
+    {
+      flexDirection: 'column',
+      borderStyle: 'round',
+      borderTop: false,
+      borderBottom: false,
+      borderRight: false,
+      borderLeft: true,
+      borderLeftColor: healthColor,
+    },
+    headline,
+    meta
   );
-
-  return h(Box, { flexDirection: 'column' }, line1, line2, line3);
 }
 
 // A backlog-only row (QUEUED, RECENT DONE) that has no live task card: one
@@ -247,8 +276,8 @@ function BacklogRow({ record, width }) {
   // measure a hair wider than truncate()'s plain character count.
   return h(
     Box,
-    null,
-    h(Text, { color: record?.blocked_by ? 'yellow' : 'gray' }, record?.blocked_by ? ' ⏸ ' : ' • '),
+    { flexWrap: 'nowrap' },
+    h(Text, { color: record?.blocked_by ? 'yellow' : 'gray', wrap: 'truncate-end' }, record?.blocked_by ? ' ⏸ ' : ' • '),
     h(Text, { dimColor: true, wrap: 'truncate-end' }, truncate(text, Math.max(4, width - 4)))
   );
 }
@@ -259,7 +288,7 @@ function BacklogRow({ record, width }) {
 // space - see the Card comment above for why that overflow path corrupts the
 // render. Entries are plain Ink nodes (implicit height 1, e.g. a group label
 // or a BacklogRow) or `{ node, height }` for a multi-row entry such as a
-// 3-row Card; a plain-node entry list therefore behaves exactly as before
+// 2-row Card; a plain-node entry list therefore behaves exactly as before
 // this height-aware accounting was added.
 function capRows(entries, maxRows, moreLabel) {
   const heightOf = (e) => (e && typeof e === 'object' && 'height' in e ? e.height : 1);
@@ -288,23 +317,30 @@ function capRows(entries, maxRows, moreLabel) {
   return kept;
 }
 
-// One board section: a bordered, colour-titled box. `flexGrow` lets the
-// IN FLIGHT section (usually the most content) claim the most space while
-// still letting QUEUED/RECENT DONE expand to fill the screen when IN FLIGHT
-// is empty - the degraded-state requirement from the redesign: no giant void.
-// `maxRows`, when given, caps how many body rows are handed to Ink (see
-// capRows) so this section alone can never overflow its allotted height.
-function Section({ title, color, count, rows, maxRows, flexGrow = 1, emptyText }) {
+// One board section: a bordered, colour-titled box whose title doubles as a
+// single-line divider (no separate blank row beneath it - deliberate spacing
+// discipline, not a default). Pass `height` for a section that should hug its
+// own content instead of stretching to fill the parent flex row (IN FLIGHT
+// when it is smaller than its fair share - the fix for the half-empty-box
+// problem); pass `flexGrow` for a section that should absorb whatever space
+// siblings leave unclaimed (QUEUED/RECENT DONE always, IN FLIGHT when its
+// content meets or exceeds its fair share). `maxRows`, when given, caps how
+// many body rows are handed to Ink (see capRows) so this section alone can
+// never overflow its allotted height.
+function Section({ title, color, count, rows, maxRows, flexGrow, height, emptyText }) {
   const body = rows && rows.length ? capRows(rows, maxRows, 'below') : null;
+  const box = { flexDirection: 'column', borderStyle: 'round', borderColor: color, paddingX: 1 };
+  if (height != null) box.height = height;
+  else box.flexGrow = flexGrow || 1;
   return h(
     Box,
-    { flexDirection: 'column', flexGrow, borderStyle: 'round', borderColor: color, paddingX: 1 },
+    box,
     h(Text, { bold: true, color }, `${title}${count != null ? ` (${count})` : ''}`),
     body || h(Text, { dimColor: true }, emptyText || 'nothing here')
   );
 }
 
-function InFlightSection({ grouped, selectedId, width, flexGrow, maxRows }) {
+function InFlightSection({ grouped, selectedId, width, flexGrow, height, maxRows }) {
   const anyCards = GROUP_ORDER.some((g) => (grouped.get(g) || []).length > 0);
   const rows = anyCards
     ? GROUP_ORDER.flatMap((g) => {
@@ -324,6 +360,7 @@ function InFlightSection({ grouped, selectedId, width, flexGrow, maxRows }) {
     title: 'IN FLIGHT',
     color: 'cyan',
     flexGrow,
+    height,
     maxRows,
     rows,
     emptyText: 'Nothing in flight - a healthy resting state.',
@@ -688,12 +725,23 @@ export default function App({ bin, home }) {
   // BEFORE Ink ever sees it - computeRowBudget (state.js) is the pure,
   // unit-tested math; each section is then capped to fit via capRows.
   const footerLines = snapError || !header.watcherAlive || supervisor.error ? 1 : 0;
+  const inFlightContentRows = inFlightContentRowCount(inFlightGrouped);
   const { inFlightRows, queuedRows, doneRows } = computeRowBudget({
     height,
     hasFooter: footerLines > 0,
     hasInFlight: inFlight.length > 0,
+    inFlightContentRows: inFlight.length ? inFlightContentRows : null,
   });
 
+  // IN FLIGHT hugs its own content (a fixed height: SECTION_ROW_CHROME plus
+  // its capped body rows) whenever that content is smaller than the space
+  // computeRowBudget would otherwise give it - this is the fix for the
+  // half-empty-box problem: a single card no longer reserves acres of blank
+  // space below it. Once content meets or exceeds the row budget (a large
+  // fleet), IN FLIGHT switches to flexGrow so it still competes for space
+  // like the other sections instead of clipping at an arbitrary fixed size.
+  const inFlightHugsContent = inFlight.length > 0 && inFlightContentRows < inFlightRows;
+  const inFlightHeight = inFlightHugsContent ? SECTION_ROW_CHROME + inFlightRows : null;
   const inFlightGrow = inFlight.length ? 3 : 1;
 
   // Each Section pays 1 col of border + 1 col of padding on each side (4
@@ -713,7 +761,8 @@ export default function App({ bin, home }) {
           grouped: inFlightGrouped,
           selectedId,
           width: fullContentWidth,
-          flexGrow: inFlightGrow,
+          flexGrow: inFlightHeight == null ? inFlightGrow : undefined,
+          height: inFlightHeight,
           maxRows: inFlightRows,
         }),
         h(QueuedSection, {
@@ -732,7 +781,8 @@ export default function App({ bin, home }) {
           grouped: inFlightGrouped,
           selectedId,
           width: fullContentWidth,
-          flexGrow: inFlightGrow,
+          flexGrow: inFlightHeight == null ? inFlightGrow : undefined,
+          height: inFlightHeight,
           maxRows: inFlightRows,
         }),
         h(
@@ -759,7 +809,7 @@ export default function App({ bin, home }) {
     Box,
     { flexDirection: 'column', width, height, overflowY: 'hidden' },
     h(TitleBar, { home, width }),
-    h(StatusStrip, { header }),
+    h(StatusStrip, { header, width }),
     boardRow,
     h(Footer, { header, supervisor, snapError }),
     h(InputLine, { input, pendingConfirm, quickMenu, selectedId, message })

@@ -7,7 +7,7 @@
 // snapshot into cards and computes a few header facts the snapshot omits
 // (disk, watcher liveness, afk), which are cheap, console-local reads.
 
-import { WATCHER_GRACE_SECS } from './constants.js';
+import { WATCHER_GRACE_SECS, GROUP_ORDER, CARD_ROW_HEIGHT, SECTION_ROW_CHROME } from './constants.js';
 
 // Extract a ticket chip from a task's branch name or brief text, if one is
 // present. A ticket is OPTIONAL metadata: many tasks (e.g. poc/* work) have
@@ -204,34 +204,70 @@ export function recentDoneBacklogRecords(snapshot, limit = 5) {
     .reverse();
 }
 
-// Compute how many body rows each board section may draw, given the
-// terminal height and whether anything is in flight. Pure and unit-testable
-// on purpose: Ink has no scrolling, so handing a fixed-height flex tree more
-// rows than it has space for can corrupt the render rather than clip it
-// cleanly (rows losing content unpredictably, not just the last ones, because
-// Yoga distributes the shortfall across the whole tree). Every row that will
-// be drawn must therefore be counted here, in JS, before Ink ever sees it -
-// the caller caps each section's row list to the returned budget.
+// Compute how many body rows each board section may draw, given the terminal
+// height and how many rows IN FLIGHT's actual content needs. Pure and
+// unit-testable on purpose: Ink has no scrolling, so handing a fixed-height
+// flex tree more rows than it has space for can corrupt the render rather
+// than clip it cleanly (rows losing content unpredictably, not just the last
+// ones, because Yoga distributes the shortfall across the whole tree). Every
+// row that will be drawn must therefore be counted here, in JS, before Ink
+// ever sees it - the caller caps each section's row list to the returned
+// budget.
 //
 // Fixed chrome subtracted from `height` before splitting: title(1) + status
 // strip(1) + footer(0 or 1) + input box (2 borders + 1 message/menu/confirm
 // line + input line + hint line = 5). Each of the three board sections then
-// pays its own 3 rows of border+title chrome before the remainder is split
-// into body rows: IN FLIGHT gets a larger share when it has content (60%)
-// than when it is empty (34%, since QUEUED/RECENT DONE need the room more in
-// that case - the degraded-state requirement), and the rest splits evenly
-// between QUEUED and RECENT DONE.
-export function computeRowBudget({ height, hasFooter = false, hasInFlight = false }) {
-  const SECTION_CHROME = 3;
+// pays its own SECTION_ROW_CHROME rows of border+title chrome before the
+// remainder is split into body rows.
+//
+// IN FLIGHT is now content-sized, not percentage-sized: it is capped at
+// exactly what `inFlightContentRows` needs (plus one row of breathing room),
+// so a single card never reserves the same acreage as a full board - this is
+// the fix for the "half-empty box" problem. Whatever IN FLIGHT does not use
+// flows to QUEUED/RECENT DONE instead of sitting empty. `inFlightContentRows`
+// defaults to a generous cap when omitted (an older caller, or a caller that
+// has not computed it yet) so this function never regresses to 0 rows.
+export function computeRowBudget({ height, hasFooter = false, hasInFlight = false, inFlightContentRows = null }) {
   const fixedChrome = 1 + 1 + (hasFooter ? 1 : 0) + 5;
-  const availableForBoard = Math.max(3, height - fixedChrome);
-  const bodyBudget = Math.max(3, availableForBoard - SECTION_CHROME * 3);
-  const inFlightShare = hasInFlight ? 0.6 : 0.34;
-  const inFlightRows = Math.max(1, Math.round(bodyBudget * inFlightShare));
+  // A board needs at least 1 body row per section on top of its own chrome to
+  // render without losing content (a section handed less can lose its own
+  // title row, not just body content - the Ink no-scrolling corruption this
+  // function exists to prevent). Floor availableForBoard at that true
+  // minimum (3 * SECTION_ROW_CHROME + 3 body rows) rather than the looser `3`
+  // this used before variable per-card row heights made the floor mismatch
+  // visible: a too-small terminal is a degenerate case no TUI renders
+  // cleanly, but the three sections should at least agree on a consistent,
+  // in-budget split instead of collectively requesting more than fits.
+  const minBoardHeight = SECTION_ROW_CHROME * 3 + 3;
+  const availableForBoard = Math.max(minBoardHeight, height - fixedChrome);
+  const bodyBudget = availableForBoard - SECTION_ROW_CHROME * 3;
+
+  // Reserve at most a "fair share" ceiling for IN FLIGHT so a large fleet
+  // still leaves QUEUED/RECENT DONE something, then shrink that reservation
+  // down to what the content actually needs (plus 1 row of margin) when the
+  // content is smaller than the ceiling - freeing the rest to the bottom row.
+  const fairShareCeiling = hasInFlight ? Math.round(bodyBudget * 0.6) : Math.round(bodyBudget * 0.34);
+  const desiredInFlight = inFlightContentRows == null ? fairShareCeiling : inFlightContentRows + 1;
+  const inFlightRows = Math.max(1, Math.min(fairShareCeiling, desiredInFlight));
+
   const bottomBudget = Math.max(2, bodyBudget - inFlightRows);
   const queuedRows = Math.max(1, Math.floor(bottomBudget / 2));
   const doneRows = Math.max(1, bottomBudget - queuedRows);
   return { inFlightRows, queuedRows, doneRows };
+}
+
+// Rows IN FLIGHT's actual content will draw: one label row per non-empty
+// group plus CARD_ROW_HEIGHT rows per card in it. This is what lets
+// computeRowBudget size the section to its content instead of a fixed share -
+// a fleet with one card must not reserve the same acreage as a full board.
+export function inFlightContentRowCount(grouped) {
+  let rows = 0;
+  for (const g of GROUP_ORDER) {
+    const cards = grouped.get(g) || [];
+    if (!cards.length) continue;
+    rows += 1 + cards.length * CARD_ROW_HEIGHT;
+  }
+  return rows;
 }
 
 // Partition task cards into the three board sections the redesigned UI shows:
