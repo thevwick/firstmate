@@ -31,6 +31,9 @@ import {
   RECENT_DONE_LIMIT,
   MIN_ROWS_FOR_FULL_LAYOUT,
   MIN_COLS_FOR_FULL_LAYOUT,
+  CARD_ROW_HEIGHT,
+  CARD_NARROW_WIDTH,
+  CARD_VERY_NARROW_WIDTH,
 } from './constants.js';
 import {
   buildCard,
@@ -47,7 +50,7 @@ import {
   isSendable,
   normalizeCommand,
 } from './commands.js';
-import { humanBytes, truncate } from './format.js';
+import { humanBytes, humanDuration, truncate } from './format.js';
 import {
   readSnapshot,
   readDisk,
@@ -59,7 +62,7 @@ import {
 import { resolveSupervisor, sendCommand } from './bridge.js';
 
 const h = React.createElement;
-const { useState, useEffect, useRef, useCallback } = React;
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
 const GROUP_COLORS = {
   'needs-you': 'red',
@@ -67,6 +70,16 @@ const GROUP_COLORS = {
   working: 'cyan',
   blocked: 'yellow',
   done: 'gray',
+};
+
+// Health-dot color per state.js's healthLevel: green = provably working,
+// yellow = stale/idle, red = needs a captain decision or is stuck, grey = a
+// settled/unknown card (done, or health not yet resolved).
+const HEALTH_COLORS = {
+  green: 'green',
+  yellow: 'yellow',
+  red: 'red',
+  grey: 'gray',
 };
 
 const BRAND = 'magentaBright';
@@ -147,33 +160,73 @@ function Footer({ header, supervisor, snapError }) {
   );
 }
 
-// One task card: ONE line, colour-coded by state. Ink has no scrolling and a
-// fixed-height flex tree that receives more rows than it has space for can
-// visibly corrupt the render (rows silently losing content) rather than
-// clipping cleanly, so sections cap their row COUNT in JS (see capRows below)
-// instead of relying on Yoga/terminal overflow to hide the excess. Keeping
-// each card to one line keeps that row budget cheap to reason about.
+// One task card: exactly CARD_ROW_HEIGHT (3) terminal rows, colour-coded by
+// state. Ink has no scrolling and a fixed-height flex tree that receives more
+// rows than it has space for can visibly corrupt the render (rows silently
+// losing content) rather than clipping cleanly, so sections cap their row
+// COUNT in JS (see capRows below) instead of relying on Yoga/terminal overflow
+// to hide the excess - which is why this component's actual row count must
+// stay in lockstep with CARD_ROW_HEIGHT in constants.js.
+//
+// Line 1: health dot + id + repo + kind + model/effort profile chip.
+// Line 2: size + age/last-event + branch/PR + backend endpoint, narrowing by
+//   dropping endpoint, then branch/PR, then size, below CARD_NARROW_WIDTH /
+//   CARD_VERY_NARROW_WIDTH rather than wrapping them into a run-on line.
+// Line 3: the fuller status line (still truncated to width, never wrapped -
+//   Ink's own wrapping would grow the card past 3 rows and corrupt the
+//   section's row budget).
 function Card({ card, selected, width }) {
   const color = GROUP_COLORS[card.group] || 'white';
+  const healthColor = HEALTH_COLORS[card.health] || 'gray';
   const chips = card.ticket ? ` [${card.ticket}]` : '';
-  const prText = card.prUrl ? ` PR${card.prChecks ? `:${card.prChecks}` : ''}` : '';
-  const prColor = card.prChecks === 'failing' ? 'red' : card.prChecks === 'passing' ? 'green' : 'cyan';
-  const detail = card.lastEvent || `${card.stateRaw}${card.stateDetail ? ` · ${card.stateDetail}` : ''}`;
-  const prefixLen = card.id.length + chips.length + card.repo.length + card.kind.length + 12;
-  const detailWidth = Math.max(6, width - prefixLen - 4);
-  return h(
+
+  const line1 = h(
     Box,
     null,
+    h(Text, { color: healthColor }, '● '),
     h(
       Text,
       { color: selected ? 'black' : color, backgroundColor: selected ? color : undefined, bold: true },
-      ` ${card.id} `
+      `${card.id} `
     ),
     chips ? h(Text, { color: 'blueBright' }, chips) : null,
     h(Text, { dimColor: true }, ` ${card.repo} · ${card.kind}`),
-    card.prUrl ? h(Text, { color: prColor }, prText) : null,
-    h(Text, { dimColor: true, wrap: 'truncate-end' }, ` - ${truncate(detail, detailWidth)}`)
+    card.profile ? h(Text, { color: 'magentaBright' }, `  ${card.profile}`) : null
   );
+
+  const line2Parts = [];
+  if (card.duBytes != null || width >= CARD_NARROW_WIDTH) {
+    line2Parts.push(card.duBytes != null ? humanBytes(card.duBytes) : '…');
+  }
+  const ageText = card.ageSecs != null ? humanDuration(card.ageSecs) : '…';
+  const lastEventText = card.lastEventSecs != null ? `last ${humanDuration(card.lastEventSecs)} ago` : null;
+  line2Parts.push(lastEventText ? `${ageText} / ${lastEventText}` : ageText);
+  if (width >= CARD_NARROW_WIDTH) {
+    if (card.branch) line2Parts.push(card.branch);
+    if (card.prUrl) {
+      const prNum = (String(card.prUrl).match(/\/pull\/(\d+)/) || [])[1];
+      const prChecksText = card.prChecks ? `:${card.prChecks}` : '';
+      line2Parts.push(`PR${prNum ? `#${prNum}` : ''}${prChecksText}`);
+    }
+  }
+  if (width >= CARD_VERY_NARROW_WIDTH && card.endpointTarget) {
+    line2Parts.push(card.endpointTarget);
+  }
+  const prColor = card.prChecks === 'failing' ? 'red' : card.prChecks === 'passing' ? 'green' : 'cyan';
+  const line2 = h(
+    Text,
+    { dimColor: true, color: card.prUrl ? prColor : undefined, wrap: 'truncate-end' },
+    `   ${truncate(line2Parts.join('  ·  '), Math.max(6, width - 3))}`
+  );
+
+  const detail = card.lastEvent || `${card.stateRaw}${card.stateDetail ? ` · ${card.stateDetail}` : ''}`;
+  const line3 = h(
+    Text,
+    { dimColor: true, wrap: 'truncate-end' },
+    `   ${truncate(detail, Math.max(6, width - 3))}`
+  );
+
+  return h(Box, { flexDirection: 'column' }, line1, line2, line3);
 }
 
 // A backlog-only row (QUEUED, RECENT DONE) that has no live task card: one
@@ -200,15 +253,38 @@ function BacklogRow({ record, width }) {
   );
 }
 
-// Cap a flat list of section rows to `maxRows`, appending a "+N more" marker
-// (itself counted in the budget) instead of silently dropping the overflow or
-// handing Ink more rows than the section's allotted space - see the Card
-// comment above for why that overflow path corrupts the render.
-function capRows(rows, maxRows, moreLabel) {
-  if (maxRows == null || rows.length <= maxRows) return rows;
+// Cap a flat list of section rows to `maxRows` terminal rows, appending a
+// "+N more" marker (itself counted in the budget) instead of silently
+// dropping the overflow or handing Ink more rows than the section's allotted
+// space - see the Card comment above for why that overflow path corrupts the
+// render. Entries are plain Ink nodes (implicit height 1, e.g. a group label
+// or a BacklogRow) or `{ node, height }` for a multi-row entry such as a
+// 3-row Card; a plain-node entry list therefore behaves exactly as before
+// this height-aware accounting was added.
+function capRows(entries, maxRows, moreLabel) {
+  const heightOf = (e) => (e && typeof e === 'object' && 'height' in e ? e.height : 1);
+  const nodeOf = (e) => (e && typeof e === 'object' && 'height' in e ? e.node : e);
+  const totalHeight = entries.reduce((sum, e) => sum + heightOf(e), 0);
+  if (maxRows == null || totalHeight <= maxRows) return entries.map(nodeOf);
   if (maxRows <= 0) return [];
-  const kept = rows.slice(0, Math.max(0, maxRows - 1));
-  kept.push(h(Text, { key: '__more', dimColor: true, italic: true }, `  … +${rows.length - kept.length} more ${moreLabel}`));
+  // Over budget, so a "+N more" marker (1 row) is always needed - reserve its
+  // row upfront and take entries in order until the next one would no longer
+  // fit, stopping there rather than skipping a too-tall entry to admit a
+  // later, smaller one out of order.
+  const budget = maxRows - 1;
+  const kept = [];
+  let used = 0;
+  let i = 0;
+  for (; i < entries.length; i++) {
+    const eh = heightOf(entries[i]);
+    if (used + eh > budget) break;
+    kept.push(nodeOf(entries[i]));
+    used += eh;
+  }
+  const droppedCount = entries.length - i;
+  if (droppedCount > 0) {
+    kept.push(h(Text, { key: '__more', dimColor: true, italic: true }, `  … +${droppedCount} more ${moreLabel}`));
+  }
   return kept;
 }
 
@@ -237,7 +313,10 @@ function InFlightSection({ grouped, selectedId, width, flexGrow, maxRows }) {
         const color = GROUP_COLORS[g] || 'white';
         return [
           h(Text, { key: `${g}-label`, bold: true, color }, `${GROUP_LABELS[g]} (${cards.length})`),
-          ...cards.map((c) => h(Card, { key: c.id, card: c, selected: c.id === selectedId, width })),
+          ...cards.map((c) => ({
+            node: h(Card, { key: c.id, card: c, selected: c.id === selectedId, width }),
+            height: CARD_ROW_HEIGHT,
+          })),
         ];
       })
     : [];
@@ -267,7 +346,10 @@ function QueuedSection({ records, blockedCount, width, flexGrow, maxRows }) {
 
 function RecentDoneSection({ doneCards, doneRecords, width, flexGrow, maxRows }) {
   const rows = [
-    ...doneCards.map((c) => h(Card, { key: `c-${c.id}`, card: c, selected: false, width })),
+    ...doneCards.map((c) => ({
+      node: h(Card, { key: `c-${c.id}`, card: c, selected: false, width }),
+      height: CARD_ROW_HEIGHT,
+    })),
     ...doneRecords.map((r, i) => h(BacklogRow, { key: `r-${r.id || i}`, record: r, width })),
   ];
   return h(Section, {
@@ -351,13 +433,20 @@ export default function App({ bin, home }) {
   const [afk, setAfk] = useState(false);
   const [duById, setDuById] = useState({});
   const [prById, setPrById] = useState({});
+  const [mtimeById, setMtimeById] = useState({});
   const [selectedId, setSelectedId] = useState(null);
   const [input, setInput] = useState('');
   const [pendingConfirm, setPendingConfirm] = useState(null);
   const [quickMenu, setQuickMenu] = useState(false);
   const [message, setMessage] = useState(null);
 
-  const supervisor = resolveSupervisor();
+  // Memoized (computed once per mount): process.env-derived and does not
+  // change within a session. A fresh object every render would otherwise
+  // cascade into doSend/handleInput below never stabilizing their own
+  // useCallback identity, which churns Ink's useInput stdin listener on every
+  // render and can drop a keystroke that lands in the reattach gap (see the
+  // handleInput comment below).
+  const supervisor = useMemo(() => resolveSupervisor(), []);
   const mounted = useRef(true);
   useEffect(() => () => { mounted.current = false; }, []);
 
@@ -387,8 +476,40 @@ export default function App({ bin, home }) {
     return () => clearInterval(t);
   }, [refresh]);
 
-  // Slower, non-blocking du + PR-checks pass over the current tasks.
+  // Age/last-event mtime pass: a single stat() per file, unlike du's tree walk,
+  // so it is cheap enough to run on the fast board-refresh cadence rather than
+  // the slower du/PR one - but it is still threaded in as an async side-channel
+  // (never awaited inline in the card build) so a slow or missing file never
+  // blocks a redraw, matching the du/PR pattern below.
   const tasks = (snapshot && snapshot.tasks) || [];
+  const mtimeTaskKey = tasks
+    .map((t) => `${t.id}:${t.paths?.meta?.path || ''}:${t.paths?.status_log?.path || ''}`)
+    .join('|');
+  useEffect(() => {
+    let cancelled = false;
+    async function measureMtimes() {
+      for (const t of tasks) {
+        const metaPath = t.paths?.meta?.path;
+        const statusPath = t.paths?.status_log?.path;
+        const [metaMtime, statusMtime] = await Promise.all([
+          metaPath ? fileMtimeSecs(metaPath) : null,
+          statusPath ? fileMtimeSecs(statusPath) : null,
+        ]);
+        if (cancelled || !mounted.current) return;
+        setMtimeById((prev) => ({ ...prev, [t.id]: { metaMtime, statusMtime } }));
+      }
+    }
+    measureMtimes();
+    const t = setInterval(measureMtimes, REFRESH_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+    // Re-run when the set of tasks/meta/status paths changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mtimeTaskKey]);
+
+  // Slower, non-blocking du + PR-checks pass over the current tasks.
   const taskKey = tasks.map((t) => `${t.id}:${t.paths?.worktree?.path || ''}:${t.pr?.url || ''}`).join('|');
   useEffect(() => {
     let cancelled = false;
@@ -418,9 +539,13 @@ export default function App({ bin, home }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskKey]);
 
-  const cards = tasks.map((t) =>
-    buildCard(t, { duBytes: duById[t.id] ?? null, prChecks: prById[t.id] ?? null })
-  );
+  const nowForCards = nowSecs();
+  const cards = tasks.map((t) => {
+    const mtimes = mtimeById[t.id];
+    const ageSecs = mtimes?.metaMtime != null ? Math.max(0, nowForCards - mtimes.metaMtime) : null;
+    const lastEventSecs = mtimes?.statusMtime != null ? Math.max(0, nowForCards - mtimes.statusMtime) : null;
+    return buildCard(t, { duBytes: duById[t.id] ?? null, prChecks: prById[t.id] ?? null, ageSecs, lastEventSecs });
+  });
   const { inFlight, inFlightGrouped, done } = boardSections(cards);
   const queuedRecords = queuedBacklogRecords(snapshot);
   const doneRecords = recentDoneBacklogRecords(snapshot, RECENT_DONE_LIMIT);
@@ -464,7 +589,12 @@ export default function App({ bin, home }) {
     }
   }, [bin, home, supervisor]);
 
-  useInput((inputChar, key) => {
+  // Memoized so Ink's useInput effect (keyed on this callback's identity)
+  // does not tear down and re-attach its stdin listener on every unrelated
+  // re-render (e.g. the age/du/PR async side-channels resolving) - an
+  // unmemoized inline handler here reattaches on every render, and a
+  // keystroke landing in that brief detach/reattach gap is silently dropped.
+  const handleInput = useCallback((inputChar, key) => {
     // Ctrl-C handled by Ink's exit, but be explicit for clean quit.
     if (key.ctrl && inputChar === 'c') {
       exit();
@@ -545,7 +675,9 @@ export default function App({ bin, home }) {
     if (inputChar && !key.ctrl && !key.meta && !key.tab) {
       setInput((s) => s + inputChar);
     }
-  });
+  }, [exit, pendingConfirm, quickMenu, selectedId, orderedIds, input, doSend]);
+
+  useInput(handleInput);
 
   // Row budget: Ink has no scrolling, and handing a fixed-height flex tree
   // more rows than it has space for can corrupt the render rather than clip

@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { humanBytes, truncate } from '../src/format.js';
+import { humanBytes, humanDuration, truncate } from '../src/format.js';
 import { parseDf } from '../src/io.js';
 
 test('humanBytes scales to K/M/G and handles null', () => {
@@ -34,4 +34,19 @@ test('parseDf extracts available bytes and use% from df -k output', () => {
 test('parseDf degrades to nulls on unparseable input', () => {
   assert.deepEqual(parseDf(''), { free: null, usePct: null });
   assert.deepEqual(parseDf('only a header line'), { free: null, usePct: null });
+});
+
+test('humanDuration scales seconds to a compact relative label', () => {
+  assert.equal(humanDuration(45), '45s');
+  assert.equal(humanDuration(40), '40s');
+  assert.equal(humanDuration(6 * 60), '6m');
+  assert.equal(humanDuration(3 * 3600), '3h');
+  assert.equal(humanDuration(2 * 86400), '2d');
+});
+
+test('humanDuration degrades to a dim placeholder on null/negative/non-finite', () => {
+  assert.equal(humanDuration(null), '-');
+  assert.equal(humanDuration(-5), '-');
+  assert.equal(humanDuration(NaN), '-');
+  assert.equal(humanDuration(Infinity), '-');
 });

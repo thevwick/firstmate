@@ -15,6 +15,9 @@ import {
   queuedBacklogRecords,
   recentDoneBacklogRecords,
   computeRowBudget,
+  healthLevel,
+  formatProfile,
+  branchForTask,
 } from '../src/state.js';
 
 test('extractTicket finds a generic ticket key in branch or brief', () => {
@@ -66,8 +69,12 @@ test('buildCard threads du/pr side-channels and derives fields', () => {
     hints: { last_event_text: 'implementing fix' },
     paths: { worktree: { path: '/wt/login-k3' } },
     pr: { url: 'https://github.com/o/r/pull/5' },
+    harness: 'claude',
+    model: 'sonnet',
+    effort: 'high',
+    endpoint: { target: 'default:wZ:p2' },
   };
-  const card = buildCard(task, { duBytes: 2048, prChecks: 'passing' });
+  const card = buildCard(task, { duBytes: 2048, prChecks: 'passing', ageSecs: 360, lastEventSecs: 40 });
   assert.equal(card.id, 'login-k3');
   assert.equal(card.repo, 'yourapp');
   assert.equal(card.group, 'working');
@@ -76,13 +83,66 @@ test('buildCard threads du/pr side-channels and derives fields', () => {
   assert.equal(card.prUrl, 'https://github.com/o/r/pull/5');
   assert.equal(card.prChecks, 'passing');
   assert.equal(card.lastEvent, 'implementing fix');
+  assert.equal(card.harness, 'claude');
+  assert.equal(card.model, 'sonnet');
+  assert.equal(card.effort, 'high');
+  assert.equal(card.profile, 'claude/sonnet high');
+  assert.equal(card.endpointTarget, 'default:wZ:p2');
+  assert.equal(card.branch, 'fm/login-k3');
+  assert.equal(card.ageSecs, 360);
+  assert.equal(card.lastEventSecs, 40);
+  assert.equal(card.health, 'green');
 });
 
-test('buildCard defaults du/pr to null when not yet computed', () => {
+test('buildCard defaults du/pr/model/age fields to null or empty when not yet computed', () => {
   const card = buildCard({ id: 'x', current_state: { state: 'working' } });
   assert.equal(card.duBytes, null);
   assert.equal(card.prChecks, null);
   assert.equal(card.ticket, null);
+  assert.equal(card.harness, '');
+  assert.equal(card.model, '');
+  assert.equal(card.effort, '');
+  assert.equal(card.profile, null);
+  assert.equal(card.endpointTarget, null);
+  assert.equal(card.branch, null);
+  assert.equal(card.ageSecs, null);
+  assert.equal(card.lastEventSecs, null);
+});
+
+test('branchForTask derives fm/<id> for ship tasks only', () => {
+  assert.equal(branchForTask({ kind: 'ship', id: 'login-k3' }), 'fm/login-k3');
+  assert.equal(branchForTask({ kind: 'scout', id: 'audit-x9' }), null);
+  assert.equal(branchForTask({ kind: 'secondmate', id: 'triage' }), null);
+});
+
+test('formatProfile shows harness/model with effort appended only when not default', () => {
+  assert.equal(formatProfile('claude', 'haiku', 'default'), 'claude/haiku');
+  assert.equal(formatProfile('claude', 'haiku', ''), 'claude/haiku');
+  assert.equal(formatProfile('claude', 'opus', 'high'), 'claude/opus high');
+  assert.equal(formatProfile('claude', '', ''), 'claude');
+  assert.equal(formatProfile('claude', 'default', ''), 'claude');
+  assert.equal(formatProfile('', 'sonnet', ''), null);
+  assert.equal(formatProfile(null, null, null), null);
+});
+
+test('healthLevel maps needs-you/blocked to red regardless of raw state', () => {
+  assert.equal(healthLevel({ group: 'needs-you', stateRaw: 'working' }), 'red');
+  assert.equal(healthLevel({ group: 'blocked', stateRaw: 'blocked' }), 'red');
+});
+
+test('healthLevel maps a stale raw state to yellow even inside the working group', () => {
+  assert.equal(healthLevel({ group: 'working', stateRaw: 'stale' }), 'yellow');
+});
+
+test('healthLevel maps provably working/ready to green', () => {
+  assert.equal(healthLevel({ group: 'working', stateRaw: 'working' }), 'green');
+  assert.equal(healthLevel({ group: 'ready', stateRaw: 'ready' }), 'green');
+});
+
+test('healthLevel maps done and unknown/unrecognized state to dim grey, not a false green or yellow', () => {
+  assert.equal(healthLevel({ group: 'done', stateRaw: 'done' }), 'grey');
+  assert.equal(healthLevel({ group: 'working', stateRaw: 'unknown' }), 'grey');
+  assert.equal(healthLevel({ group: undefined, stateRaw: undefined }), 'grey');
 });
 
 test('groupCards preserves order within a group', () => {

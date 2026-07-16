@@ -60,10 +60,54 @@ export function groupForTask(task) {
   }
 }
 
-// Build a console card from one snapshot task. Pure: du size and PR-check
-// status are threaded in from async side-channels keyed by task id, defaulting
-// to null when not yet computed.
-export function buildCard(task, { duBytes = null, prChecks = null } = {}) {
+// Map a card's group + raw state into a health level for the card's status
+// dot: the primary at-a-glance "what needs me" signal. 'needs-you'/'blocked'
+// map straight to red (the captain owes a decision or the crew is stuck);
+// 'working'/'ready' map to green UNLESS the raw state itself says stale,
+// which maps to yellow instead - groupForTask files a wedged-but-not-yet-
+// escalated crew under 'working', so the raw state is what actually
+// distinguishes "provably working" from "stale". 'done' and 'unknown' (and
+// anything else unrecognized) map to dim grey: settled or genuinely unknown,
+// never a false green or a false stale-yellow.
+export function healthLevel(card) {
+  const group = card?.group;
+  const state = card?.stateRaw || 'unknown';
+  if (group === 'needs-you' || group === 'blocked') return 'red';
+  if (state === 'stale') return 'yellow';
+  if (state === 'unknown') return 'grey';
+  if (group === 'working' || group === 'ready') return 'green';
+  return 'grey';
+}
+
+// One-line "which Claude instance" label: harness/model, with effort appended
+// only when it is not the harness default. This is the headline ask - the
+// captain wants to see which model+effort profile each crewmate runs without
+// opening its pane. Empty harness (an older meta or a not-yet-recorded field)
+// renders as null so the card can omit the chip entirely rather than show a
+// blank "/ ".
+export function formatProfile(harness, model, effort) {
+  const h = String(harness || '').trim();
+  if (!h) return null;
+  const m = String(model || '').trim();
+  const e = String(effort || '').trim();
+  let label = m && m !== 'default' ? `${h}/${m}` : h;
+  if (e && e !== 'default') label += ` ${e}`;
+  return label;
+}
+
+// The crew branch, by convention fm/<id> for a ship task (AGENTS.md section
+// 11's brief contract). Scout worktrees are declared scratch and never
+// branch; secondmates work in their own home, not a task branch - both render
+// with no branch chip.
+export function branchForTask(task) {
+  if (task?.kind !== 'ship') return null;
+  return `fm/${task?.id}`;
+}
+
+// Build a console card from one snapshot task. Pure: du size, PR-check status,
+// and crew age/last-event are threaded in from async side-channels keyed by
+// task id, defaulting to null when not yet computed.
+export function buildCard(task, { duBytes = null, prChecks = null, ageSecs = null, lastEventSecs = null } = {}) {
   const meta = task?.paths || {};
   const worktreePath = meta.worktree?.path || null;
   const ticket = extractTicket([task?.branch, task?.brief_excerpt, task?.id]);
@@ -72,7 +116,7 @@ export function buildCard(task, { duBytes = null, prChecks = null } = {}) {
     meta.status_log?.last_event?.raw ||
     '';
 
-  return {
+  const card = {
     id: task?.id || '(unknown)',
     ticket,
     repo: shortRepo(task?.project),
@@ -86,7 +130,17 @@ export function buildCard(task, { duBytes = null, prChecks = null } = {}) {
     prUrl: task?.pr?.url || null,
     prChecks,
     endpointExists: task?.endpoint?.exists === true,
+    harness: task?.harness || '',
+    model: task?.model || '',
+    effort: task?.effort || '',
+    endpointTarget: task?.endpoint?.target || null,
+    branch: branchForTask(task),
+    ageSecs,
+    lastEventSecs,
   };
+  card.profile = formatProfile(card.harness, card.model, card.effort);
+  card.health = healthLevel(card);
+  return card;
 }
 
 // Reduce a full project path to a short repo label for the card. The snapshot
