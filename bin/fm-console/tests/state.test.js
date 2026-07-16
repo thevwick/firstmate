@@ -11,6 +11,10 @@ import {
   backlogCounts,
   watcherAlive,
   buildHeader,
+  boardSections,
+  queuedBacklogRecords,
+  recentDoneBacklogRecords,
+  computeRowBudget,
 } from '../src/state.js';
 
 test('extractTicket finds a generic ticket key in branch or brief', () => {
@@ -125,11 +129,112 @@ test('buildHeader composes disk/watcher/afk/backlog into one model', () => {
     nowSecs: 1100,
     afkPresent: true,
     snapshot: { backlog: { records: [{ state: 'queued', blocked_by: null }] } },
+    inFlightCount: 3,
   });
   assert.equal(header.diskFree, 5000);
   assert.equal(header.diskUsePct, 42);
   assert.equal(header.watcherAlive, true);
   assert.equal(header.afk, true);
+  assert.equal(header.inFlight, 3);
   assert.equal(header.queued, 1);
   assert.equal(header.blocked, 0);
+});
+
+test('buildHeader defaults inFlight to 0 when not passed', () => {
+  const header = buildHeader({ nowSecs: 1100 });
+  assert.equal(header.inFlight, 0);
+});
+
+test('boardSections splits cards into inFlight (non-done) and done, preserving order', () => {
+  const cards = [
+    { id: 'a', group: 'working' },
+    { id: 'b', group: 'done' },
+    { id: 'c', group: 'needs-you' },
+    { id: 'd', group: 'done' },
+  ];
+  const { inFlight, done, inFlightGrouped } = boardSections(cards);
+  assert.deepEqual(inFlight.map((c) => c.id), ['a', 'c']);
+  assert.deepEqual(done.map((c) => c.id), ['b', 'd']);
+  assert.deepEqual(inFlightGrouped.get('working').map((c) => c.id), ['a']);
+  assert.deepEqual(inFlightGrouped.get('needs-you').map((c) => c.id), ['c']);
+});
+
+test('boardSections reports a live meta-derived task as in flight even when its state is unknown', () => {
+  // Regression guard for the snapshot visibility bug: a torn-down-worktree or
+  // backend-target-gone task still reports current_state.state === 'unknown',
+  // which groupForTask maps to 'working' (visible), so it must land in
+  // inFlight, never silently dropped.
+  const card = buildCard({ id: 'smm-ota-manifest-stamp-scout-v2', kind: 'scout', current_state: { state: 'unknown' } });
+  const { inFlight } = boardSections([card]);
+  assert.deepEqual(inFlight.map((c) => c.id), ['smm-ota-manifest-stamp-scout-v2']);
+});
+
+test('queuedBacklogRecords keeps only structured queued rows, in snapshot order', () => {
+  const snapshot = {
+    backlog: {
+      records: [
+        { structured: true, state: 'queued', id: 'a' },
+        { structured: true, state: 'in_flight', id: 'b' },
+        { structured: false, state: 'queued', id: null },
+        { structured: true, state: 'queued', id: 'c' },
+        { structured: true, state: 'done', id: 'd' },
+      ],
+    },
+  };
+  assert.deepEqual(queuedBacklogRecords(snapshot).map((r) => r.id), ['a', 'c']);
+});
+
+test('queuedBacklogRecords is safe on a missing/empty backlog', () => {
+  assert.deepEqual(queuedBacklogRecords(null), []);
+  assert.deepEqual(queuedBacklogRecords({}), []);
+});
+
+test('recentDoneBacklogRecords returns structured done rows, most-recent-first, capped at limit', () => {
+  const snapshot = {
+    backlog: {
+      records: [
+        { structured: true, state: 'done', id: 'a' },
+        { structured: true, state: 'queued', id: 'x' },
+        { structured: true, state: 'done', id: 'b' },
+        { structured: true, state: 'done', id: 'c' },
+      ],
+    },
+  };
+  assert.deepEqual(recentDoneBacklogRecords(snapshot, 2).map((r) => r.id), ['c', 'b']);
+  assert.deepEqual(recentDoneBacklogRecords(snapshot, 10).map((r) => r.id), ['c', 'b', 'a']);
+});
+
+test('computeRowBudget never returns a non-positive row count, even at the tightest realistic terminal size', () => {
+  // Regression guard: Ink has no scrolling, so a section handed 0 or fewer
+  // rows than it needs is exactly the failure mode that corrupted the board
+  // during development (a fixed-height flex tree fed more content than it had
+  // space for silently blanked card id lines instead of clipping cleanly).
+  for (const height of [10, 20, 24, 30, 40, 60, 100]) {
+    for (const hasFooter of [true, false]) {
+      for (const hasInFlight of [true, false]) {
+        const budget = computeRowBudget({ height, hasFooter, hasInFlight });
+        assert.ok(budget.inFlightRows >= 1, `inFlightRows at height=${height}`);
+        assert.ok(budget.queuedRows >= 1, `queuedRows at height=${height}`);
+        assert.ok(budget.doneRows >= 1, `doneRows at height=${height}`);
+      }
+    }
+  }
+});
+
+test('computeRowBudget gives IN FLIGHT a larger share when something is in flight than when the fleet is empty', () => {
+  const withWork = computeRowBudget({ height: 40, hasFooter: true, hasInFlight: true });
+  const empty = computeRowBudget({ height: 40, hasFooter: true, hasInFlight: false });
+  assert.ok(withWork.inFlightRows > empty.inFlightRows);
+  // The degraded-state requirement: when nothing is in flight, QUEUED/RECENT
+  // DONE must get MORE room, not less, so the board never shows a void.
+  assert.ok(empty.queuedRows >= withWork.queuedRows);
+  assert.ok(empty.doneRows >= withWork.doneRows);
+});
+
+test('computeRowBudget grows all three sections as the terminal gets taller', () => {
+  const short = computeRowBudget({ height: 24, hasFooter: false, hasInFlight: true });
+  const tall = computeRowBudget({ height: 60, hasFooter: false, hasInFlight: true });
+  assert.ok(tall.inFlightRows > short.inFlightRows);
+  assert.ok(tall.queuedRows >= short.queuedRows);
+  assert.ok(tall.doneRows >= short.doneRows);
 });

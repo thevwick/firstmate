@@ -161,6 +161,31 @@ esac
 
 command -v jq >/dev/null 2>&1 || { echo "fm-fleet-snapshot: jq not found" >&2; exit 1; }
 
+# Per-task ceiling on the fm-crew-state.sh call below. fm-crew-state.sh can
+# itself shell out to `no-mistakes` up to three times (axi status, the
+# cross-branch runs fallback, and a ci-log tail check), each separately bounded
+# by its own FM_CREW_STATE_NM_TIMEOUT (default 10s) - so one ship task with a
+# slow or wedged no-mistakes daemon can take up to ~30s. Snapshot has no
+# timeout of its own around that call and reads every task serially, so a
+# single wedged task (or a couple of slow ones) can push the WHOLE snapshot
+# past a caller's read timeout (fm-console's 15s) and blank out every task in
+# the fleet, including unrelated scout/secondmate rows that never touch
+# no-mistakes at all. Bound each task's read here so one bad task degrades to
+# "unknown" for that task only, never the whole fleet.
+CREW_STATE_TIMEOUT=${FM_SNAPSHOT_CREW_STATE_TIMEOUT:-8}
+case "$CREW_STATE_TIMEOUT" in ''|*[!0-9]*) CREW_STATE_TIMEOUT=8 ;; esac
+CREW_STATE_HAVE_TIMEOUT=none
+if command -v timeout >/dev/null 2>&1; then CREW_STATE_HAVE_TIMEOUT=timeout
+elif command -v gtimeout >/dev/null 2>&1; then CREW_STATE_HAVE_TIMEOUT=gtimeout
+fi
+bounded_crew_state() {  # <id>
+  case "$CREW_STATE_HAVE_TIMEOUT" in
+    timeout)  timeout "$CREW_STATE_TIMEOUT" "$SCRIPT_DIR/fm-crew-state.sh" "$1" 2>/dev/null ;;
+    gtimeout) gtimeout "$CREW_STATE_TIMEOUT" "$SCRIPT_DIR/fm-crew-state.sh" "$1" 2>/dev/null ;;
+    *)        "$SCRIPT_DIR/fm-crew-state.sh" "$1" 2>/dev/null ;;
+  esac
+}
+
 bool_json() {
   if [ "$1" = 1 ]; then printf 'true'; else printf 'false'; fi
 }
@@ -182,7 +207,7 @@ last_nonempty_line() {  # <file>
 }
 
 crew_state_json() {  # <id>
-  local id=$1 raw rest state source detail sep
+  local id=$1 raw rest state source detail sep timed_out=0
   raw=$(
     FM_ROOT_OVERRIDE="$FM_ROOT" \
       FM_HOME="$FM_HOME" \
@@ -190,13 +215,17 @@ crew_state_json() {  # <id>
       FM_DATA_OVERRIDE="$DATA" \
       FM_PROJECTS_OVERRIDE="$PROJECTS" \
       FM_CONFIG_OVERRIDE="$CONFIG" \
-      "$SCRIPT_DIR/fm-crew-state.sh" "$id" 2>/dev/null || true
-  )
+      bounded_crew_state "$id"
+  ) || timed_out=1
   raw=$(printf '%s\n' "$raw" | head -1)
   sep=' · '
   state=unknown
   source=none
   detail=
+  if [ "$timed_out" = 1 ] || [ -z "$raw" ]; then
+    detail="crew-state read timed out or produced no output"
+    raw="state: unknown · source: none · $detail"
+  fi
   case "$raw" in
     state:\ *"$sep"source:\ *)
       rest=${raw#state: }
