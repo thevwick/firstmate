@@ -131,7 +131,73 @@ export function watcherAlive(mtimeSecs, nowSecs, grace = WATCHER_GRACE_SECS) {
   return nowSecs - mtimeSecs <= grace;
 }
 
-// Compose the whole header model from the pieces the UI has read.
+// Backlog records for the QUEUED board section: structured, queued records
+// only, in snapshot order (already ordered as written in data/backlog.md).
+export function queuedBacklogRecords(snapshot) {
+  const records = snapshot?.backlog?.records || [];
+  return records.filter((r) => r?.structured && r?.state === 'queued');
+}
+
+// Backlog records for the RECENT DONE board section: structured, done
+// records only, most-recently-written first (data/backlog.md's Done section
+// is append-order, so reversing gives most-recent-first without re-deriving
+// dates). Capped by `limit` - the board shows a taste, not the whole archive.
+export function recentDoneBacklogRecords(snapshot, limit = 5) {
+  const records = snapshot?.backlog?.records || [];
+  return records
+    .filter((r) => r?.structured && r?.state === 'done')
+    .slice(-limit)
+    .reverse();
+}
+
+// Compute how many body rows each board section may draw, given the
+// terminal height and whether anything is in flight. Pure and unit-testable
+// on purpose: Ink has no scrolling, so handing a fixed-height flex tree more
+// rows than it has space for can corrupt the render rather than clip it
+// cleanly (rows losing content unpredictably, not just the last ones, because
+// Yoga distributes the shortfall across the whole tree). Every row that will
+// be drawn must therefore be counted here, in JS, before Ink ever sees it -
+// the caller caps each section's row list to the returned budget.
+//
+// Fixed chrome subtracted from `height` before splitting: title(1) + status
+// strip(1) + footer(0 or 1) + input box (2 borders + 1 message/menu/confirm
+// line + input line + hint line = 5). Each of the three board sections then
+// pays its own 3 rows of border+title chrome before the remainder is split
+// into body rows: IN FLIGHT gets a larger share when it has content (60%)
+// than when it is empty (34%, since QUEUED/RECENT DONE need the room more in
+// that case - the degraded-state requirement), and the rest splits evenly
+// between QUEUED and RECENT DONE.
+export function computeRowBudget({ height, hasFooter = false, hasInFlight = false }) {
+  const SECTION_CHROME = 3;
+  const fixedChrome = 1 + 1 + (hasFooter ? 1 : 0) + 5;
+  const availableForBoard = Math.max(3, height - fixedChrome);
+  const bodyBudget = Math.max(3, availableForBoard - SECTION_CHROME * 3);
+  const inFlightShare = hasInFlight ? 0.6 : 0.34;
+  const inFlightRows = Math.max(1, Math.round(bodyBudget * inFlightShare));
+  const bottomBudget = Math.max(2, bodyBudget - inFlightRows);
+  const queuedRows = Math.max(1, Math.floor(bottomBudget / 2));
+  const doneRows = Math.max(1, bottomBudget - queuedRows);
+  return { inFlightRows, queuedRows, doneRows };
+}
+
+// Partition task cards into the three board sections the redesigned UI shows:
+//   inFlight  - every card whose group is not 'done' (needs-you/ready/working/
+//               blocked), sub-grouped by groupCards so the board can still
+//               show state-colored rows within the section.
+//   done      - card group 'done' only, most recently reported first.
+// QUEUED has no task cards of its own (queued work has no meta yet); the
+// caller merges in queuedBacklogRecords/recentDoneBacklogRecords for the
+// backlog-derived rows that belong in QUEUED and RECENT DONE respectively.
+export function boardSections(cards) {
+  const inFlight = cards.filter((c) => c.group !== 'done');
+  const done = cards.filter((c) => c.group === 'done');
+  return { inFlight, inFlightGrouped: groupCards(inFlight), done };
+}
+
+// Compose the whole header model from the pieces the UI has read. inFlight is
+// derived from the snapshot's tasks[] (live state/<id>.meta rows), NOT from
+// the backlog's "In flight" section text, so it reflects actual live work
+// even when data/backlog.md is stale, absent, or hand-edited out of sync.
 export function buildHeader({
   diskFree = null,
   diskUsePct = null,
@@ -139,6 +205,7 @@ export function buildHeader({
   nowSecs,
   afkPresent = false,
   snapshot = null,
+  inFlightCount = 0,
 }) {
   const counts = backlogCounts(snapshot);
   return {
@@ -146,6 +213,7 @@ export function buildHeader({
     diskUsePct,
     watcherAlive: watcherAlive(watcherBeatSecs, nowSecs),
     afk: afkPresent === true,
+    inFlight: inFlightCount,
     queued: counts.queued,
     blocked: counts.blocked,
   };

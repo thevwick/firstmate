@@ -73,11 +73,22 @@ Workspace-per-HOME fixes that while keeping tab-per-task's original human-watchi
 
 `fm_backend_herdr_workspace_label` (`bin/backends/herdr.sh`) resolves the label from `$FM_HOME`, read fresh on every call rather than cached or threaded through env plumbing:
 
-- The PRIMARY home (no `.fm-secondmate-home` marker at its root) resolves to the constant `firstmate` - byte-identical to every pre-P3 task's recorded label.
+- The PRIMARY home (no `.fm-secondmate-home` marker at its root) resolves to the constant `firstmate` - byte-identical to every pre-P3 task's recorded label - unless it sets the optional per-home override below.
 - A SECONDMATE home (carrying `.fm-secondmate-home`, written by `bin/fm-home-seed.sh` at seed time and containing exactly that secondmate's id) resolves to `2ndmate-<secondmate-id>`, e.g. `2ndmate-sshhip-h7`.
 
 Because the label is derived from the home's own durable identity - the marker file lives at the home's root, not in an environment variable passed down a call chain - it is automatically stable across every respawn, recovery, and firstmate restart for the life of that home, with no extra bookkeeping required.
 Two different secondmate homes always get two different, non-colliding labels because their marker ids are unique (verified: `tests/fm-backend-herdr.test.sh`'s `test_workspace_label_different_secondmates_get_different_labels`).
+
+#### Optional per-home override for primaries: `config/herdr-workspace-label`
+
+A machine running several PRIMARY firstmate homes (for example one hub per company or context) has every primary derive the same constant `firstmate` label, so all their task tabs co-mingle in one workspace - exactly the mixing problem the P3 workspace-per-home pass already solved for secondmates.
+An optional local, gitignored `config/herdr-workspace-label` file lets a primary opt out: its FIRST non-empty line becomes that home's herdr workspace label, so several primaries on one machine keep their tabs in separate workspaces.
+The file is read from the effective config dir, respecting `FM_CONFIG_OVERRIDE` / `FM_HOME` exactly like `bin/fm-backend.sh` reads `config/backend`.
+Absent or empty means the constant `firstmate`, byte-for-byte - a single-home setup sees zero behavior change.
+The value is sanitized: it is trimmed of surrounding whitespace, then a label that still contains interior whitespace or a colon (the target-string `<session>:<pane-id>` field separator), or that matches the reserved `2ndmate-*` secondmate namespace, is rejected with a stderr warning and falls back to `firstmate`.
+A SECONDMATE home ignores this file entirely: its marker-derived `2ndmate-<secondmate-id>` label is already unique, so the override never applies to it.
+This file is deliberately NOT in the inheritable-config set (`bin/fm-config-inherit-lib.sh`): it is per-home by nature, exactly like `config/backend`.
+Verified in `tests/fm-backend-herdr.test.sh`'s `test_workspace_label_primary_override_*`, `test_workspace_label_secondmate_ignores_override`, and the whitespace/colon/reserved rejection tests.
 
 Every workspace-scoped adapter path reads this SAME resolution: find/ensure (`fm_backend_herdr_workspace_find`/`_ensure`), tab create and its duplicate-label check (`fm_backend_herdr_create_task`), list-live recovery (`fm_backend_herdr_list_live`), and pane-for-tab (`fm_backend_herdr_pane_for_tab`, via the workspace id these resolve).
 So a secondmate's own recovery/duplicate-check calls are automatically scoped to its own space and never see (or collide with) the primary's or a sibling secondmate's tabs.

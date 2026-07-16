@@ -87,24 +87,63 @@ FM_BACKEND_HERDR_SECONDMATE_MARKER=".fm-secondmate-home"
 # fm_backend_herdr_workspace_label: the per-firstmate-HOME herdr workspace
 # label (docs/herdr-backend.md "Task container shape"). The PRIMARY home (no
 # secondmate marker) resolves to the constant "firstmate", byte-identical to
-# every pre-existing task's recorded label - no forced migration. A SECONDMATE
-# home resolves to "2ndmate-<secondmate-id>", so its tasks land in their own
-# workspace, obviously distinguishable from the primary's (and from every
-# other secondmate's) in herdr's spaces sidebar. Read fresh from FM_HOME on
-# every call rather than cached at source time: FM_HOME is the home's own
+# every pre-existing task's recorded label - no forced migration - UNLESS this
+# home sets the optional config/herdr-workspace-label override (below). A
+# SECONDMATE home resolves to "2ndmate-<secondmate-id>", so its tasks land in
+# their own workspace, obviously distinguishable from the primary's (and from
+# every other secondmate's) in herdr's spaces sidebar. Read fresh from FM_HOME
+# on every call rather than cached at source time: FM_HOME is the home's own
 # durable identity, not env plumbing threaded through a call chain, so the
 # label is automatically stable across every respawn/recovery for the life of
 # that home. fm-spawn.sh briefly shadows FM_HOME to a secondmate's own home
 # when the PRIMARY spawns that secondmate (its own process's FM_HOME still
 # names the primary at that point) - see fm-spawn.sh's herdr case arm.
+#
+# config/herdr-workspace-label (OPTIONAL, local, gitignored, per-home): a
+# PRIMARY home may override its constant "firstmate" label so several primary
+# homes on one machine keep their task tabs in separate herdr workspaces - the
+# same tab-mixing problem the P3 secondmate pass (2ndmate-<id> labels) solved,
+# extended to primaries, opt-in, with zero behavior change for single-home
+# setups. The label is the file's FIRST non-empty line, read from the effective
+# config dir respecting FM_CONFIG_OVERRIDE / FM_HOME exactly like fm-backend.sh
+# reads config/backend. Absent or empty = "firstmate", byte-for-byte. A
+# SECONDMATE home IGNORES this file entirely: its marker-derived 2ndmate-<id>
+# label is already unique. Sanitized: the line is trimmed of surrounding
+# whitespace, then a value that still contains interior whitespace or a colon
+# (the target-string "<session>:<pane-id>" field separator), or that matches
+# the reserved 2ndmate-* secondmate namespace, is REJECTED with a stderr
+# warning and falls back to "firstmate". Deliberately NOT in the
+# inheritable-config set (bin/fm-config-inherit-lib.sh): it is per-home by
+# nature, exactly like config/backend.
 fm_backend_herdr_workspace_label() {
-  local marker="$FM_HOME/$FM_BACKEND_HERDR_SECONDMATE_MARKER" id
+  local marker="$FM_HOME/$FM_BACKEND_HERDR_SECONDMATE_MARKER" id override line label
   if [ -f "$marker" ]; then
     id=$(tr -d '[:space:]' < "$marker" 2>/dev/null)
     if [ -n "$id" ]; then
       printf '2ndmate-%s' "$id"
       return 0
     fi
+  fi
+  override="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}/herdr-workspace-label"
+  if [ -f "$override" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      label="${line#"${line%%[![:space:]]*}"}"
+      label="${label%"${label##*[![:space:]]}"}"
+      [ -n "$label" ] || continue
+      case "$label" in
+        *[[:space:]]*|*:*)
+          echo "warning: config/herdr-workspace-label '$label' contains whitespace or a colon; falling back to 'firstmate'" >&2
+          ;;
+        2ndmate-*)
+          echo "warning: config/herdr-workspace-label '$label' uses the reserved '2ndmate-' secondmate namespace; falling back to 'firstmate'" >&2
+          ;;
+        *)
+          printf '%s' "$label"
+          return 0
+          ;;
+      esac
+      break
+    done < "$override"
   fi
   printf 'firstmate'
 }
