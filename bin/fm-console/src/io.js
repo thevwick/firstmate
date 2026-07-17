@@ -160,4 +160,30 @@ export async function readPrChecks(prUrl) {
   }
 }
 
+// Capture firstmate's OWN pane (the resolved supervisor target the command
+// bridge sends into - see bridge.js's resolveSupervisor) via bin/fm-peek.sh,
+// the same plain, human-facing capture fm-peek uses for cheap diagnosis -
+// never the styled composer-only reader (fm_tmux_composer_state), which
+// captures only a single cursor row for busy/idle classification, not a
+// readable tail. Read-only: this only ever reads pane content, never sends
+// keystrokes. Returns { text, error }; a resolution or capture failure
+// degrades to { text: null, error } rather than throwing, so a slow or wedged
+// pane never blocks the board (callers thread this through an async
+// side-channel exactly like du/PR-checks, never inline in render).
+export async function readFirstmateActivity(bin, home, target, lines) {
+  if (!target) return { text: null, error: 'no target' };
+  try {
+    const { code, stdout, stderr } = await run(path.join(bin, 'fm-peek.sh'), [target, String(lines)], {
+      env: { ...process.env, FM_HOME: home },
+      timeout: 10000,
+    });
+    if (code !== 0) {
+      return { text: null, error: (stderr || '').trim() || `fm-peek exited ${code}` };
+    }
+    return { text: stdout, error: null };
+  } catch (e) {
+    return { text: null, error: e.message };
+  }
+}
+
 export { run };
