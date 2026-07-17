@@ -138,22 +138,51 @@ export async function readWorktreeSize(worktreePath) {
   }
 }
 
+// Parse a full https://github.com/<owner>/<repo>/pull/<n> URL into its parts,
+// mirroring bin/fm-pr-merge.sh's parse_pr_url. gh-axi's `pr checks` takes a PR
+// NUMBER plus --repo <owner>/<repo>, not a URL - passing a URL fails with
+// "error: Missing PR number" (VALIDATION_ERROR). Returns null if the URL does
+// not match.
+export function parsePrUrl(prUrl) {
+  const m = String(prUrl).match(
+    /^https:\/\/github\.com\/([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9._-]+)\/pull\/(\d+)\/?$/
+  );
+  if (!m) return null;
+  return { owner: m[1], repo: m[2], number: m[3] };
+}
+
 // PR checks status for a task via gh-axi, best-effort. Returns a short status
-// string ('passing' | 'failing' | 'pending' | null). Only called when the task
-// records a PR url. gh-axi's own output shape is the source of truth; this
-// keeps parsing to the rollup state it prints and degrades to null otherwise.
+// string ('passing' | 'failing' | 'pending' | 'none' | null). Only called when
+// the task records a PR url.
+//
+// gh-axi's `pr checks <n> --repo <owner>/<repo>` always exits 0 on a
+// successful read (empirically verified against gh-axi 0.1.26's
+// src/commands/pr.js:prChecks) and prints one of two TOON-encoded shapes on
+// stdout:
+//   checks: "0 passed, 0 failed — this PR has no CI checks configured"   (no checks configured)
+//   summary: "N passed, M failed[, K skipped][, P pending], Q total"     (checks exist)
+// Any error (bad args, not-found, auth, rate limit) prints "error: ..." /
+// "code: ..." on stdout with a non-zero exit. gh-axi's printed output is the
+// source of truth here, not the exit code, so this parses that text directly
+// rather than trusting exit codes.
 export async function readPrChecks(prUrl) {
-  if (!prUrl) return null;
+  const parsed = parsePrUrl(prUrl);
+  if (!parsed) return null;
   try {
-    const { code, stdout } = await run(
+    const { stdout } = await run(
       'gh-axi',
-      ['pr', 'checks', prUrl],
+      ['pr', 'checks', parsed.number, '--repo', `${parsed.owner}/${parsed.repo}`],
       { timeout: 15000 }
     );
-    // gh pr checks exits 0 when all pass, 8 when pending, non-zero-non-8 on fail.
-    if (code === 0) return 'passing';
-    if (code === 8) return 'pending';
-    if (String(stdout).length) return 'failing';
+    const text = String(stdout);
+    if (/no CI checks configured/.test(text)) return 'none';
+    const failMatch = text.match(/(\d+)\s+failed/);
+    const passMatch = text.match(/(\d+)\s+passed/);
+    const pendingMatch = text.match(/(\d+)\s+pending/);
+    if (!failMatch || !passMatch) return null;
+    if (Number(failMatch[1]) > 0) return 'failing';
+    if (pendingMatch && Number(pendingMatch[1]) > 0) return 'pending';
+    if (Number(passMatch[1]) > 0) return 'passing';
     return null;
   } catch {
     return null;

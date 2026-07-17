@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node src/cli.js",
-    "test": "node --test --test-force-exit tests/state.test.js tests/commands.test.js tests/format.test.js tests/render.test.js"
+    "test": "node --test --test-force-exit tests/state.test.js tests/commands.test.js tests/format.test.js tests/render.test.js tests/io.test.js"
   },
   "engines": {
     "node": ">=20"
