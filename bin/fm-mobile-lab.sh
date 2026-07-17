@@ -562,15 +562,38 @@ ensure_slot_worktree() {
 
 # switch_node <version>: switch node via fnm if available and a version is asked
 # for. Best-effort: a missing fnm or version is a warning, not a failure (the
-# ambient node may already be right).
+# ambient node may already be right). fnm's own "fnm use" needs its shell
+# environment set up first (eval "$(fnm env)"), or the switch silently fails
+# and the process stays on ambient node; do that before "fnm use", then verify
+# the switch actually took effect so a repo that needs an exact node (e.g.
+# engineStrict) never builds on the wrong one without a loud warning.
 switch_node() {
   local v=$1
   [ -n "$v" ] || return 0
   if command -v fnm >/dev/null 2>&1; then
-    fnm use "$v" >/dev/null 2>&1 || warn "fnm could not switch to node $v; using ambient node ($(node --version 2>/dev/null || echo unknown))"
+    eval "$(fnm env)" 2>/dev/null || true
+    if fnm use "$v" >/dev/null 2>&1 && node_version_matches "$v" "$(node --version 2>/dev/null)"; then
+      return 0
+    fi
+    warn "fnm failed to switch to node $v; still on ambient node ($(node --version 2>/dev/null || echo unknown)) - builds may fail if this repo is engine-strict"
   else
     warn "node $v requested but fnm is not installed; using ambient node ($(node --version 2>/dev/null || echo unknown))"
   fi
+}
+
+# node_version_matches <requested> <actual v-prefixed>: 0 if actual satisfies
+# the requested major[.minor[.patch]] prefix (e.g. requested "20" or "20.18"
+# both match actual "v20.18.3"). Used to confirm a "fnm use" switch really
+# landed, since a stale environment can report success while node is unchanged.
+node_version_matches() {
+  local requested=$1 actual=$2
+  requested=${requested%.}
+  actual=${actual#v}
+  [ -n "$requested" ] && [ -n "$actual" ] || return 1
+  case "$actual" in
+    "$requested"|"$requested".*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # metro_running <port>: 0 if a Metro packager answers on the port.
