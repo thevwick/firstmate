@@ -227,6 +227,55 @@ fm_backend_detect_cmux_app_is_ancestor() {
   return 1
 }
 
+# fm_backend_config_backend: the explicit backend from config/backend (a single
+# word on its first non-empty line, mirroring config/crew-harness), or empty
+# when the file is absent or blank. One owner for reading that file, shared by
+# fm_backend_name and fm_backend_runtime_or_error.
+fm_backend_config_backend() {
+  local line v
+  [ -f "$FM_BACKEND_CONFIG_DIR/backend" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    v=$(printf '%s' "$line" | tr -d '[:space:]')
+    if [ -n "$v" ]; then
+      printf '%s' "$v"
+      return 0
+    fi
+  done < "$FM_BACKEND_CONFIG_DIR/backend"
+}
+
+# fm_backend_runtime_or_error: the honest, NOTICE-free runtime resolver for a
+# METALESS target (a pane with no task meta, such as firstmate's OWN primary
+# pane, which is not a crewmate and carries no state/<id>.meta). Precedence:
+# FM_BACKEND env, then config/backend, then quiet runtime auto-detection
+# (fm_backend_detect, which sets FM_BACKEND_DETECTED with NO stderr noise). When
+# NOTHING resolves - no FM_BACKEND, no config/backend, no detectable runtime
+# signal - it errors LOUDLY and returns 1 rather than silently guessing tmux: a
+# metaless target under herdr must resolve to herdr, and an undetectable one is
+# a genuine unknown, not a tmux default (the old blind `printf 'tmux'` floor was
+# simply a wrong guess for these targets). Deliberately does NOT call
+# fm_backend_name, whose auto-detect path emits a spawn-flavored `NOTICE:` to
+# stderr - the wrong context for a peek/watch resolution, and it would pollute
+# captured output. The one shared owner of this precedence; both
+# fm_backend_of_selector and fm-watch.sh's window_backend fall through to it.
+fm_backend_runtime_or_error() {  # [context-for-error]
+  local context=${1:-target} v
+  if [ -n "${FM_BACKEND:-}" ]; then
+    printf '%s' "$FM_BACKEND"
+    return 0
+  fi
+  v=$(fm_backend_config_backend)
+  if [ -n "$v" ]; then
+    printf '%s' "$v"
+    return 0
+  fi
+  if v=$(fm_backend_detect); then
+    printf '%s' "$v"
+    return 0
+  fi
+  echo "error: cannot resolve a runtime backend for metaless $context (no FM_BACKEND, no config/backend, no detectable runtime); refusing to assume tmux" >&2
+  return 1
+}
+
 # fm_backend_name: resolve the ACTIVE backend for a NEW spawn, absent an
 # explicit per-task override. Precedence: FM_BACKEND env, then config/backend
 # (a single word on its first non-empty line, mirroring config/crew-harness),
@@ -239,21 +288,19 @@ fm_backend_detect_cmux_app_is_ancestor() {
 # today's default-path behavior and callers must see zero change. The cmux
 # notice names the winning signal, so a fallback-detected cmux (bundle id or
 # ancestry, after the claude wrapper stripped CMUX_WORKSPACE_ID) is visibly
-# distinct from the primary-marker case.
+# distinct from the primary-marker case. Unlike fm_backend_runtime_or_error,
+# this spawn resolver keeps a final tmux floor (a NEW spawn must always pick a
+# backend) and emits the experimental-backend notice.
 fm_backend_name() {
-  local line v detected marker
+  local v detected marker
   if [ -n "${FM_BACKEND:-}" ]; then
     printf '%s' "$FM_BACKEND"
     return 0
   fi
-  if [ -f "$FM_BACKEND_CONFIG_DIR/backend" ]; then
-    while IFS= read -r line || [ -n "$line" ]; do
-      v=$(printf '%s' "$line" | tr -d '[:space:]')
-      if [ -n "$v" ]; then
-        printf '%s' "$v"
-        return 0
-      fi
-    done < "$FM_BACKEND_CONFIG_DIR/backend"
+  v=$(fm_backend_config_backend)
+  if [ -n "$v" ]; then
+    printf '%s' "$v"
+    return 0
   fi
   # Called directly (not in a command substitution) so the detect signal
   # globals survive into the notice below.
@@ -361,6 +408,13 @@ fm_backend_meta_for_selector() {  # <raw-target> <state-dir>
   printf '%s/%s.meta' "$state" "$id"
 }
 
+# fm_backend_of_selector: the backend for a raw peek/send-style selector. A
+# target with a task meta (matched by selector, then by resolved window/
+# terminal) inherits that meta's recorded backend - the P1 compatibility
+# contract, absent backend= means the task genuinely was tmux. A METALESS
+# target (no matching meta, e.g. firstmate's own primary pane) falls through to
+# the honest runtime resolver instead of blindly assuming tmux: under herdr the
+# runtime is herdr, and an undetectable target errors rather than guessing.
 fm_backend_of_selector() {  # <raw-target> <resolved-target> <state-dir>
   local raw=$1 resolved=$2 state=$3 meta
   meta=$(fm_backend_meta_for_selector "$raw" "$state" 2>/dev/null || true)
@@ -369,7 +423,7 @@ fm_backend_of_selector() {  # <raw-target> <resolved-target> <state-dir>
     meta=$(fm_backend_meta_for_window "$resolved" "$state" 2>/dev/null || true)
     [ -n "$meta" ] && { fm_backend_of_meta "$meta"; return 0; }
   fi
-  printf 'tmux'
+  fm_backend_runtime_or_error "target ${raw:-$resolved}"
 }
 
 fm_backend_expected_label_of_selector() {  # <raw-target> <state-dir>
