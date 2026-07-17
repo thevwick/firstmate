@@ -315,7 +315,10 @@ function Card({ card, selected, width }) {
     if (card.branch) metaParts.push(card.branch);
     if (card.prUrl) {
       const prNum = (String(card.prUrl).match(/\/pull\/(\d+)/) || [])[1];
-      const prChecksText = card.prChecks ? `:${card.prChecks}` : '';
+      // 'none' means gh-axi confirmed no CI checks are configured - a plain
+      // PR reference reads correctly there, so it gets no status suffix,
+      // unlike passing/failing/pending which are worth calling out.
+      const prChecksText = card.prChecks && card.prChecks !== 'none' ? `:${card.prChecks}` : '';
       metaParts.push(`PR${prNum ? `#${prNum}` : ''}${prChecksText}`);
     }
   }
@@ -325,6 +328,9 @@ function Card({ card, selected, width }) {
   const detail = card.lastEvent || card.stateDetail || '';
   if (detail) metaParts.push(detail);
 
+  // 'none' (gh-axi confirmed no CI checks configured) renders neutrally,
+  // same as the unresolved/unknown default - it is not a status worth
+  // calling out in color, just a plain PR reference.
   const prColor = card.prChecks === 'failing' ? 'redBright' : card.prChecks === 'passing' ? 'greenBright' : 'cyan';
   // A PR whose checks have not resolved yet (prUrl present, prChecks still
   // null) is genuine async work in progress - the PR-check poll - so it gets
@@ -332,6 +338,8 @@ function Card({ card, selected, width }) {
   // dim string, matching the captain's "loaders on async work" ask. This is
   // a real sibling Ink node (not string-joined into metaParts) so the spinner
   // still animates independent of the surrounding text's own truncation.
+  // 'none' is a resolved, final state (not pending), so it must not trigger
+  // the spinner - only a strict null (not yet resolved) does.
   const prPending = !!card.prUrl && card.prChecks == null;
   const metaText = truncate(metaParts.join('  '), Math.max(6, contentWidth - (prPending ? 3 : 1)));
   const meta = h(
