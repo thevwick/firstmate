@@ -1,0 +1,22 @@
+{
+  "repos": {
+    "sitemate-mobile": {
+      "clone": "sitemate-mobile",
+      "default_branch": "release/26.10",
+      "pkgmgr": "pnpm",
+      "ios_scheme": "Sitemate",
+      "sim_device": "iPhone 16 Pro",
+      "metro_port_base": 8101,
+      "pool_size": 3
+    },
+    "dashpivot-mobile": {
+      "clone": "dashpivot-mobile",
+      "default_branch": "release/26.9",
+      "pkgmgr": "npm",
+      "ios_scheme": "Dashpivot",
+      "sim_device": "iPhone 16 Pro",
+      "metro_port_base": 8111,
+      "pool_size": 3
+    }
+  }
+}
