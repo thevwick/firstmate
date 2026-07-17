@@ -78,6 +78,25 @@ export const HEALTH_COLORS = {
   grey: 'gray',
 };
 
+// Claude's brand accent (the warm coral/orange used across Anthropic's own
+// surfaces). Applied to the identity mark on a card whose harness is claude -
+// see CLAUDE_MARK below and app.js's HarnessMark render code.
+export const CLAUDE_ACCENT = '#D97757';
+
+// Neutral accent for a crew running on any non-claude harness (codex, grok,
+// opencode, pi), so the Claude accent above stays a meaningful signal rather
+// than a decoration applied to everything.
+export const OTHER_HARNESS_ACCENT = '#7C9CBF';
+
+// Identity glyph shown next to a card's harness/model/effort chip: a sparkle
+// stands in for Claude (a terminal cannot render the real logo raster), a
+// plain diamond marks any other harness. figures has no exact sparkle, so
+// this is one of the few literal glyphs in the app - both are widely
+// supported Unicode (not exotic), and figures.pointer is used everywhere else
+// state/action glyphs are needed.
+export const CLAUDE_MARK = '✵';
+export const OTHER_HARNESS_MARK = '◆';
+
 // How many trailing lines of firstmate's OWN pane the FIRSTMATE ACTIVITY panel
 // captures and shows, newest at the bottom (a live-tail read). Sized generous
 // enough to read like a real terminal tail while still fitting the panel's
