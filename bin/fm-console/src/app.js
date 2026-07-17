@@ -24,6 +24,9 @@
 
 import React from 'react';
 import { Box, Text, useApp, useInput, useStdout } from 'ink';
+import Spinner from 'ink-spinner';
+import Gradient from 'ink-gradient';
+import figures from 'figures';
 
 import {
   REFRESH_INTERVAL_MS,
@@ -41,6 +44,10 @@ import {
   SECTION_ROW_CHROME,
   FIRSTMATE_ACTIVITY_CAPTURE_LINES,
   FIRSTMATE_ACTIVITY_STRIP_ROWS,
+  CLAUDE_ACCENT,
+  OTHER_HARNESS_ACCENT,
+  CLAUDE_MARK,
+  OTHER_HARNESS_MARK,
 } from './constants.js';
 import {
   buildCard,
@@ -85,21 +92,57 @@ const GROUP_COLORS = {
   done: 'gray',
 };
 
+// Per-state icon glyph (figures, terminal-safe with ASCII fallbacks) shown in
+// a card's badge ahead of its state text - the captain reads shape+color
+// before parsing the word. Keyed by the same board group badgeText() already
+// resolves to a label for, plus a dedicated STALE entry since badgeText can
+// override the label independent of group (see badgeText below).
+const STATE_ICON = {
+  'needs-you': figures.warning,
+  ready: figures.tick,
+  working: figures.play,
+  blocked: figures.circleDotted,
+  done: figures.tick,
+  STALE: figures.pointerSmall,
+};
+
+// Minimum terminal width for the gradient FIRSTMATE wordmark to keep its
+// breathing room; below it TitleBar falls back to a plain bold anchor glyph +
+// text so the banner never crowds the operating-home path off a narrow line.
+const BANNER_MIN_WIDTH = 54;
+
 const BRAND = 'magentaBright';
 
 function nowSecs() {
   return Math.floor(Date.now() / 1000);
 }
 
-// Title bar: brand + operating home. One line, never wraps content below it.
+// Title bar: gradient FIRSTMATE wordmark + operating home, one line. Degrades
+// to a plain bold anchor glyph below BANNER_MIN_WIDTH so a narrow terminal
+// never loses the home path to banner decoration.
+//
+// ink-big-text is deliberately NOT used for this banner: cfonts (the library
+// it wraps) measures its own idea of terminal width to decide where to wrap,
+// and that measurement is unreliable outside a real interactive TTY (it
+// under-detects and silently hard-wraps mid-glyph) - verified this corrupts a
+// multi-row block-font render (glyph rows split/duplicated) even when an
+// explicit oversized width is passed to cfonts directly, bypassing
+// ink-big-text entirely. ink-gradient applied to a short, ordinary Text line
+// has none of that risk (it measures actual rendered content, not a second
+// ambient guess), so the gradient wordmark below is the banner in every
+// terminal size instead of an unreliable "sometimes bigger" flourish.
 function TitleBar({ home, width }) {
+  const wordmark =
+    width >= BANNER_MIN_WIDTH
+      ? h(Gradient, { name: 'passion' }, h(Text, { bold: true, wrap: 'truncate-end' }, '⚓ FIRSTMATE'))
+      : h(Text, { bold: true, color: BRAND, wrap: 'truncate-end' }, '⚓ FIRSTMATE');
   return h(
     Box,
     { justifyContent: 'space-between', paddingX: 1, flexWrap: 'nowrap' },
     h(
       Box,
       { flexWrap: 'nowrap' },
-      h(Text, { bold: true, color: BRAND, wrap: 'truncate-end' }, '⚓ FIRSTMATE'),
+      wordmark,
       h(Text, { dimColor: true, wrap: 'truncate-end' }, '  control console')
     ),
     h(Text, { dimColor: true, wrap: 'truncate-end' }, truncate(home, Math.max(10, width - 34)))
@@ -127,28 +170,39 @@ function StatusStrip({ header, width }) {
         : `disk ${humanBytes(header.diskFree)} free${
             header.diskUsePct == null ? '' : ` (${header.diskUsePct}%)`
           }`;
-  const diskColor = header.diskUsePct != null && header.diskUsePct >= 90 ? 'red' : 'white';
-  const watcherColor = header.watcherAlive ? 'green' : 'red';
+  const diskColor = header.diskUsePct != null && header.diskUsePct >= 90 ? 'red' : 'whiteBright';
+  const watcherColor = header.watcherAlive ? 'greenBright' : 'redBright';
+  const watcherIcon = header.watcherAlive ? figures.tick : figures.cross;
 
-  const sep = h(Text, { dimColor: true, wrap: 'truncate-end' }, '  │  ');
+  const sep = h(Text, { dimColor: true, wrap: 'truncate-end' }, '   ');
 
   return h(
     Box,
     { paddingX: 1, flexWrap: 'nowrap' },
     h(Text, { color: diskColor, wrap: 'truncate-end' }, diskText),
     sep,
-    h(Text, { color: watcherColor, wrap: 'truncate-end' }, '●'),
+    h(Text, { bold: true, color: watcherColor, wrap: 'truncate-end' }, watcherIcon),
     h(Text, { color: watcherColor, wrap: 'truncate-end' }, header.watcherAlive ? ' watcher' : ' watcher down'),
     narrow ? null : sep,
-    narrow ? null : h(Text, { color: header.afk ? 'yellow' : 'gray', wrap: 'truncate-end' }, header.afk ? '● afk' : '○ present'),
+    narrow
+      ? null
+      : h(
+          Text,
+          { bold: header.afk, color: header.afk ? 'yellowBright' : 'gray', wrap: 'truncate-end' },
+          header.afk ? `${figures.warning} afk` : `${figures.circle} present`
+        ),
     sep,
-    h(Text, { bold: true, color: header.inFlight > 0 ? 'cyan' : 'gray', wrap: 'truncate-end' }, `${header.inFlight} in flight`),
+    h(
+      Text,
+      { bold: true, color: header.inFlight > 0 ? 'cyanBright' : 'gray', wrap: 'truncate-end' },
+      `${figures.play} ${header.inFlight} in flight`
+    ),
     sep,
     h(
       Text,
       { wrap: 'truncate-end' },
-      `${header.queued} queued`,
-      header.blocked ? h(Text, { color: 'yellow' }, ` (${header.blocked} blocked)`) : null
+      `${figures.hamburger} ${header.queued} queued`,
+      header.blocked ? h(Text, { bold: true, color: 'yellowBright' }, ` (${figures.circleDotted} ${header.blocked} blocked)`) : null
     )
   );
 }
@@ -184,6 +238,36 @@ function badgeText(card) {
   return GROUP_LABELS[card.group] || String(card.stateRaw || 'working').toUpperCase();
 }
 
+// State icon shown ahead of the badge text: an animated braille spinner for a
+// card that is actually WORKING (the ink-spinner requirement - the console
+// should feel alive, not static, on real in-flight work), otherwise a fixed
+// figures glyph per state so shape (not just color) carries the signal.
+// ink-spinner's own Text has no `wrap` prop set, which - inside a nowrap
+// headline row of several sibling Text nodes - can push the whole row onto a
+// second physical line (Ink's no-scrolling wrap corruption every other
+// component in this file guards against with `wrap: 'truncate-end'`); wrap
+// its single glyph frame in a Text of our own that carries it, rather than
+// rendering Spinner directly as a sibling.
+function StateIcon({ card, color }) {
+  const label = badgeText(card);
+  if (label === 'WORKING') {
+    return h(Text, { color, bold: true, wrap: 'truncate-end' }, h(Spinner, { type: 'dots' }));
+  }
+  const icon = label === 'STALE' ? STATE_ICON.STALE : STATE_ICON[card.group];
+  return h(Text, { color, bold: true, wrap: 'truncate-end' }, icon || figures.play);
+}
+
+// Claude/harness identity chip: a warm-coral sparkle for a claude crew (the
+// captain's requested Claude identity mark, since crewmates run on Claude by
+// default), a neutral diamond for any other harness, so the Claude accent
+// stays a meaningful signal rather than decorating every card the same way.
+function HarnessMark({ harness }) {
+  const isClaude = String(harness || '').trim().toLowerCase() === 'claude';
+  const mark = isClaude ? CLAUDE_MARK : OTHER_HARNESS_MARK;
+  const color = isClaude ? CLAUDE_ACCENT : OTHER_HARNESS_ACCENT;
+  return h(Text, { color, bold: true, wrap: 'truncate-end' }, mark);
+}
+
 // One task card, colour-coded by state end to end: a left border stripe in
 // the health color (the heat-map requirement - a card needing the captain
 // reads red before you even parse the text), a headline row (id, then a
@@ -212,9 +296,11 @@ function Card({ card, selected, width }) {
       { color: selected ? 'black' : 'whiteBright', backgroundColor: selected ? healthColor : undefined, bold: true, wrap: 'truncate-end' },
       ` ${card.id} `
     ),
+    h(StateIcon, { card, color: healthColor }),
     h(Text, { color: healthColor, bold: true, wrap: 'truncate-end' }, ` ${badgeText(card)} `),
     chips ? h(Text, { color: 'blueBright', wrap: 'truncate-end' }, chips) : null,
-    card.profile ? h(Text, { color: 'magentaBright', wrap: 'truncate-end' }, ` ${card.profile}`) : null,
+    card.profile ? h(Text, { color: 'magentaBright', wrap: 'truncate-end' }, ` ${card.profile} `) : null,
+    card.profile ? h(HarnessMark, { harness: card.harness }) : null,
     h(Text, { dimColor: true, wrap: 'truncate-end' }, ` ${card.repo}${card.kind !== 'ship' ? ` · ${card.kind}` : ''}`)
   );
 
@@ -239,11 +325,22 @@ function Card({ card, selected, width }) {
   const detail = card.lastEvent || card.stateDetail || '';
   if (detail) metaParts.push(detail);
 
-  const prColor = card.prChecks === 'failing' ? 'red' : card.prChecks === 'passing' ? 'green' : 'cyan';
+  const prColor = card.prChecks === 'failing' ? 'redBright' : card.prChecks === 'passing' ? 'greenBright' : 'cyan';
+  // A PR whose checks have not resolved yet (prUrl present, prChecks still
+  // null) is genuine async work in progress - the PR-check poll - so it gets
+  // its own live spinner node ahead of the meta text rather than a static
+  // dim string, matching the captain's "loaders on async work" ask. This is
+  // a real sibling Ink node (not string-joined into metaParts) so the spinner
+  // still animates independent of the surrounding text's own truncation.
+  const prPending = !!card.prUrl && card.prChecks == null;
+  const metaText = truncate(metaParts.join('  '), Math.max(6, contentWidth - (prPending ? 3 : 1)));
   const meta = h(
-    Text,
-    { dimColor: true, color: card.prUrl ? prColor : undefined, wrap: 'truncate-end' },
-    ` ${truncate(metaParts.join('  '), Math.max(6, contentWidth - 1))}`
+    Box,
+    { flexWrap: 'nowrap' },
+    prPending
+      ? h(Text, { color: 'cyan', wrap: 'truncate-end' }, ' ', h(Spinner, { type: 'dots' }))
+      : null,
+    h(Text, { dimColor: true, color: card.prUrl ? prColor : undefined, wrap: 'truncate-end' }, ` ${metaText}`)
   );
 
   return h(
@@ -281,7 +378,11 @@ function BacklogRow({ record, width }) {
   return h(
     Box,
     { flexWrap: 'nowrap' },
-    h(Text, { color: record?.blocked_by ? 'yellow' : 'gray', wrap: 'truncate-end' }, record?.blocked_by ? ' ⏸ ' : ' • '),
+    h(
+      Text,
+      { bold: !!record?.blocked_by, color: record?.blocked_by ? 'yellowBright' : 'gray', wrap: 'truncate-end' },
+      record?.blocked_by ? ` ${figures.circleDotted} ` : ` ${figures.bullet} `
+    ),
     h(Text, { dimColor: true, wrap: 'truncate-end' }, truncate(text, Math.max(4, width - 4)))
   );
 }
@@ -331,7 +432,7 @@ function capRows(entries, maxRows, moreLabel) {
 // content meets or exceeds its fair share). `maxRows`, when given, caps how
 // many body rows are handed to Ink (see capRows) so this section alone can
 // never overflow its allotted height.
-function Section({ title, color, count, rows, maxRows, flexGrow, height, emptyText }) {
+function Section({ title, icon, color, count, rows, maxRows, flexGrow, height, emptyText }) {
   const body = rows && rows.length ? capRows(rows, maxRows, 'below') : null;
   const box = { flexDirection: 'column', borderStyle: 'round', borderColor: color, paddingX: 1 };
   if (height != null) box.height = height;
@@ -339,7 +440,7 @@ function Section({ title, color, count, rows, maxRows, flexGrow, height, emptyTe
   return h(
     Box,
     box,
-    h(Text, { bold: true, color }, `${title}${count != null ? ` (${count})` : ''}`),
+    h(Text, { bold: true, color }, `${icon ? `${icon} ` : ''}${title}${count != null ? ` (${count})` : ''}`),
     body || h(Text, { dimColor: true }, emptyText || 'nothing here')
   );
 }
@@ -361,20 +462,27 @@ function FirstmateActivityPanel({ lines, error, width, flexGrow, height, maxRows
   // the fail-closed not-resolved case, where lines is always empty).
   let rows;
   if (lines.length) {
-    rows = lines.map((l, i) => h(Text, { key: i, wrap: 'truncate-end' }, truncate(l, contentWidth) || ' '));
+    rows = lines.map((l, i) => h(Text, { key: i, dimColor: true, wrap: 'truncate-end' }, truncate(l, contentWidth) || ' '));
   } else if (error) {
-    rows = [h(Text, { key: 'err', color: 'yellow' }, truncate(error, contentWidth))];
+    rows = [
+      h(
+        Text,
+        { key: 'err', color: 'yellowBright', wrap: 'truncate-end' },
+        `${figures.warning} ${truncate(error, Math.max(1, contentWidth - 2))}`
+      ),
+    ];
   } else {
     rows = null;
   }
   return h(Section, {
     title: 'FIRSTMATE ACTIVITY',
+    icon: figures.radioOn,
     color: 'blueBright',
     flexGrow,
     height,
     maxRows,
     rows,
-    emptyText: error ? error : 'capturing...',
+    emptyText: error ? error : `${figures.ellipsis} capturing...`,
   });
 }
 
@@ -396,12 +504,13 @@ function InFlightSection({ grouped, selectedId, width, flexGrow, height, maxRows
     : [];
   return h(Section, {
     title: 'IN FLIGHT',
+    icon: figures.play,
     color: 'cyan',
     flexGrow,
     height,
     maxRows,
     rows,
-    emptyText: 'Nothing in flight - a healthy resting state.',
+    emptyText: `${figures.tick} Nothing in flight - a healthy resting state.`,
   });
 }
 
@@ -410,6 +519,7 @@ function QueuedSection({ records, blockedCount, width, flexGrow, maxRows }) {
   const title = blockedCount ? `QUEUED (${records.length}, ${blockedCount} blocked)` : 'QUEUED';
   return h(Section, {
     title,
+    icon: figures.hamburger,
     color: 'yellow',
     count: blockedCount ? null : records.length,
     flexGrow,
@@ -429,6 +539,7 @@ function RecentDoneSection({ doneCards, doneRecords, width, flexGrow, maxRows })
   ];
   return h(Section, {
     title: 'RECENT DONE',
+    icon: figures.tick,
     color: 'gray',
     flexGrow,
     maxRows,
