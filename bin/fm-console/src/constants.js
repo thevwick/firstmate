@@ -77,3 +77,19 @@ export const HEALTH_COLORS = {
   red: 'red',
   grey: 'gray',
 };
+
+// How many trailing lines of firstmate's OWN pane the FIRSTMATE ACTIVITY panel
+// captures and shows, newest at the bottom (a live-tail read). Sized generous
+// enough to read like a real terminal tail while still fitting the panel's
+// allotted height in either layout mode (see app.js's FirstmateActivityPanel);
+// the panel itself further caps what it draws to its actual row budget so a
+// wide capture never overflows Ink's fixed-height layout.
+export const FIRSTMATE_ACTIVITY_CAPTURE_LINES = 25;
+
+// Compact-strip height (in body rows, not counting the section's own
+// SECTION_ROW_CHROME) for the FIRSTMATE ACTIVITY panel when it shares the
+// screen with in-flight task cards, so it never crowds out IN FLIGHT/QUEUED/
+// RECENT DONE - just enough to read as "firstmate is doing something" at a
+// glance. The captain can still see the full capture via the idle-fleet
+// layout, where the panel takes over IN FLIGHT's whole freed box.
+export const FIRSTMATE_ACTIVITY_STRIP_ROWS = 5;

@@ -48,6 +48,26 @@ async function stubFmSend(bin, exitCode, stderrText) {
   await chmod(stub, 0o755);
 }
 
+// Stub bin/fm-peek.sh so the FIRSTMATE ACTIVITY panel tests can drive the real
+// readFirstmateActivity()->run() path without a real firstmate pane. Prints
+// `lines` (one per array entry) to stdout and exits 0, mirroring fm-peek's own
+// plain-text capture contract - never the styled composer-only reader.
+async function stubFmPeek(bin, lines) {
+  const stub = path.join(bin, 'fm-peek.sh');
+  const body = lines.map((l) => `echo '${l.replace(/'/g, "'\\''")}'`).join('\n');
+  await writeFile(stub, `#!/usr/bin/env bash\n${body}\nexit 0\n`, { mode: 0o755 });
+  await chmod(stub, 0o755);
+}
+
+// Stub bin/fm-peek.sh to hang past the test's own patience, so a test can
+// assert the render never blocks on a slow/wedged capture - the panel must
+// show a stale-but-present frame (or the capturing placeholder), never freeze.
+async function stubFmPeekSlow(bin, delaySeconds) {
+  const stub = path.join(bin, 'fm-peek.sh');
+  await writeFile(stub, `#!/usr/bin/env bash\nsleep ${delaySeconds}\necho 'too late'\n`, { mode: 0o755 });
+  await chmod(stub, 0o755);
+}
+
 // ink-testing-library's stdout stub has no `.rows` getter, so the app's own
 // dims fallback (`stdout.rows || 24`) always measures a short 24-row terminal
 // in tests, unless a test opts into a taller one - the app reacts to a real
@@ -101,16 +121,21 @@ async function waitForFrame(lastFrame, re, timeoutMs = 4000) {
   }
 }
 
-test('renders the empty-fleet resting state with the board filled by QUEUED/RECENT DONE, not a void', async () => {
+test('renders the empty-fleet resting state with IN FLIGHT\'s freed box showing FIRSTMATE ACTIVITY instead of a void', async () => {
+  // An idle fleet used to leave IN FLIGHT's box showing only "Nothing in
+  // flight" prose - wasted space exactly when firstmate itself may still be
+  // working (reading, deciding, running commands). The panel now takes over
+  // that freed box so the captain watches firstmate at a glance without ever
+  // leaving the console, which is the whole point of this feature.
   const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
   const { lastFrame, unmount } = render(
     React.createElement(App, { bin, home })
   );
-  const frame = await waitForFrame(lastFrame, /IN FLIGHT/);
+  const frame = await waitForFrame(lastFrame, /FIRSTMATE ACTIVITY/);
   assert.match(frame, /FIRSTMATE/);
   assert.match(frame, /0 in flight/);
-  assert.match(frame, /IN FLIGHT/);
-  assert.match(frame, /healthy resting state/);
+  assert.match(frame, /FIRSTMATE ACTIVITY/);
+  assert.doesNotMatch(frame, /\bIN FLIGHT\b/);
   assert.match(frame, /QUEUED/);
   assert.match(frame, /RECENT DONE/);
   assert.match(frame, /select a task/);
@@ -343,7 +368,7 @@ test('the status strip stays a single line at a narrow width instead of wrapping
   const { home, bin } = await makeHome(snap);
   const { lastFrame, stdout, unmount } = render(React.createElement(App, { bin, home }));
   setTestRows(stdout, 30);
-  await waitForFrame(lastFrame, /IN FLIGHT/);
+  await waitForFrame(lastFrame, /FIRSTMATE ACTIVITY/);
   await waitForSettled(lastFrame);
   // Both widths stay below MIN_COLS_FOR_FULL_LAYOUT (70), so both renders use
   // the same stacked `compact` layout - isolating StatusStrip's own narrow
@@ -510,7 +535,7 @@ test('degraded state: no in-flight tasks still fills the board with QUEUED and R
   const { lastFrame, unmount } = render(React.createElement(App, { bin, home }));
   const frame = await waitForFrame(lastFrame, /next-thing/);
   assert.match(frame, /0 in flight/);
-  assert.match(frame, /healthy resting state/);
+  assert.match(frame, /FIRSTMATE ACTIVITY/);
   assert.match(frame, /next-thing/);
   assert.match(frame, /shipped-x/);
   unmount();
@@ -527,7 +552,7 @@ test('auto-detects the bridge target from TMUX_PANE when no explicit FM_SUPERVIS
   try {
     const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
     const { lastFrame, unmount } = render(React.createElement(App, { bin, home }));
-    await waitForFrame(lastFrame, /IN FLIGHT/);
+    await waitForFrame(lastFrame, /FIRSTMATE ACTIVITY/);
     const frame = lastFrame();
     assert.doesNotMatch(frame, /command bridge disabled/);
     unmount();
@@ -582,7 +607,7 @@ test('a FAILED send still clears the input line, not leaving the failed command 
     const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
     await stubFmSend(bin, 1, 'Enter swallowed / text not submitted');
     const { lastFrame, stdin, unmount } = render(React.createElement(App, { bin, home }));
-    await waitForFrame(lastFrame, /IN FLIGHT/);
+    await waitForFrame(lastFrame, /FIRSTMATE ACTIVITY/);
     await waitForSettled(lastFrame);
 
     stdin.write('hello');
@@ -615,7 +640,7 @@ test('a successful send still clears the input line', async () => {
     const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
     await stubFmSend(bin, 0, '');
     const { lastFrame, stdin, unmount } = render(React.createElement(App, { bin, home }));
-    await waitForFrame(lastFrame, /IN FLIGHT/);
+    await waitForFrame(lastFrame, /FIRSTMATE ACTIVITY/);
     await waitForSettled(lastFrame);
 
     stdin.write('status x');
@@ -656,7 +681,7 @@ test('a second Enter while a send is still in flight does not start a second sen
     );
     await chmod(stub, 0o755);
     const { lastFrame, stdin, unmount } = render(React.createElement(App, { bin, home }));
-    await waitForFrame(lastFrame, /IN FLIGHT/);
+    await waitForFrame(lastFrame, /FIRSTMATE ACTIVITY/);
     await waitForSettled(lastFrame);
 
     stdin.write('hello');
@@ -695,7 +720,7 @@ test('a second Enter while a send is still in flight does not start a second sen
 test('a single keypress appends exactly one character, not two or more', async () => {
   const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
   const { lastFrame, stdin, unmount } = render(React.createElement(App, { bin, home }));
-  await waitForFrame(lastFrame, /IN FLIGHT/);
+  await waitForFrame(lastFrame, /FIRSTMATE ACTIVITY/);
   await waitForSettled(lastFrame);
 
   stdin.write('a');
@@ -720,7 +745,7 @@ test('typing N characters yields exactly N characters in the input, across many 
   // competing re-render.
   const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
   const { lastFrame, stdin, unmount } = render(React.createElement(App, { bin, home }));
-  await waitForFrame(lastFrame, /IN FLIGHT/);
+  await waitForFrame(lastFrame, /FIRSTMATE ACTIVITY/);
   await waitForSettled(lastFrame);
 
   const word = 'abcdefghijklmnopqrst'; // 20 distinct characters
@@ -739,4 +764,179 @@ test('typing N characters yields exactly N characters in the input, across many 
   const typed = afterPrompt.replace(/[\s│]+$/, '');
   assert.equal(typed, word, `expected exactly "${word}" (${word.length} chars), got "${typed}" (${typed.length} chars)`);
   unmount();
+});
+
+// FIRSTMATE ACTIVITY panel: a live tail of firstmate's OWN pane, reusing the
+// SAME resolved supervisor target the command bridge sends into, so the
+// captain watches firstmate work without leaving the console.
+
+test('FIRSTMATE ACTIVITY renders the captured pane lines, in an idle fleet\'s freed IN FLIGHT box', async () => {
+  const keys = ['FM_SUPERVISOR_TARGET', 'FM_SUPERVISOR_BACKEND', 'TMUX_PANE', 'HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_SESSION'];
+  const prev = {};
+  for (const k of keys) {
+    prev[k] = process.env[k];
+    delete process.env[k];
+  }
+  process.env.TMUX_PANE = '%3';
+  try {
+    const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+    await stubFmPeek(bin, ['reading src/app.js', 'running fm-crew-state.sh fix-login-k3', 'deciding next step']);
+    // A taller terminal so the panel's own row budget (it hugs IN FLIGHT's
+    // freed box, same discipline as every other section) has room for all 3
+    // lines rather than capping them behind a "+N more" marker - the default
+    // 24-row test stub is realistic for a cramped terminal, but this test is
+    // about the panel showing captured content, not about capRows truncation
+    // (covered by its own tests elsewhere).
+    const { lastFrame, stdout, unmount } = render(React.createElement(App, { bin, home }));
+    setTestRows(stdout, 40);
+    const frame = await waitForFrame(lastFrame, /reading src\/app\.js/);
+    assert.match(frame, /FIRSTMATE ACTIVITY/);
+    assert.match(frame, /reading src\/app\.js/);
+    assert.match(frame, /running fm-crew-state\.sh fix-login-k3/);
+    assert.match(frame, /deciding next step/);
+    unmount();
+  } finally {
+    for (const k of keys) {
+      if (prev[k] !== undefined) process.env[k] = prev[k];
+      else delete process.env[k];
+    }
+  }
+});
+
+test('FIRSTMATE ACTIVITY tails newest-at-bottom and drops older lines beyond its row budget', async () => {
+  const keys = ['FM_SUPERVISOR_TARGET', 'FM_SUPERVISOR_BACKEND', 'TMUX_PANE', 'HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_SESSION'];
+  const prev = {};
+  for (const k of keys) {
+    prev[k] = process.env[k];
+    delete process.env[k];
+  }
+  process.env.TMUX_PANE = '%3';
+  try {
+    const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+    // More lines than any reasonable panel row budget at a 24-row test
+    // terminal, so the oldest ("line 0") must be dropped and the newest
+    // ("line 39") must survive, in that relative top-to-bottom order.
+    const captured = Array.from({ length: 40 }, (_, i) => `line ${i}`);
+    await stubFmPeek(bin, captured);
+    const { lastFrame, unmount } = render(React.createElement(App, { bin, home }));
+    const frame = await waitForFrame(lastFrame, /line 39/);
+    assert.match(frame, /line 39/, 'the newest captured line must be visible');
+    assert.doesNotMatch(frame, /line 0\b/, 'the oldest captured line must have been trimmed, not the newest');
+    const lineIndexOf = (needle) => frame.split('\n').findIndex((l) => l.includes(needle));
+    const idx38 = lineIndexOf('line 38');
+    const idx39 = lineIndexOf('line 39');
+    if (idx38 !== -1) {
+      assert.ok(idx39 > idx38, 'newest line must render below an earlier surviving line, not above it');
+    }
+    unmount();
+  } finally {
+    for (const k of keys) {
+      if (prev[k] !== undefined) process.env[k] = prev[k];
+      else delete process.env[k];
+    }
+  }
+});
+
+test('FIRSTMATE ACTIVITY shows a clear not-resolved placeholder when no supervisor target can be found, never guessing a pane', async () => {
+  const keys = ['FM_SUPERVISOR_TARGET', 'FM_SUPERVISOR_BACKEND', 'TMUX_PANE', 'HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_SESSION'];
+  const prev = {};
+  for (const k of keys) {
+    prev[k] = process.env[k];
+    delete process.env[k];
+  }
+  try {
+    const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+    const { lastFrame, unmount } = render(React.createElement(App, { bin, home }));
+    // The panel briefly shows "capturing..." on first paint, before the async
+    // side-channel's effect lands the not-resolved error - wait for the actual
+    // placeholder text rather than just the panel title, or this test could
+    // pass on the transient frame instead of the fail-closed state it exists
+    // to verify. This mirrors the command bridge's own fail-closed message
+    // (bridge.js's resolveSupervisor) - the console never guesses a pane.
+    const frame = await waitForFrame(lastFrame, /FM_SUPERVISOR_TARGET/);
+    assert.match(frame, /FIRSTMATE ACTIVITY/);
+    assert.match(frame, /FM_SUPERVISOR_TARGET/);
+    unmount();
+  } finally {
+    for (const k of keys) {
+      if (prev[k] !== undefined) process.env[k] = prev[k];
+    }
+  }
+});
+
+test('a slow/wedged pane capture never blocks the render - the board keeps drawing while capture is in flight', async () => {
+  const keys = ['FM_SUPERVISOR_TARGET', 'FM_SUPERVISOR_BACKEND', 'TMUX_PANE', 'HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_SESSION'];
+  const prev = {};
+  for (const k of keys) {
+    prev[k] = process.env[k];
+    delete process.env[k];
+  }
+  process.env.TMUX_PANE = '%3';
+  try {
+    const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+    // fm-peek.sh sleeps far longer than the console's own capture timeout
+    // (10s in readFirstmateActivity) and the test's own patience - the board
+    // must still render immediately, showing the capturing placeholder rather
+    // than freezing until the (killed) capture would have returned.
+    await stubFmPeekSlow(bin, 30);
+    const { lastFrame, unmount } = render(React.createElement(App, { bin, home }));
+    const frame = await waitForFrame(lastFrame, /FIRSTMATE ACTIVITY/, 2000);
+    assert.match(frame, /FIRSTMATE ACTIVITY/);
+    // The rest of the board must have rendered too - the slow capture must
+    // not have wedged the whole app while it was still in flight.
+    assert.match(frame, /QUEUED/);
+    assert.match(frame, /RECENT DONE/);
+    assert.doesNotMatch(frame, /too late/);
+    unmount();
+  } finally {
+    for (const k of keys) {
+      if (prev[k] !== undefined) process.env[k] = prev[k];
+      else delete process.env[k];
+    }
+  }
+});
+
+test('FIRSTMATE ACTIVITY still shows in-flight cards alongside a compact activity strip at a tall terminal', async () => {
+  const keys = ['FM_SUPERVISOR_TARGET', 'FM_SUPERVISOR_BACKEND', 'TMUX_PANE', 'HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_SESSION'];
+  const prev = {};
+  for (const k of keys) {
+    prev[k] = process.env[k];
+    delete process.env[k];
+  }
+  process.env.TMUX_PANE = '%3';
+  try {
+    const snap = {
+      schema: 'fm-fleet-snapshot.v1',
+      tasks: [
+        {
+          id: 'login-k3',
+          kind: 'ship',
+          project: '/repos/yourapp',
+          current_state: { state: 'working' },
+          hints: {},
+          paths: { worktree: { path: '/nonexistent/wt' } },
+          pr: { url: null },
+        },
+      ],
+      backlog: { records: [] },
+    };
+    const { home, bin } = await makeHome(snap);
+    await stubFmPeek(bin, ['firstmate is deciding what to do next']);
+    const { lastFrame, stdout, unmount } = render(React.createElement(App, { bin, home }));
+    setTestRows(stdout, 50);
+    const frame = await waitForFrame(lastFrame, /firstmate is deciding what to do next/);
+    // Both the fleet board's own IN FLIGHT card and the activity strip must be
+    // visible at once - the captain sees the fleet AND firstmate working,
+    // never one at the cost of the other.
+    assert.match(frame, /login-k3/);
+    assert.match(frame, /IN FLIGHT/);
+    assert.match(frame, /FIRSTMATE ACTIVITY/);
+    assert.match(frame, /firstmate is deciding what to do next/);
+    unmount();
+  } finally {
+    for (const k of keys) {
+      if (prev[k] !== undefined) process.env[k] = prev[k];
+      else delete process.env[k];
+    }
+  }
 });

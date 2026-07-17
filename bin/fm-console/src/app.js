@@ -39,6 +39,8 @@ import {
   CARD_VERY_NARROW_WIDTH,
   HEALTH_COLORS,
   SECTION_ROW_CHROME,
+  FIRSTMATE_ACTIVITY_CAPTURE_LINES,
+  FIRSTMATE_ACTIVITY_STRIP_ROWS,
 } from './constants.js';
 import {
   buildCard,
@@ -48,6 +50,7 @@ import {
   recentDoneBacklogRecords,
   computeRowBudget,
   inFlightContentRowCount,
+  firstmateActivityLines,
 } from './state.js';
 import {
   QUICK_ACTIONS,
@@ -62,6 +65,7 @@ import {
   readDisk,
   readWorktreeSize,
   readPrChecks,
+  readFirstmateActivity,
   fileMtimeSecs,
   fileExists,
 } from './io.js';
@@ -340,6 +344,40 @@ function Section({ title, color, count, rows, maxRows, flexGrow, height, emptyTe
   );
 }
 
+// FIRSTMATE ACTIVITY: a live tail of firstmate's OWN pane (the same resolved
+// supervisor target the command bridge sends into - see bridge.js), so the
+// captain watches firstmate work without ever switching to its raw terminal
+// pane. Rows are capped to `maxRows` (capRows, same discipline as every other
+// section - Ink has no scrolling) and each line is truncated to width rather
+// than wrapped, matching the Card/BacklogRow contract. Newest content is at
+// the bottom (activityLines is already tailed in state.js), so it reads like
+// watching a live terminal rather than a jumbled dump.
+function FirstmateActivityPanel({ lines, error, width, flexGrow, height, maxRows }) {
+  const contentWidth = Math.max(6, width - 2);
+  // A transient capture error (a slow poll, a momentarily unreadable pane)
+  // must not blank a stale-but-still-useful prior capture: prefer showing the
+  // last good lines over the error text whenever we have any, and reserve the
+  // error placeholder for when there is truly nothing to show yet (including
+  // the fail-closed not-resolved case, where lines is always empty).
+  let rows;
+  if (lines.length) {
+    rows = lines.map((l, i) => h(Text, { key: i, wrap: 'truncate-end' }, truncate(l, contentWidth) || ' '));
+  } else if (error) {
+    rows = [h(Text, { key: 'err', color: 'yellow' }, truncate(error, contentWidth))];
+  } else {
+    rows = null;
+  }
+  return h(Section, {
+    title: 'FIRSTMATE ACTIVITY',
+    color: 'blueBright',
+    flexGrow,
+    height,
+    maxRows,
+    rows,
+    emptyText: error ? error : 'capturing...',
+  });
+}
+
 function InFlightSection({ grouped, selectedId, width, flexGrow, height, maxRows }) {
   const anyCards = GROUP_ORDER.some((g) => (grouped.get(g) || []).length > 0);
   const rows = anyCards
@@ -476,6 +514,9 @@ export default function App({ bin, home }) {
   const [pendingConfirm, setPendingConfirm] = useState(null);
   const [quickMenu, setQuickMenu] = useState(false);
   const [message, setMessage] = useState(null);
+  const [activityText, setActivityText] = useState(null);
+  const [activityError, setActivityError] = useState(null);
+  const [activityExpanded, setActivityExpanded] = useState(false);
 
   // inputRef mirrors `input` so doSend/handleInput can read the CURRENT value
   // without closing over the `input` state itself. Closing over `input`
@@ -527,6 +568,43 @@ export default function App({ bin, home }) {
     const t = setInterval(refresh, REFRESH_INTERVAL_MS);
     return () => clearInterval(t);
   }, [refresh]);
+
+  // FIRSTMATE ACTIVITY: a read-only tail of firstmate's own pane, on the same
+  // fast board-refresh cadence as the snapshot poll. Reuses the SAME resolved
+  // supervisor target the command bridge sends into (supervisor, memoized
+  // above from resolveSupervisor()), so the panel always shows the activity of
+  // the exact firstmate the input line talks to. This is an async side-channel
+  // exactly like the du/PR-checks/mtime passes above: a slow or wedged pane
+  // capture must never block a redraw, so it is never awaited inline in
+  // render - only its result lands in state once it resolves. When the
+  // supervisor target could not be resolved (the same fail-closed case the
+  // bridge already reports), this never shells out at all and the panel shows
+  // the not-resolved placeholder instead of guessing a pane.
+  useEffect(() => {
+    if (supervisor.error || !supervisor.target) {
+      setActivityText(null);
+      setActivityError(supervisor.error || 'no supervisor target resolved');
+      return undefined;
+    }
+    let cancelled = false;
+    async function captureActivity() {
+      const { text, error } = await readFirstmateActivity(
+        bin,
+        home,
+        supervisor.target,
+        FIRSTMATE_ACTIVITY_CAPTURE_LINES
+      );
+      if (cancelled || !mounted.current) return;
+      if (text != null) setActivityText(text);
+      setActivityError(error);
+    }
+    captureActivity();
+    const t = setInterval(captureActivity, REFRESH_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [bin, home, supervisor]);
 
   // Age/last-event mtime pass: a single stat() per file, unlike du's tree walk,
   // so it is cheap enough to run on the fast board-refresh cadence rather than
@@ -703,6 +781,15 @@ export default function App({ bin, home }) {
       return;
     }
 
+    // Ctrl-A toggles the in-flight FIRSTMATE ACTIVITY strip taller, for when
+    // the captain wants more than a glance while crews are running. A plain
+    // 'a' is never stolen here - only the Ctrl-combo - so free typing is
+    // unaffected (mirrors why quick-actions live behind Tab, not bare keys).
+    if (key.ctrl && inputChar === 'a') {
+      setActivityExpanded((v) => !v);
+      return;
+    }
+
     const pending = pendingConfirmRef.current;
     const selId = selectedIdRef.current;
 
@@ -786,6 +873,27 @@ export default function App({ bin, home }) {
 
   useInput(handleInput);
 
+  // FIRSTMATE ACTIVITY panel state, derived once per render from the polled
+  // capture (activityText/activityError, set by the async side-channel above)
+  // plus the not-resolved case surfaced by the same fail-closed bridge check
+  // the command bridge already reports (supervisor.error). Idle fleet: the
+  // panel takes over IN FLIGHT's whole freed box (see boardRow below) at no
+  // extra row cost - it reuses a box the board would otherwise devote to
+  // "Nothing in flight" text. In-flight: it renders as a slim ADDITIONAL strip
+  // above the board, which only fits by taking rows away from IN FLIGHT/
+  // QUEUED/RECENT DONE - so it is only added when the terminal has real slack
+  // beyond the existing compact-layout threshold (MIN_ROWS_FOR_FULL_LAYOUT):
+  // below that, the strip would squeeze the fleet board unreadable in exactly
+  // the way the row-budget discipline above exists to prevent, so it is
+  // dropped entirely rather than degrading the board everyone already relies
+  // on. A captain-pressed toggle (Ctrl-A) expands it a bit further when there
+  // is room to spare.
+  const activityIdle = inFlight.length === 0;
+  const activityStripRows = activityExpanded ? FIRSTMATE_ACTIVITY_STRIP_ROWS * 2 : FIRSTMATE_ACTIVITY_STRIP_ROWS;
+  const activityStripHeight = SECTION_ROW_CHROME + activityStripRows;
+  const activityStripFits = height >= MIN_ROWS_FOR_FULL_LAYOUT + activityStripHeight;
+  const showActivityStrip = !activityIdle && activityStripFits;
+
   // Row budget: Ink has no scrolling, and handing a fixed-height flex tree
   // more rows than it has space for can corrupt the render rather than clip
   // it cleanly (see the Card/capRows comments above) - it silently loses
@@ -796,8 +904,15 @@ export default function App({ bin, home }) {
   // unit-tested math; each section is then capped to fit via capRows.
   const footerLines = snapError || !header.watcherAlive || supervisor.error ? 1 : 0;
   const inFlightContentRows = inFlightContentRowCount(inFlightGrouped);
+  // The in-flight activity strip is its own fixed-height box outside
+  // computeRowBudget's three-section split (IN FLIGHT/QUEUED/RECENT DONE), so
+  // its total row cost (chrome + body) is subtracted from the height handed to
+  // that budget when it is actually shown - exactly like fixedChrome already
+  // accounts for the title bar/status strip/footer/input box - or the budget
+  // would hand out rows the strip has already claimed and the board would
+  // overflow its allotted height.
   const { inFlightRows, queuedRows, doneRows } = computeRowBudget({
-    height,
+    height: height - (showActivityStrip ? activityStripHeight : 0),
     hasFooter: footerLines > 0,
     hasInFlight: inFlight.length > 0,
     inFlightContentRows: inFlight.length ? inFlightContentRows : null,
@@ -823,18 +938,60 @@ export default function App({ bin, home }) {
   const fullContentWidth = Math.max(10, width - SECTION_CHROME_WIDTH);
   const halfContentWidth = Math.max(10, Math.floor(width / 2) - SECTION_CHROME_WIDTH);
 
+  // Tail exactly to each panel's own row budget (never more) so capRows never
+  // has to truncate this content - capRows keeps a list's EARLIEST entries and
+  // drops the tail behind a "+N more" marker, which is right for IN FLIGHT
+  // cards/backlog rows (most-important-first) but wrong for a live tail
+  // (newest-at-bottom is the whole point): truncating post-tail would show
+  // stale lines and hide the newest one behind "+N more" instead.
+  const idleActivityLines = firstmateActivityLines(activityText, inFlightRows);
+  const stripActivityLines = firstmateActivityLines(activityText, activityStripRows);
+
+  // Idle fleet (the common case): IN FLIGHT's whole freed box shows firstmate
+  // working instead of an empty "Nothing in flight" message - this is the
+  // console's single-window point in its clearest form, since the biggest
+  // block of otherwise-wasted space now shows the one thing the board could
+  // not show before. In-flight, with room to spare: a compact strip sits above
+  // IN FLIGHT/QUEUED/RECENT DONE instead, so the captain still sees firstmate
+  // working at a glance without the fleet board losing its own room; Ctrl-A
+  // toggles it taller when more context is wanted. In-flight at a cramped
+  // terminal height: the strip is dropped entirely (showActivityStrip false)
+  // rather than squeeze the fleet board unreadable - the row-budget discipline
+  // above already reserves nothing for it in that case.
+  const inFlightOrActivity = activityIdle
+    ? h(FirstmateActivityPanel, {
+        lines: idleActivityLines,
+        error: activityError,
+        width: fullContentWidth,
+        flexGrow: inFlightHeight == null ? inFlightGrow : undefined,
+        height: inFlightHeight,
+        maxRows: inFlightRows,
+      })
+    : h(InFlightSection, {
+        grouped: inFlightGrouped,
+        selectedId,
+        width: fullContentWidth,
+        flexGrow: inFlightHeight == null ? inFlightGrow : undefined,
+        height: inFlightHeight,
+        maxRows: inFlightRows,
+      });
+
+  const activityStrip = showActivityStrip
+    ? h(FirstmateActivityPanel, {
+        lines: stripActivityLines,
+        error: activityError,
+        width: fullContentWidth,
+        height: activityStripHeight,
+        maxRows: activityStripRows,
+      })
+    : null;
+
   const boardRow = compact
     ? h(
         Box,
         { flexDirection: 'column', flexGrow: 1 },
-        h(InFlightSection, {
-          grouped: inFlightGrouped,
-          selectedId,
-          width: fullContentWidth,
-          flexGrow: inFlightHeight == null ? inFlightGrow : undefined,
-          height: inFlightHeight,
-          maxRows: inFlightRows,
-        }),
+        activityStrip,
+        inFlightOrActivity,
         h(QueuedSection, {
           records: queuedRecords,
           blockedCount: header.blocked,
@@ -847,14 +1004,8 @@ export default function App({ bin, home }) {
     : h(
         Box,
         { flexDirection: 'column', flexGrow: 1 },
-        h(InFlightSection, {
-          grouped: inFlightGrouped,
-          selectedId,
-          width: fullContentWidth,
-          flexGrow: inFlightHeight == null ? inFlightGrow : undefined,
-          height: inFlightHeight,
-          maxRows: inFlightRows,
-        }),
+        activityStrip,
+        inFlightOrActivity,
         h(
           Box,
           { flexGrow: 2 },

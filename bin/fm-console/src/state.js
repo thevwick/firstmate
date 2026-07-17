@@ -284,6 +284,21 @@ export function boardSections(cards) {
   return { inFlight, inFlightGrouped: groupCards(inFlight), done };
 }
 
+// Pure trim/tail for the FIRSTMATE ACTIVITY panel: split a raw pane capture
+// (fm-peek.sh's stdout - trailing blank rows are normal for a short-busy pane
+// in a tall terminal) into a bounded list of lines, dropping trailing blanks
+// and keeping at most the last `maxLines` non-trailing lines so the panel
+// reads like a live tail (newest content at the bottom) rather than mostly
+// whitespace. Never throws on null/empty input - an unreadable capture is the
+// caller's job to report via its own error placeholder, not this function's.
+export function firstmateActivityLines(rawText, maxLines) {
+  if (!rawText) return [];
+  const lines = String(rawText).split('\n');
+  while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+  if (maxLines == null || lines.length <= maxLines) return lines;
+  return lines.slice(lines.length - maxLines);
+}
+
 // Compose the whole header model from the pieces the UI has read. inFlight is
 // derived from the snapshot's tasks[] (live state/<id>.meta rows), NOT from
 // the backlog's "In flight" section text, so it reflects actual live work

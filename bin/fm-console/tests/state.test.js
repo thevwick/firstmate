@@ -19,6 +19,7 @@ import {
   healthLevel,
   formatProfile,
   branchForTask,
+  firstmateActivityLines,
 } from '../src/state.js';
 
 test('extractTicket finds a generic ticket key in branch or brief', () => {
@@ -339,4 +340,31 @@ test('inFlightContentRowCount sums a label row plus CARD_ROW_HEIGHT per card, ac
 
 test('inFlightContentRowCount is 0 for an empty grouping', () => {
   assert.equal(inFlightContentRowCount(new Map()), 0);
+});
+
+test('firstmateActivityLines returns null/empty input as an empty list', () => {
+  assert.deepEqual(firstmateActivityLines(null, 10), []);
+  assert.deepEqual(firstmateActivityLines('', 10), []);
+  assert.deepEqual(firstmateActivityLines(undefined, 10), []);
+});
+
+test('firstmateActivityLines drops trailing blank rows from a short-busy pane capture', () => {
+  const raw = 'line one\nline two\n\n\n\n';
+  assert.deepEqual(firstmateActivityLines(raw, 10), ['line one', 'line two']);
+});
+
+test('firstmateActivityLines tails to the last maxLines entries, newest at the bottom, in original order', () => {
+  const raw = Array.from({ length: 10 }, (_, i) => `line ${i}`).join('\n');
+  const tailed = firstmateActivityLines(raw, 3);
+  assert.deepEqual(tailed, ['line 7', 'line 8', 'line 9']);
+});
+
+test('firstmateActivityLines returns every line unchanged when under the maxLines budget', () => {
+  const raw = 'a\nb\nc';
+  assert.deepEqual(firstmateActivityLines(raw, 10), ['a', 'b', 'c']);
+});
+
+test('firstmateActivityLines with a null maxLines returns every line (minus trailing blanks), no cap', () => {
+  const raw = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n');
+  assert.equal(firstmateActivityLines(raw, null).length, 50);
 });
