@@ -592,10 +592,99 @@ test_backend_of_selector_matches_explicit_target_meta() {
     || fail "explicit backend target matching metadata should use that task's backend"
   [ "$(fm_backend_of_selector 'firstmate:fm-tmux-task' 'firstmate:fm-tmux-task' "$state")" = tmux ] \
     || fail "explicit tmux-shaped target with absent backend= should default to tmux"
-  [ "$(fm_backend_of_selector 'manual:outside' 'manual:outside' "$state")" = tmux ] \
-    || fail "explicit target with no matching metadata should keep the tmux compatibility default"
+
+  # A metaless explicit target (no matching meta) no longer blindly assumes
+  # tmux: it resolves from the live runtime. Under a tmux signal it resolves to
+  # tmux (the honest tmux path, not a blind guess); the full metaless matrix -
+  # herdr, config/backend, and the undetectable-errors case - is asserted in
+  # test_backend_of_selector_metaless_runtime below.
+  [ "$(unset HERDR_ENV CMUX_WORKSPACE_ID; TMUX='fake,1,0' fm_backend_of_selector 'manual:outside' 'manual:outside' "$state")" = tmux ] \
+    || fail "metaless target under a tmux runtime signal should resolve to tmux"
 
   pass "fm_backend_of_selector: exact task ids, legacy fm-<id> labels, and matching explicit targets inherit metadata backend"
+}
+
+# test_backend_of_selector_metaless_runtime: the metaless-target fix. A target
+# with no matching meta (firstmate's OWN primary pane is the motivating case)
+# must resolve its backend from the live runtime - FM_BACKEND, then
+# config/backend, then quiet detection - and ERROR rather than silently
+# assuming tmux when nothing resolves. This is the herdr-primary-pane bug:
+# peeking default:w1:p1 under HERDR_ENV=1 used to dispatch to a nonexistent tmux
+# socket. Every case explicitly controls the runtime markers so the suite stays
+# deterministic regardless of the runtime it itself executes inside.
+test_backend_of_selector_metaless_runtime() {
+  local state=$TMP_ROOT/metaless-runtime-state cfg="$TMP_ROOT/metaless-runtime-config" out
+  mkdir -p "$state" "$cfg"
+  # A non-metaless control: a target WITH a matching meta still inherits that
+  # meta's backend regardless of the ambient runtime (meta wins over detection).
+  fm_write_meta "$state/herdr-task.meta" "window=default:w9:p9" "backend=herdr"
+  [ "$(unset HERDR_ENV CMUX_WORKSPACE_ID; TMUX='fake,1,0' fm_backend_of_selector 'default:w9:p9' 'default:w9:p9' "$state")" = herdr ] \
+    || fail "a target with matching meta must inherit its backend, not runtime detection"
+
+  # Metaless under a herdr runtime signal -> herdr (the original bug: this used
+  # to fall through to tmux and break fm-peek against the primary's herdr pane).
+  out=$(unset TMUX CMUX_WORKSPACE_ID; HERDR_ENV=1 FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_of_selector 'default:w1:p1' 'default:w1:p1' "$state") \
+    || fail "metaless target under HERDR_ENV=1 should resolve, not error"
+  [ "$out" = herdr ] || fail "metaless target under HERDR_ENV=1 should resolve to herdr, got '$out'"
+
+  # Metaless under a tmux runtime signal -> tmux (honest detection, not a guess).
+  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID; TMUX='fake,1,0' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_of_selector 'sess:win' 'sess:win' "$state") \
+    || fail "metaless target under a tmux signal should resolve, not error"
+  [ "$out" = tmux ] || fail "metaless target under a tmux signal should resolve to tmux, got '$out'"
+
+  # Metaless with config/backend set honors it, over even a conflicting runtime
+  # signal (explicit configuration wins over auto-detection).
+  printf 'herdr\n' > "$cfg/backend"
+  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID; TMUX='fake,1,0' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_of_selector 'sess:win' 'sess:win' "$state") \
+    || fail "metaless target with config/backend should resolve, not error"
+  [ "$out" = herdr ] || fail "metaless target should honor config/backend=herdr over a tmux signal, got '$out'"
+  rm -f "$cfg/backend"
+
+  # FM_BACKEND env wins over everything for a metaless target.
+  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID; TMUX='fake,1,0' FM_BACKEND=cmux FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_of_selector 'sess:win' 'sess:win' "$state") \
+    || fail "metaless target with FM_BACKEND set should resolve, not error"
+  [ "$out" = cmux ] || fail "metaless target should honor FM_BACKEND=cmux over other signals, got '$out'"
+
+  # Nothing detectable -> ERROR (returns non-zero, prints no backend). The
+  # non-Darwin uname fake makes the cmux ancestry/bundle fallback inert too, so
+  # this is a genuine no-signal environment regardless of the host runtime.
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier; PATH="$FAKE_NONDARWIN_BIN:$PATH" FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_of_selector 'sess:win' 'sess:win' "$state" 2>/dev/null) \
+    && fail "metaless target with nothing detectable should error, got '$out'"
+  [ -z "$out" ] || fail "metaless target with nothing detectable must NOT print tmux (or any backend), got '$out'"
+  # And the error message is loud and actionable on stderr.
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier; PATH="$FAKE_NONDARWIN_BIN:$PATH" FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_of_selector 'sess:win' 'sess:win' "$state" 2>&1 || true)
+  assert_contains "$out" "cannot resolve a runtime backend for metaless" "metaless no-signal error text changed"
+  assert_contains "$out" "refusing to assume tmux" "metaless error should state it refuses to assume tmux"
+
+  pass "fm_backend_of_selector: metaless target resolves from FM_BACKEND/config/backend/detection and errors instead of assuming tmux"
+}
+
+# test_backend_runtime_or_error: the shared honest resolver directly, so its
+# precedence (FM_BACKEND > config/backend > quiet detect > error) is pinned in
+# one place independent of its two callers.
+test_backend_runtime_or_error() {
+  local cfg="$TMP_ROOT/runtime-or-error-config" out
+  mkdir -p "$cfg"
+
+  out=$(unset TMUX CMUX_WORKSPACE_ID; HERDR_ENV=1 FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_runtime_or_error 'window w1') \
+    || fail "fm_backend_runtime_or_error should resolve under HERDR_ENV=1"
+  [ "$out" = herdr ] || fail "fm_backend_runtime_or_error should detect herdr, got '$out'"
+
+  printf 'zellij\n' > "$cfg/backend"
+  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID; TMUX='fake,1,0' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_runtime_or_error) \
+    || fail "fm_backend_runtime_or_error should read config/backend over detection"
+  [ "$out" = zellij ] || fail "fm_backend_runtime_or_error should honor config/backend=zellij, got '$out'"
+  rm -f "$cfg/backend"
+
+  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID; TMUX='fake,1,0' FM_BACKEND=orca FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_runtime_or_error) \
+    || fail "fm_backend_runtime_or_error should honor FM_BACKEND"
+  [ "$out" = orca ] || fail "fm_backend_runtime_or_error should honor FM_BACKEND=orca, got '$out'"
+
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier; PATH="$FAKE_NONDARWIN_BIN:$PATH" FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_runtime_or_error 'window w1' 2>/dev/null) \
+    && fail "fm_backend_runtime_or_error should error when nothing resolves, got '$out'"
+  [ -z "$out" ] || fail "fm_backend_runtime_or_error must print nothing on the error path, got '$out'"
+
+  pass "fm_backend_runtime_or_error: FM_BACKEND > config/backend > quiet detect > error"
 }
 
 # --- old vs new: fm-send.sh --------------------------------------------------
@@ -719,11 +808,15 @@ test_peek_conformance_old_vs_new() {
   # that guard, since STATE/HOME are already overridden directly.
   neutral_root="$TMP_ROOT/peek-neutral-root"; mkdir -p "$neutral_root"
 
+  # This peeks the metaless explicit target `sess:win`. TMUX is set for both
+  # runs so the new honest-runtime resolver deterministically resolves to tmux
+  # (matching the old blind-tmux floor), keeping the conformance comparison a
+  # test of the tmux capture command shape rather than of the ambient runtime.
   : > "$log_old"
-  out_old=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral_root" FM_HOME="$home" FM_TMUX_LOG="$log_old" \
+  out_old=$(unset HERDR_ENV CMUX_WORKSPACE_ID; PATH="$fb:$PATH" TMUX="fake,1,0" FM_ROOT_OVERRIDE="$neutral_root" FM_HOME="$home" FM_TMUX_LOG="$log_old" \
     "$old_bin/bin/fm-peek.sh" "sess:win" 25 2>/dev/null)
   : > "$log_new"
-  out_new=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$neutral_root" FM_HOME="$home" FM_TMUX_LOG="$log_new" \
+  out_new=$(unset HERDR_ENV CMUX_WORKSPACE_ID; PATH="$fb:$PATH" TMUX="fake,1,0" FM_ROOT_OVERRIDE="$neutral_root" FM_HOME="$home" FM_TMUX_LOG="$log_new" \
     "$ROOT/bin/fm-peek.sh" "sess:win" 25 2>/dev/null)
 
   [ "$out_old" = "$out_new" ] || fail "fm-peek output differs old vs new"$'\n'"--- old ---"$'\n'"$out_old"$'\n'"--- new ---"$'\n'"$out_new"
@@ -734,6 +827,29 @@ test_peek_conformance_old_vs_new() {
     "fm-peek did not call capture-pane -p -t <target> -S -<lines> exactly"
 
   pass "fm-peek.sh: capture-pane invocation and output are byte-identical old vs new"
+}
+
+# test_peek_metaless_undetectable_errors: the caller side of the metaless fix.
+# When fm-peek is handed a metaless target and NOTHING resolves the runtime
+# backend, it must surface a clear, actionable stderr error and exit non-zero,
+# rather than dispatching to a nonexistent tmux socket (the original herdr
+# symptom: `error connecting to /private/tmp/tmux-501/default`). Markers are
+# unset and uname pinned non-Darwin so the no-signal case is deterministic.
+test_peek_metaless_undetectable_errors() {
+  local home="$TMP_ROOT/peek-metaless-home" neutral_root="$TMP_ROOT/peek-metaless-root" out rc
+  mkdir -p "$home/state" "$home/config" "$neutral_root"
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier
+    PATH="$FAKE_NONDARWIN_BIN:$PATH" FM_BACKEND='' FM_ROOT_OVERRIDE="$neutral_root" FM_HOME="$home" \
+    "$ROOT/bin/fm-peek.sh" "sess:win" 5 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "fm-peek should exit non-zero for an undetectable metaless target, got rc=$rc / '$out'"
+  assert_contains "$out" "cannot peek 'sess:win'" "fm-peek metaless error should name the target"
+  assert_contains "$out" "no backend could be resolved" "fm-peek metaless error should say no backend resolved"
+  case "$out" in
+    *"error connecting to"*|*"tmux-"*) fail "fm-peek must NOT dispatch to tmux for an undetectable metaless target, got '$out'" ;;
+  esac
+
+  pass "fm-peek.sh: an undetectable metaless target errors clearly and never dispatches to tmux"
 }
 
 # --- old vs new: fm-spawn.sh --------------------------------------------------
@@ -1081,8 +1197,11 @@ test_backend_validate_spawn_accepts_orca
 test_meta_get_and_backend_of_meta
 test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
+test_backend_of_selector_metaless_runtime
+test_backend_runtime_or_error
 test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
+test_peek_metaless_undetectable_errors
 test_spawn_symlinked_project_prefix_avoids_false_refusal
 test_teardown_conformance_old_vs_new
 test_spawn_refuses_unknown_backend_flag

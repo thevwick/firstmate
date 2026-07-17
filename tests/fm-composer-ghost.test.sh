@@ -262,8 +262,13 @@ test_peek_output_is_escape_free() {
   printf 'normal output line\n\xe2\x9d\xaf \033[2mpredicted next prompt\033[0m\n' > "$capture"
   # Empty FM_HOME so fm-guard.sh finds no in-flight task and stays silent.
   home="$dir/home"; mkdir -p "$home/state"
-  # Pass an explicit session:window so resolution needs no metadata.
-  out=$(PATH="$fb:$PATH" FM_HOME="$home" FM_FAKE_STYLED="$capture" \
+  # Pass an explicit session:window so resolution needs no metadata. That makes
+  # it a METALESS target, which resolves its backend from the live runtime
+  # rather than assuming tmux, so the runtime markers are pinned here: the fake
+  # tmux below is only reached under a tmux signal, and leaving them ambient
+  # would make this test read whatever runtime the suite itself executes inside.
+  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID
+        PATH="$fb:$PATH" TMUX='fake,1,0' FM_HOME="$home" FM_FAKE_STYLED="$capture" \
         "$PEEK" "sess:win" 2>/dev/null)
   case "$out" in
     *"$ESC"*) fail "fm-peek surfaced ANSI escape codes into LLM-facing output" ;;

@@ -211,9 +211,16 @@ window_kind() {
   echo unknown
 }
 
-# window_backend: the backend recorded in the meta whose window= matches <w>,
-# defaulting to tmux (absent backend= means tmux; the P1 compatibility
-# contract) when no matching meta carries the field, or none matches at all.
+# window_backend: the backend recorded in the meta whose window= matches <w>.
+# A matching meta with an absent backend= means tmux (the P1 compatibility
+# contract). A METALESS window (no matching meta) falls through to the honest
+# runtime resolver instead of blindly assuming tmux, so a herdr runtime is not
+# mis-dispatched to a nonexistent tmux socket; an undetectable metaless window
+# yields an empty result and a stderr error, which the poll loop's existing
+# guards (fm_backend_busy_state -> unknown -> regex fallback, fm_backend_capture
+# -> `|| continue`) already handle without killing the supervision backbone.
+# In normal operation every <w> the loop passes here comes from recorded_windows
+# (each backed by a meta), so this metaless fallthrough is defensive only.
 window_backend() {
   local w=$1 meta backend
   meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null || true)
@@ -223,7 +230,7 @@ window_backend() {
     echo "$backend"
     return 0
   fi
-  echo tmux
+  fm_backend_runtime_or_error "window $w"
 }
 
 window_label() {
