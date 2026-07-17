@@ -63,6 +63,114 @@ test_detect_node_version() {
   pass "detect_node_version reads nvmrc/.node-version/engines and normalizes"
 }
 
+# --- node switching (switch_node / node_version_matches) --------------------
+#
+# A fake fnm + node pair on PATH, driven by a marker file, stands in for the
+# real toolchain so this is hermetic (does not depend on fnm being installed
+# on the CI box). The fake node always reports v24.16.0 UNTIL the fake fnm's
+# "env" subcommand has run in this shell (FM_TEST_FAKE_FNM_ENV=1): only then
+# does "fnm use <v>" flip the marker file that the fake node reads its
+# reported version from. This reproduces the real bug precisely: fnm use
+# without fnm env first must be a no-op on node --version.
+
+# fm_fake_fnm_node <dir>: write fake fnm/node stubs into <dir>/fakebin and
+# echo that dir. The switched-to version is tracked in <dir>/node-version;
+# absent means the fake ambient node (v24.16.0).
+fm_fake_fnm_node() {
+  local dir=$1 fakebin
+  fakebin=$(fm_fakebin "$dir")
+  cat > "$fakebin/fnm" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  env)
+    # Real fnm prints shell code to eval; ours just sets the marker the
+    # fake "fnm use" requires before it will actually switch.
+    printf 'export FM_TEST_FAKE_FNM_ENV=1\n'
+    ;;
+  use)
+    if [ "${FM_TEST_FAKE_FNM_ENV:-0}" != 1 ]; then
+      echo "fnm: environment not set up, run fnm env first" >&2
+      exit 1
+    fi
+    v=${2%.}
+    case "$v" in
+      99.*) echo "fnm: no installation found for $v" >&2; exit 1 ;;
+    esac
+    printf '%s\n' "$v" > "$FM_TEST_FAKE_NODE_STATE"
+    ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/fnm"
+  cat > "$fakebin/node" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then
+  if [ -s "$FM_TEST_FAKE_NODE_STATE" ]; then
+    printf 'v%s\n' "$(cat "$FM_TEST_FAKE_NODE_STATE")"
+  else
+    printf 'v24.16.0\n'
+  fi
+  exit 0
+fi
+exit 1
+SH
+  chmod +x "$fakebin/node"
+  printf '%s\n' "$fakebin"
+}
+
+test_node_version_matches() {
+  node_version_matches 20 v20.18.3 || fail "bare major should match"
+  node_version_matches 20.18 v20.18.3 || fail "major.minor should match"
+  node_version_matches 20.18.3 v20.18.3 || fail "exact should match"
+  node_version_matches "20.18." v20.18.3 || fail "trailing-dot form should match"
+  node_version_matches 21 v20.18.3 && fail "different major must not match"
+  node_version_matches 20.19 v20.18.3 && fail "different minor must not match"
+  pass "node_version_matches accepts a requested prefix of the actual version"
+}
+
+test_switch_node_evals_fnm_env_before_use() {
+  local d="$TMP_ROOT/switch-ok" out
+  mkdir -p "$d"
+  export FM_TEST_FAKE_NODE_STATE="$d/node-version"
+  PATH="$(fm_fake_fnm_node "$d"):$PATH"
+  unset FM_TEST_FAKE_FNM_ENV
+  out=$(switch_node "20.18." 2>&1)
+  [ "$(cat "$d/node-version")" = "20.18" ] || fail "fake fnm use never ran (fnm env was not eval'd first)"
+  [ "$(node --version)" = "v20.18" ] || fail "node --version should reflect the switched version"
+  assert_not_contains "$out" "WARNING" "a successful switch must not warn"
+  pass "switch_node evaluates fnm env before fnm use, so the switch actually takes"
+}
+
+test_switch_node_warns_loudly_on_failed_switch() {
+  local d="$TMP_ROOT/switch-fail" out
+  mkdir -p "$d"
+  export FM_TEST_FAKE_NODE_STATE="$d/node-version"
+  PATH="$(fm_fake_fnm_node "$d"):$PATH"
+  unset FM_TEST_FAKE_FNM_ENV
+  out=$(switch_node "99.0.0" 2>&1)
+  assert_contains "$out" "WARNING" "a version fnm cannot resolve must warn"
+  assert_contains "$out" "99.0.0" "warning should name the requested version"
+  assert_contains "$out" "v24.16.0" "warning should name the ambient (unswitched) version"
+  pass "switch_node warns loudly when a present fnm fails to switch"
+}
+
+test_switch_node_noop_without_fnm() {
+  local d="$TMP_ROOT/switch-nofnm" out fakebin
+  mkdir -p "$d"
+  fakebin=$(fm_fakebin "$d")
+  out=$(PATH="$fakebin:/usr/bin:/bin" switch_node "20" 2>&1)
+  assert_contains "$out" "fnm is not installed" "missing fnm should warn, not fail"
+  pass "switch_node is a no-op warning when fnm is absent"
+}
+
+test_switch_node_noop_without_version() {
+  local out rc
+  out=$(switch_node "" 2>&1); rc=$?
+  [ -z "$out" ] || fail "no version requested should produce no output"
+  expect_code 0 "$rc" "no version requested should return success"
+  pass "switch_node returns early when no version is requested"
+}
+
 # --- hashing determinism ----------------------------------------------------
 
 test_lockfile_hash_determinism() {
@@ -274,6 +382,11 @@ test_unknown_repo_errors() {
 test_detect_pkgmgr
 test_pnpm_wins_over_npm
 test_detect_node_version
+test_node_version_matches
+test_switch_node_evals_fnm_env_before_use
+test_switch_node_warns_loudly_on_failed_switch
+test_switch_node_noop_without_fnm
+test_switch_node_noop_without_version
 test_lockfile_hash_determinism
 test_native_fingerprint_determinism_and_js_invariance
 test_native_fingerprint_platform_and_podfile_sensitive
