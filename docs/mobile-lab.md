@@ -31,7 +31,7 @@ Each key is the repo name you pass on the command line; each value is an object:
 | `clone` | no | Directory name under `projects/` holding the git clone. Defaults to the repo key. |
 | `default_branch` | no | Documentation only today (the repo's default release branch). Not required to run. |
 | `pkgmgr` | no | Documentation hint only. The engine detects the package manager per checkout from the lockfile, so this is not authoritative. |
-| `ios_scheme` | for native build | The Xcode scheme/workspace name used by `xcodebuild`. Required only to run a real native build. |
+| `ios_scheme` | for native build | The Xcode scheme name used by `xcodebuild`. Required only to run a real native build. The `.xcworkspace` is discovered under `ios/` at build time (it is named after the Xcode project, not the scheme). |
 | `sim_device` | no | Default simulator device name (e.g. `iPhone 16 Pro`). |
 | `metro_port_base` | no | Base Metro port for this repo's slots. Slot N gets `base + N`. Defaults to 8081. |
 | `pool_size` | no | Number of warm slots for this repo. Defaults to 3. |

@@ -694,7 +694,7 @@ native_build_and_launch() {
     # Force a clean build so the new RCT_METRO_PORT actually recompiles
     # React-Core (report caveat: incremental builds keep the old baked port).
     do_xcodebuild "$slot" "$scheme" "$platform"
-    snapshot_app "$slot" "$scheme" "$platform" "$app_cache"
+    snapshot_app "$slot" "$platform" "$app_cache"
   fi
 
   install_and_boot "$slot" "$scheme" "$platform" "$app_cache" "$port"
@@ -706,14 +706,37 @@ native_build_and_launch() {
 # gate passed. Kept as small named functions so the flow reads clearly and so a
 # future change (or a test with fakes) can override them.
 
+# find_ios_workspace: the .xcworkspace under <slot>/ios is named after the
+# Xcode PROJECT, not the scheme (they are independent), so it must be
+# discovered rather than derived from the configured ios_scheme. Exactly one
+# workspace is the expected case; zero usually means `pod install` has not run
+# yet; more than one is ambiguous, so pick the first (alphabetical, via glob
+# order) deterministically and warn rather than guessing wrong silently.
+find_ios_workspace() {
+  local slot=$1 w
+  local dir="$slot/ios" found=()
+  shopt -s nullglob
+  for w in "$dir"/*.xcworkspace; do found+=("$w"); done
+  shopt -u nullglob
+  case "${#found[@]}" in
+    0) die "no .xcworkspace found in $dir; run pod install first" ;;
+    1) printf '%s\n' "${found[0]}" ;;
+    *)
+      warn "multiple .xcworkspace found in $dir, using ${found[0]##*/}: ${found[*]##*/}"
+      printf '%s\n' "${found[0]}"
+      ;;
+  esac
+}
+
 do_xcodebuild() {
-  local slot=$1 scheme=$2 platform=$3 destination
+  local slot=$1 scheme=$2 platform=$3 destination workspace
   case "$platform" in
     sim)    destination='generic/platform=iOS Simulator' ;;
     device) destination='generic/platform=iOS' ;;
   esac
+  workspace=$(find_ios_workspace "$slot")
   ( cd "$slot/ios" && xcodebuild \
-      -workspace "$scheme.xcworkspace" \
+      -workspace "${workspace##*/}" \
       -scheme "$scheme" \
       -configuration Debug \
       -destination "$destination" \
@@ -721,12 +744,28 @@ do_xcodebuild() {
       clean build )
 }
 
+# find_built_app: the product .app under the derivedDataPath Products dir is
+# named after the target's PRODUCT_NAME, not the scheme, so it must be
+# discovered too. Only look in the Products/<Debug-platform> dir (never a
+# deeper Frameworks/ or a *.appex under it) so a framework or extension .app
+# bundle is never mistaken for the main product.
+find_built_app() {
+  local slot=$1 platform=$2 products_dir app
+  case "$platform" in
+    sim)    products_dir="$slot/ios/build/Build/Products/Debug-iphonesimulator" ;;
+    device) products_dir="$slot/ios/build/Build/Products/Debug-iphoneos" ;;
+  esac
+  app=$(find "$products_dir" -mindepth 1 -maxdepth 1 -type d -name '*.app' 2>/dev/null | head -1)
+  [ -n "$app" ] || return 1
+  printf '%s\n' "$app"
+}
+
 snapshot_app() {
-  local slot=$1 scheme=$2 platform=$3 app_cache=$4 app
-  app=$(find "$slot/ios/build" -type d -name "$scheme.app" 2>/dev/null | head -1)
-  [ -n "$app" ] || { warn "could not locate built $scheme.app to cache; skipping snapshot"; return 0; }
+  local slot=$1 platform=$2 app_cache=$3 app
+  app=$(find_built_app "$slot" "$platform") \
+    || { warn "could not locate built .app under $slot/ios/build to cache; skipping snapshot"; return 0; }
   rm -rf "$app_cache"; mkdir -p "$app_cache"
-  apfs_clone "$app" "$app_cache/$scheme.app"
+  apfs_clone "$app" "$app_cache/${app##*/}"
 }
 
 install_and_boot() {

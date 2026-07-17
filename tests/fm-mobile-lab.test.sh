@@ -171,6 +171,132 @@ test_switch_node_noop_without_version() {
   pass "switch_node returns early when no version is requested"
 }
 
+# --- xcworkspace / .app discovery -------------------------------------------
+#
+# The workspace is named after the Xcode PROJECT, not the scheme (they are
+# independent); the same is true for the built .app, which is named after the
+# target's PRODUCT_NAME. This reproduces the real dashpivot-mobile bug: scheme
+# "Dashpivot Dev" but workspace "Dashpivot.xcworkspace".
+
+test_find_ios_workspace_discovers_project_named_workspace() {
+  local slot="$TMP_ROOT/ws-ok"
+  mkdir -p "$slot/ios/Dashpivot.xcworkspace"
+  local found
+  found=$(find_ios_workspace "$slot")
+  [ "$found" = "$slot/ios/Dashpivot.xcworkspace" ] \
+    || fail "should discover the project-named workspace, got: $found"
+  pass "find_ios_workspace discovers the .xcworkspace regardless of scheme name"
+}
+
+test_do_xcodebuild_targets_discovered_workspace_not_scheme_named() {
+  # Reproduces the confirmed dashpivot-mobile failure: scheme "Dashpivot Dev",
+  # workspace "Dashpivot.xcworkspace". Fake xcodebuild records its argv so the
+  # constructed command can be asserted without a real build.
+  local slot="$TMP_ROOT/ws-build" fakebin d
+  mkdir -p "$slot/ios/Dashpivot.xcworkspace"
+  d="$TMP_ROOT/ws-build-fake"; mkdir -p "$d"
+  fakebin=$(fm_fakebin "$d")
+  cat > "$fakebin/xcodebuild" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$FM_TEST_XCODEBUILD_ARGS"
+exit 0
+SH
+  chmod +x "$fakebin/xcodebuild"
+  export FM_TEST_XCODEBUILD_ARGS="$d/argv"
+  PATH="$fakebin:$PATH" do_xcodebuild "$slot" "Dashpivot Dev" sim >/dev/null
+  assert_grep "Dashpivot.xcworkspace" "$d/argv" \
+    "xcodebuild must be invoked with the discovered project workspace"
+  assert_no_grep "Dashpivot Dev.xcworkspace" "$d/argv" \
+    "xcodebuild must NOT be invoked with a scheme-named workspace that does not exist"
+  assert_grep "Dashpivot Dev" "$d/argv" "xcodebuild must still receive the configured scheme"
+  pass "do_xcodebuild targets the discovered project workspace, not <scheme>.xcworkspace"
+}
+
+test_find_ios_workspace_errors_clearly_when_none_found() {
+  local slot="$TMP_ROOT/ws-none" out rc
+  mkdir -p "$slot/ios"
+  out=$(find_ios_workspace "$slot" 2>&1); rc=$?
+  expect_code 1 "$rc" "no workspace found must exit non-zero"
+  assert_contains "$out" "no .xcworkspace found" "error names the missing workspace"
+  assert_contains "$out" "pod install" "error hints at the likely cause"
+  pass "find_ios_workspace fails loudly and clearly when no workspace exists"
+}
+
+test_find_ios_workspace_picks_deterministically_and_warns_on_multiple() {
+  local slot="$TMP_ROOT/ws-multi" out
+  mkdir -p "$slot/ios/Alpha.xcworkspace" "$slot/ios/Zeta.xcworkspace"
+  out=$(find_ios_workspace "$slot" 2>&1)
+  assert_contains "$out" "multiple .xcworkspace" "should warn about the ambiguity"
+  # Deterministic pick: glob order, so Alpha (alphabetically first) wins.
+  local picked
+  picked=$(find_ios_workspace "$slot" 2>/dev/null)
+  [ "$picked" = "$slot/ios/Alpha.xcworkspace" ] || fail "should deterministically pick one workspace, got: $picked"
+  pass "find_ios_workspace warns and picks deterministically when multiple workspaces exist"
+}
+
+test_find_built_app_discovers_product_named_app_not_scheme_named() {
+  # Reproduces the app-bundle half of the same bug: scheme "Dashpivot Dev"
+  # but the built product is "Dashpivot.app" (named after PRODUCT_NAME).
+  local slot="$TMP_ROOT/app-ok"
+  mkdir -p "$slot/ios/build/Build/Products/Debug-iphonesimulator/Dashpivot.app"
+  local found
+  found=$(find_built_app "$slot" sim)
+  [ "$found" = "$slot/ios/build/Build/Products/Debug-iphonesimulator/Dashpivot.app" ] \
+    || fail "should discover the product-named .app, got: $found"
+  pass "find_built_app discovers the .app regardless of scheme name"
+}
+
+test_find_built_app_ignores_nested_framework_and_extension_bundles() {
+  local slot="$TMP_ROOT/app-nested" products
+  products="$slot/ios/build/Build/Products/Debug-iphonesimulator"
+  mkdir -p "$products/Dashpivot.app/PlugIns/DashpivotWidget.appex"
+  mkdir -p "$products/Dashpivot.app/Frameworks/SomeLib.framework"
+  local found
+  found=$(find_built_app "$slot" sim)
+  [ "$found" = "$products/Dashpivot.app" ] \
+    || fail "should pick the top-level product .app, not a nested framework/extension, got: $found"
+  pass "find_built_app picks the top-level product, not nested frameworks/extensions"
+}
+
+test_find_built_app_uses_device_products_dir_for_device_platform() {
+  local slot="$TMP_ROOT/app-device"
+  mkdir -p "$slot/ios/build/Build/Products/Debug-iphoneos/Dashpivot.app"
+  local found
+  found=$(find_built_app "$slot" device)
+  [ "$found" = "$slot/ios/build/Build/Products/Debug-iphoneos/Dashpivot.app" ] \
+    || fail "device platform should look under Debug-iphoneos, got: $found"
+  pass "find_built_app uses the platform-appropriate Products dir"
+}
+
+test_find_built_app_returns_failure_when_missing() {
+  local slot="$TMP_ROOT/app-missing" rc
+  mkdir -p "$slot/ios/build/Build/Products/Debug-iphonesimulator"
+  find_built_app "$slot" sim >/dev/null 2>&1; rc=$?
+  expect_code 1 "$rc" "missing built .app must return non-zero"
+  pass "find_built_app returns failure (not an error exit) when no .app exists, so callers can warn-and-skip"
+}
+
+test_snapshot_app_caches_discovered_app_under_its_real_name() {
+  local slot="$TMP_ROOT/snap" app_cache="$TMP_ROOT/snap-cache" out
+  mkdir -p "$slot/ios/build/Build/Products/Debug-iphonesimulator/Dashpivot.app"
+  : > "$slot/ios/build/Build/Products/Debug-iphonesimulator/Dashpivot.app/marker"
+  out=$(snapshot_app "$slot" sim "$app_cache" 2>&1)
+  assert_not_contains "$out" "could not locate" "snapshot_app should find the app, not warn"
+  assert_present "$app_cache/Dashpivot.app" "snapshot_app should cache the app under its real product name"
+  assert_present "$app_cache/Dashpivot.app/marker" "cached app contents should be present"
+  pass "snapshot_app caches the discovered app under its real product name, not the scheme name"
+}
+
+test_snapshot_app_warns_and_skips_when_no_app_built() {
+  local slot="$TMP_ROOT/snap-none" app_cache="$TMP_ROOT/snap-none-cache" out rc
+  mkdir -p "$slot/ios/build/Build/Products/Debug-iphonesimulator"
+  out=$(snapshot_app "$slot" sim "$app_cache" 2>&1); rc=$?
+  expect_code 0 "$rc" "snapshot_app should warn-and-skip, not fail the build, when nothing was built"
+  assert_contains "$out" "could not locate built" "should warn clearly"
+  assert_absent "$app_cache" "no cache dir should be created when nothing was found"
+  pass "snapshot_app warns and returns success when no .app was built"
+}
+
 # --- hashing determinism ----------------------------------------------------
 
 test_lockfile_hash_determinism() {
@@ -387,6 +513,16 @@ test_switch_node_evals_fnm_env_before_use
 test_switch_node_warns_loudly_on_failed_switch
 test_switch_node_noop_without_fnm
 test_switch_node_noop_without_version
+test_find_ios_workspace_discovers_project_named_workspace
+test_do_xcodebuild_targets_discovered_workspace_not_scheme_named
+test_find_ios_workspace_errors_clearly_when_none_found
+test_find_ios_workspace_picks_deterministically_and_warns_on_multiple
+test_find_built_app_discovers_product_named_app_not_scheme_named
+test_find_built_app_ignores_nested_framework_and_extension_bundles
+test_find_built_app_uses_device_products_dir_for_device_platform
+test_find_built_app_returns_failure_when_missing
+test_snapshot_app_caches_discovered_app_under_its_real_name
+test_snapshot_app_warns_and_skips_when_no_app_built
 test_lockfile_hash_determinism
 test_native_fingerprint_determinism_and_js_invariance
 test_native_fingerprint_platform_and_podfile_sensitive
