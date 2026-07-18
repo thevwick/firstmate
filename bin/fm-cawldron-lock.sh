@@ -22,19 +22,21 @@
 #     captain's Cawldron edits for that project may still be sitting uncommitted
 #     in its working tree, to reconcile before dispatching crews there.
 #   fm-cawldron-lock.sh [--list]
-#     List active locks with age and note. The default with no arguments.
+#     List active locks with age and note. The default with no arguments. A
+#     marker that exists but cannot be parsed is listed as an unreadable lock
+#     rather than hidden - re-set or clear it to resolve.
 #   fm-cawldron-lock.sh -h|--help
 #
 # Marker: state/cawldron-lock-<project>, containing "since=<epoch>" and an
 # optional "note=<text>" line (bin/fm-cawldron-lock-lib.sh owns the format).
 # FM_HOME/FM_STATE_OVERRIDE resolve the state dir exactly as other bin/ scripts
-# do. <project> must be a leaf name (no path separators).
+# do. <project> must be a non-empty leaf name (no path separators).
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -49,21 +51,13 @@ PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 # shellcheck source=bin/fm-cawldron-lock-lib.sh
 . "$SCRIPT_DIR/fm-cawldron-lock-lib.sh"
 
-RULE='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
-
 list_locks() {
-  local project since note age line printed
+  local project status since note printed
   printed=0
-  while IFS=$'\t' read -r project since note; do
+  while IFS=$'\t' read -r project status since note; do
     [ -n "$project" ] || continue
     printed=1
-    age=$(fm_cawldron_lock_age_human "$since")
-    if [ -n "$note" ]; then
-      line="$project - locked $age ago (note: $note)"
-    else
-      line="$project - locked $age ago"
-    fi
-    printf '%s\n' "$line"
+    printf '%s - %s\n' "$project" "$(fm_cawldron_lock_detail "$status" "$since" "$note")"
   done < <(fm_cawldron_lock_list "$STATE")
   [ "$printed" -eq 1 ] || echo "no active Cawldron locks"
 }
@@ -77,6 +71,7 @@ PROJECT=$1
 shift
 
 case "$PROJECT" in
+  '') echo "error: <project> must not be empty; usage: fm-cawldron-lock.sh <project> [--note <text>|--clear]" >&2; exit 1 ;;
   -*) echo "error: missing <project> (got '$PROJECT'); usage: fm-cawldron-lock.sh <project> [--note <text>|--clear]" >&2; exit 1 ;;
   */*) echo "error: <project> must be a leaf name, not a path: $PROJECT" >&2; exit 1 ;;
 esac
@@ -138,11 +133,11 @@ for meta in "$STATE"/*.meta; do
 done
 if [ "${#live_crew_ids[@]}" -gt 0 ]; then
   {
-    printf '●%s\n' "$RULE"
+    printf '●%s\n' "$FM_CAWLDRON_RULE"
     printf '●  CAWLDRON LOCK SET WHILE A CREW IS ALREADY ON %s\n' "$PROJECT"
     printf '●  Live crew(s) already recorded on this project: %s\n' "${live_crew_ids[*]}"
     printf '●  The lock is informational only - it does not stop or notify those crews.\n'
-    printf '●%s\n' "$RULE"
+    printf '●%s\n' "$FM_CAWLDRON_RULE"
   } >&2
 fi
 

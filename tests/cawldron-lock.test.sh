@@ -196,8 +196,50 @@ test_spawn_gate_force_locked_env_overrides() {
   pass "fm-spawn.sh FM_SPAWN_FORCE_LOCKED=1 overrides the Cawldron lock refusal"
 }
 
+# An empty <project> must be rejected, like the leading-dash and path cases -
+# otherwise it creates an orphan state/cawldron-lock- marker that nothing can
+# list, gate on, or clear.
+test_empty_project_rejected() {
+  local home out status
+  home=$(new_home)
+  out=$(run_lock "$home" "")
+  status=$?
+  [ "$status" -ne 0 ] || fail "an empty <project> should be rejected"
+  assert_contains "$out" "error: <project> must not be empty" "empty-project rejection message missing"
+  assert_absent "$home/state/cawldron-lock-" "an orphan empty-name marker was created"
+  pass "an empty <project> is rejected instead of creating an orphan marker"
+}
+
+# A marker that exists but carries no since= value (e.g. a zero-byte file left
+# by a truncated write) must NOT read as "unlocked": --list surfaces it and the
+# spawn gate still refuses.
+test_corrupt_marker_surfaces_and_still_gates() {
+  local home out status
+  home=$(new_home)
+  mkdir -p "$home/projects/corrupt-proj"
+  : > "$home/state/cawldron-lock-corrupt-proj"
+
+  out=$(run_lock "$home" --list)
+  assert_contains "$out" "corrupt-proj" "--list hid the unreadable marker"
+  assert_contains "$out" "unreadable" "--list did not flag the marker as unreadable"
+  assert_not_contains "$out" "no active Cawldron locks" "an unreadable marker must not read as no locks"
+
+  out=$(run_spawn "$home" nope-corrupt-z5 projects/corrupt-proj)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn into a project with an unreadable marker should be refused"
+  assert_contains "$out" "CAWLDRON LOCK ACTIVE - corrupt-proj" "spawn gate failed open on an unreadable marker"
+
+  out=$(run_spawn "$home" nope-corrupt-z6 projects/corrupt-proj --force-locked)
+  assert_not_contains "$out" "CAWLDRON LOCK ACTIVE" "--force-locked should still override an unreadable marker"
+  assert_contains "$out" "error: no brief at" "override should have reached the missing-brief check"
+
+  pass "an unreadable marker is surfaced by --list and still gates spawns"
+}
+
 test_set_clear_list_roundtrip
 test_clear_when_not_locked
+test_empty_project_rejected
+test_corrupt_marker_surfaces_and_still_gates
 test_unknown_project_warns_but_allows
 test_known_project_via_projects_dir_no_warning
 test_known_project_via_registry_no_warning

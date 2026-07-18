@@ -17,7 +17,7 @@
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed: <reason>",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...",
-#                 "CAWLDRON_LOCK: <project> (since <age>[, note: <text>])".
+#                 "CAWLDRON_LOCK: <project> - locked <age> ago[ (note: <text>)]".
 #          When a RUNNING secondmate worktree is fast-forwarded to firstmate's
 #          own current default-branch commit (a purely LOCAL fast-forward, never
 #          an origin fetch) AND its loaded instruction surface (AGENTS.md, bin/,
@@ -46,8 +46,10 @@
 #          landed in the primary instead of its own worktree; restore it per the line.
 #          A CAWLDRON_LOCK line surfaces one active Cawldron coordination lock
 #          (state/cawldron-lock-<project>; bin/fm-cawldron-lock.sh), one per active
-#          lock, silent when none. Purely read-only detection - it runs the same
-#          way whether or not FM_BOOTSTRAP_DETECT_ONLY is set.
+#          lock, silent when none. A marker that exists but cannot be parsed is
+#          still surfaced, as an explicit unreadable-marker line, so a truncated
+#          write never hides a lock. Purely read-only detection - it runs the
+#          same way whether or not FM_BOOTSTRAP_DETECT_ONLY is set.
 #          treehouse is also MISSING when its installed version lacks
 #          "treehouse get --lease" support.
 #          no-mistakes is also MISSING when its installed version is older than
@@ -800,14 +802,9 @@ fi
 # (bin/fm-cawldron-lock.sh; bin/fm-cawldron-lock-lib.sh owns the marker format).
 # Mutates nothing itself, so it runs in the read-only/lock-refused path too.
 if [ -d "$STATE" ]; then
-  while IFS=$'\t' read -r cawl_project cawl_since cawl_note; do
+  while IFS=$'\t' read -r cawl_project cawl_status cawl_since cawl_note; do
     [ -n "$cawl_project" ] || continue
-    cawl_age=$(fm_cawldron_lock_age_human "$cawl_since")
-    if [ -n "$cawl_note" ]; then
-      echo "CAWLDRON_LOCK: $cawl_project (since $cawl_age, note: $cawl_note)"
-    else
-      echo "CAWLDRON_LOCK: $cawl_project (since $cawl_age)"
-    fi
+    echo "CAWLDRON_LOCK: $cawl_project - $(fm_cawldron_lock_detail "$cawl_status" "$cawl_since" "$cawl_note")"
   done < <(fm_cawldron_lock_list "$STATE")
 fi
 crew=

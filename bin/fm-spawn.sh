@@ -60,7 +60,9 @@
 #   A ship/scout spawn whose resolved project is Cawldron-locked
 #   (state/cawldron-lock-<project>; bin/fm-cawldron-lock.sh) is refused with a
 #   loud banner naming the project and lock age, unless --force-locked is passed
-#   or FM_SPAWN_FORCE_LOCKED=1 is set. --secondmate spawns are exempt.
+#   or FM_SPAWN_FORCE_LOCKED=1 is set. A marker that exists but cannot be parsed
+#   counts as locked, so a truncated marker cannot silently disarm the gate.
+#   --secondmate spawns are exempt.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -629,25 +631,30 @@ fi
 # exits 1, which the batch loop already reports as "FAILED to spawn" and skips,
 # continuing the rest of the pairs - no separate per-pair check needed there.
 fm_cawldron_spawn_gate() {
-  local proj_abs=$1 proj_name marker age note rule
+  local proj_abs=$1 proj_name marker rc detail
   proj_name=$(basename "$proj_abs")
   marker=$(fm_cawldron_lock_path "$STATE" "$proj_name")
-  fm_cawldron_lock_read "$marker" || return 0
+  rc=0
+  fm_cawldron_lock_read "$marker" || rc=$?
+  # Only a missing marker (rc 1) means unlocked. An unreadable marker (rc 2 -
+  # truncated or corrupt write) is still a lock: a damaged state file must never
+  # silently disarm this gate.
+  [ "$rc" -ne 1 ] || return 0
   [ "$FORCE_LOCKED_EFFECTIVE" -eq 0 ] || return 0
-  age=$(fm_cawldron_lock_age_human "$FM_CAWL_SINCE")
-  note=$FM_CAWL_NOTE
-  rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+  if [ "$rc" -eq 0 ]; then
+    detail=$(fm_cawldron_lock_detail ok "$FM_CAWL_SINCE" "$FM_CAWL_NOTE")
+  else
+    detail=$(fm_cawldron_lock_detail corrupt '' '')
+  fi
   {
-    printf '●%s\n' "$rule"
+    printf '●%s\n' "$FM_CAWLDRON_RULE"
     printf '●  CAWLDRON LOCK ACTIVE - %s\n' "$proj_name"
-    printf '●  Locked %s ago' "$age"
-    if [ -n "$note" ]; then printf ' (note: %s)' "$note"; fi
-    printf '\n'
+    printf '●  %s\n' "$detail"
     printf "●  A background crew may collide with the captain's unlanded live Cawldron edits.\n"
     printf '●  Pass --force-locked (or set FM_SPAWN_FORCE_LOCKED=1) to spawn anyway.\n'
-    printf '●%s\n' "$rule"
+    printf '●%s\n' "$FM_CAWLDRON_RULE"
   } >&2
-  echo "error: spawn refused: $proj_name is Cawldron-locked (locked $age ago); pass --force-locked to override" >&2
+  echo "error: spawn refused: $proj_name is Cawldron-locked ($detail); pass --force-locked to override" >&2
   return 1
 }
 
