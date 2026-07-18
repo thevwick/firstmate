@@ -107,6 +107,23 @@ banner() {
   printf '\n=== [%s/%s] %s: %s ===\n' "$idx" "$total" "$phase" "$msg"
 }
 
+# fm_setsid <cmd> [args...]: run a command in a NEW session/process group so it
+# is decoupled from the caller's controlling terminal and process group. This is
+# what lets the detached build outlive its launcher AND be torn down as a group
+# without ever signalling the launcher's own group. Prefers util-linux setsid;
+# macOS has none, so falls back to perl's POSIX::setsid (present on every macOS).
+# If neither exists, runs the command as-is (still detached via nohup + stdio
+# redirection at the call site, just not in its own group).
+fm_setsid() {
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!\n"' "$@"
+  else
+    "$@"
+  fi
+}
+
 # --- config -----------------------------------------------------------------
 
 # config_present: 0 if the config file exists, 1 otherwise.
@@ -621,12 +638,20 @@ release_build_lock() {
 #
 # Status state is carried in globals so the heartbeat and phase-transition
 # writers share one source of truth. percent is null unless a caller sets a
-# concrete integer (NEVER a fake smooth bar).
+# concrete integer (NEVER a fake smooth bar). The pid field records the OS pid
+# of the process that owns the build (the detached build process once handed
+# off) so a reader can tell a live build from a zombie "running" file with
+# `kill -0 <pid>`.
 
 ST_SLOT='' ST_REPO='' ST_BRANCH='' ST_PLATFORM='' ST_TARGET=''
 ST_RUN_COMMAND='' ST_PORT=0 ST_PHASE='' ST_PHASE_INDEX=0 ST_PHASE_TOTAL=7
 ST_PERCENT='null' ST_STATUS='running' ST_STARTED=0 ST_PHASE_STARTED=0
 ST_MESSAGE='' ST_LOGFILE='' ST_ERROR='null'
+# ST_PID is the OS pid of the process that owns this build (the detached build
+# process once handed off). The console and self-cleanup use it with `kill -0`
+# to tell a live build from a zombie "running" file whose process is gone. 0
+# means unset (no owning process recorded yet).
+ST_PID=0
 
 # status_file_path <slot-name>: the console-facing status file path for a slot,
 # under firstmate's OWN state dir (see FM_STATE_DIR above), not the lab's
@@ -666,12 +691,13 @@ status_write() {
     --arg message "$ST_MESSAGE" \
     --arg logfile "$ST_LOGFILE" \
     --argjson error "${ST_ERROR:-null}" \
+    --argjson pid "${ST_PID:-0}" \
     '{schema:$schema, slot:$slot, repo:$repo, branch:$branch, platform:$platform,
       target:$target, run_command:$run_command, port:$port, phase:$phase,
       phase_index:$phase_index, phase_total:$phase_total, percent:$percent,
       status:$status, started_epoch:$started_epoch, updated_epoch:$updated_epoch,
       phase_started_epoch:$phase_started_epoch, message:$message,
-      logfile:$logfile, error:$error}' \
+      logfile:$logfile, error:$error, pid:$pid}' \
     > "$tmp" 2>/dev/null; then
     mv "$tmp" "$out"
   else
@@ -709,6 +735,36 @@ status_success() {
   ST_STATUS='success'; ST_ERROR='null'; ST_PERCENT=100
   ST_MESSAGE='build complete'
   status_write
+}
+
+# status_stale_if_running <status-file>: if <status-file> exists, is in a
+# non-terminal ("running") state, and its recorded owning pid is no longer alive
+# (or was never recorded), rewrite it in place as failed/stale. This reaps a
+# zombie "running-forever" file left by a previous build whose process died
+# without writing a terminal state. It is a pure in-place rewrite of the ONE
+# file passed (never the live ST_* globals), so a new build can call it against
+# its own slot's stale file before starting. A file already terminal
+# (success/failed) or whose pid is still alive is left untouched.
+status_stale_if_running() {
+  local f=$1 st pid tmp
+  [ -f "$f" ] || return 0
+  st=$(jq -r '.status // ""' "$f" 2>/dev/null) || return 0
+  [ "$st" = "running" ] || return 0
+  pid=$(jq -r '.pid // 0' "$f" 2>/dev/null)
+  case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
+  # A recorded, live pid means the build is genuinely still running: leave it.
+  if [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  tmp=$(mktemp "$(dirname "$f")/lab-build-stale.XXXXXX") || return 0
+  if jq '.status="failed"
+         | .error="stale build: owning process (pid \(.pid)) is no longer alive; marked failed by a new build"
+         | .message="stale build reaped"' \
+       "$f" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$f"
+  else
+    rm -f "$tmp"
+  fi
 }
 
 # --- disk headroom -----------------------------------------------------------
@@ -885,8 +941,20 @@ clone_dir() {
   printf '%s/%s\n' "$PROJECTS_DIR" "$clone"
 }
 
+# run_build <repo> <branch> <platform> [explicit_slot] [wait_mode]:
+# Run the SYNCHRONOUS setup (preflight, worktree, slice gate, deps, metro), then
+# hand the long, kill-prone native build (pods + compile + link + install) off
+# to a DETACHED build process that outlives this caller. wait_mode=1 (--wait)
+# blocks until the detached build finishes and propagates its exit code; the
+# default (wait_mode empty/0) returns 0 as soon as the build is launched.
+#
+# The detached build is the robustness fix: the previous foreground build tied
+# the whole 10-15 minute native build to the caller, so a killed/timed-out
+# caller killed the build mid-phase and left a zombie "running" status file.
+# Now the build runs under nohup+setsid with its own status-writing trap, so it
+# survives its caller and always reaches a terminal status (success/failed).
 run_build() {
-  local repo=$1 branch=$2 platform=$3 explicit_slot=${4:-}
+  local repo=$1 branch=$2 platform=$3 explicit_slot=${4:-} wait_mode=${5:-}
   require_config
   config_repo_exists "$repo" || die "repo '$repo' is not defined in $CONFIG (configured: $(config_repos | paste -sd, -))"
 
@@ -909,11 +977,20 @@ run_build() {
   log "fm-mobile-lab: $repo @ $branch -> slot $idx (port $port, $platform)"
   log "  run_command: $run_cmd"
 
+  # Reap a zombie "running" status file left in this slot by a previous build
+  # whose process died without writing a terminal state (see status_stale_if_running).
+  # Done before we overwrite the file so a stale build is never silently replaced
+  # as if it had succeeded.
+  status_stale_if_running "$(status_file_path "$name")"
+
   # Initialize build-status globals up front so even an early failure emits a
   # contract-shaped status file the console can render.
   ST_SLOT=$name ST_REPO=$repo ST_BRANCH=$branch ST_PLATFORM=$platform
   ST_RUN_COMMAND=$run_cmd ST_PORT=$port ST_STATUS='running' ST_ERROR='null'
   ST_STARTED=$now ST_PERCENT='null' ST_TARGET='(resolving)'
+  # During synchronous setup THIS process owns the status file; the detached
+  # child re-stamps pid to its own once it takes over.
+  ST_PID=$$
   # Absolute path: the log itself stays under the lab's own private STATE_DIR
   # (LAB_HOME/state), but the status file it is NAMED FROM now lives under
   # firstmate's state dir, so a bare relative "state/build-<slot>.log" would
@@ -922,17 +999,28 @@ run_build() {
   ST_LOGFILE="$STATE_DIR/build-$name.log"
   ST_PHASE_TOTAL=7
 
-  # Take the per-slot build lock around the whole pods+build+install sequence.
-  # Metro and the worktree are shared-safe; the native build + install into the
-  # slot's derivedData is what must be serialized.
-  if ! acquire_build_lock "$name"; then
-    ST_PHASE='preflight' ST_PHASE_INDEX=1
-    status_fail "another build is already running for slot $name (held by pid $(cat "$(build_lock_dir "$name")/pid" 2>/dev/null || echo '?')); wait for it or run a different slot with --slot"
-    die "slot $name is locked by another build; wait for it or pick a different --slot"
-  fi
-  # Release the lock however we exit from here on.
+  # Synchronous-setup guard: if this caller dies during setup (a `die` in
+  # preflight/worktree/deps), mark the status file failed so setup never leaves a
+  # zombie "running" file either. Cleared right before handoff, after which the
+  # detached build owns the file. A prior explicit status_fail sets ST_STATUS
+  # away from running, making this a no-op on that path.
   # shellcheck disable=SC2064
-  trap "release_build_lock '$name'" EXIT
+  trap "run_build_setup_on_exit '$name'" EXIT
+
+  # The per-slot build lock is taken by the DETACHED build process (which owns
+  # the pods+build+install sequence and outlives this caller), not here: a lock
+  # acquired here would be released the moment this caller returns. We still
+  # check it up front so a genuinely-contended slot fails fast synchronously.
+  local lockdir lockpid
+  lockdir=$(build_lock_dir "$name")
+  if [ -d "$lockdir" ]; then
+    lockpid=$(cat "$lockdir/pid" 2>/dev/null || echo)
+    if [ -n "$lockpid" ] && kill -0 "$lockpid" 2>/dev/null; then
+      ST_PHASE='preflight' ST_PHASE_INDEX=1
+      status_fail "another build is already running for slot $name (held by pid $lockpid); wait for it or run a different slot with --slot"
+      die "slot $name is locked by another build (pid $lockpid); wait for it or pick a different --slot"
+    fi
+  fi
 
   # PHASE 1: preflight - resolve the concrete target and run the slice gate.
   status_phase preflight 1 "resolving target and checking framework slices"
@@ -987,18 +1075,258 @@ run_build() {
 
   state_set_slot "$name" "$repo" "$branch" "$port" "$now"
 
-  # PHASES 4-7: pods, compile, link, install - all owned by the wrapped
-  # run_command. The lab streams+tees its output, infers phase transitions from
-  # the CLI's own markers, and emits the status file throughout.
-  run_wrapped_build "$name" "$slot" "$run_cmd" "$target_flag" "$target_value" "$port"
+  # Setup succeeded: the detached build now owns the status file, so clear the
+  # synchronous-setup guard before handoff (a caller return must NOT mark the
+  # detached build's file failed).
+  trap - EXIT
+
+  # Hand the long native build (pods + compile + link + install) off to a
+  # detached process. It re-runs this engine as `__build-detached` with the
+  # resolved params, holds the build lock, and writes its own terminal status.
+  launch_detached_build "$name" "$slot" "$run_cmd" "$target_flag" "$target_value" \
+    "$port" "$node_v" "$wait_mode"
+  return $?
+}
+
+# run_build_setup_on_exit <name>: EXIT-trap handler for the SYNCHRONOUS setup
+# phase of run_build. If setup died before handoff with the status still
+# 'running', mark the file failed so a setup failure never leaves a zombie
+# "running" file. No lock to release here (the detached build owns the lock).
+run_build_setup_on_exit() {
+  if [ "${ST_STATUS:-}" = "running" ]; then
+    status_fail "build setup failed before the native build started (see terminal output / log)"
+  fi
+}
+
+# launch_detached_build <name> <slot> <run_cmd> <tflag> <tval> <port> <node_v> <wait_mode>:
+# spawn the native build fully detached from this caller and return. The child
+# is re-launched as `<engine> __build-detached <params-file>` in its own session
+# (fm_setsid) with stdin from /dev/null and stdout/stderr redirected to a driver
+# log, so it is not tied to the caller's controlling terminal, process group, or
+# stdout pipe. It therefore keeps running to completion even if this caller is
+# killed or times out. wait_mode=1 blocks on the child and returns its exit code.
+launch_detached_build() {
+  local name=$1 slot=$2 run_cmd=$3 tflag=$4 tval=$5 port=$6 node_v=$7 wait_mode=${8:-}
+  local logfile driverlog paramfile
+  logfile="$STATE_DIR/build-$name.log"
+  # The contract logfile is the CLEAN build output that stream_build_output
+  # tees. The detached child's OWN stdout/stderr (phase banners, info lines, any
+  # stray tool chatter) go to a separate driver log so they do not duplicate the
+  # build lines the reader already appends to $logfile.
+  driverlog="$STATE_DIR/build-$name.driver.log"
+  : > "$logfile"
+  : > "$driverlog"
+  # Serialize the resolved build params to a file the child reads. Keeps the
+  # detached re-launch argument list clean and unambiguous (values may contain
+  # spaces/quotes). Written atomically alongside the log.
+  paramfile="$STATE_DIR/build-params-$name.json"
+  local ptmp
+  ptmp=$(mktemp "$STATE_DIR/build-params-$name.json.XXXXXX")
+  if jq -n \
+    --arg name "$name" --arg slot "$slot" --arg repo "$ST_REPO" \
+    --arg branch "$ST_BRANCH" --arg platform "$ST_PLATFORM" \
+    --arg target "$ST_TARGET" --arg run_command "$run_cmd" \
+    --arg tflag "$tflag" --arg tval "$tval" --argjson port "$port" \
+    --arg node_v "$node_v" --argjson started "$ST_STARTED" \
+    --arg logfile "$logfile" \
+    '{name:$name, slot:$slot, repo:$repo, branch:$branch, platform:$platform,
+      target:$target, run_command:$run_command, tflag:$tflag, tval:$tval,
+      port:$port, node_v:$node_v, started:$started, logfile:$logfile}' \
+    > "$ptmp"; then
+    mv "$ptmp" "$paramfile" || { rm -f "$ptmp"; die "could not write build params for slot $name"; }
+  else
+    rm -f "$ptmp"; die "could not write build params for slot $name"
+  fi
+
+  # Detach: setsid gives the child its own session (no controlling terminal),
+  # nohup ignores SIGHUP, </dev/null unties stdin, and >>logfile 2>&1 unties the
+  # child's stdout/stderr from this caller's pipe. The whole point is that this
+  # child survives the caller's death. setsid is not on macOS by default, so
+  # fall back to a plain background+disown, which still detaches stdio and
+  # ignores HUP via nohup.
+  # Launch the build in its OWN session (fm_setsid) so it is fully decoupled from
+  # this caller's controlling terminal and process group: it survives the caller
+  # exiting or being killed. </dev/null unties stdin, and >>driverlog 2>&1 unties
+  # stdout/stderr from this caller's pipe. fm_setsid exec's into the engine, so
+  # child_pid is the session leader that owns the build; its own pid == its pgid,
+  # so its exit trap can group-signal the build subtree without ever touching
+  # this launcher's group. nohup guards against SIGHUP for the pre-exec window.
+  local child_pid
+  fm_setsid "$SCRIPT_DIR/fm-mobile-lab.sh" __build-detached "$paramfile" \
+    </dev/null >>"$driverlog" 2>&1 &
+  child_pid=$!
+  disown "$child_pid" 2>/dev/null || true
+
+  log ""
+  log "build started in slot $name (pid $child_pid); it runs detached and will"
+  log "survive this shell exiting."
+  info "watch:  $(status_file_path "$name")"
+  info "tail:   tail -f $logfile"
+
+  if [ "$wait_mode" = "1" ]; then
+    info "--wait: blocking until the detached build finishes ..."
+    # Poll the status file for a terminal state instead of `wait`, because the
+    # detached child is in its own session and may not be a waitable child on
+    # every platform. This preserves the old blocking behavior + final exit code.
+    wait_for_detached_build "$name" "$child_pid"
+    return $?
+  fi
+  return 0
+}
+
+# wait_for_detached_build <name> <child-pid>: block until the detached build for
+# a slot reaches a terminal status (success/failed), then return 0 for success
+# or 1 for failure. Used by --wait. Polls the status file rather than `wait`
+# because the child runs in its own session and is not reliably a waitable child.
+# Also exits (as failed) if the child process disappears without a terminal
+# status, so --wait can never hang forever on a vanished build.
+wait_for_detached_build() {
+  local name=$1 child_pid=$2 f st
+  f=$(status_file_path "$name")
+  while :; do
+    if [ -f "$f" ]; then
+      st=$(jq -r '.status // ""' "$f" 2>/dev/null)
+      case "$st" in
+        success) return 0 ;;
+        failed)  return 1 ;;
+      esac
+    fi
+    if [ -n "$child_pid" ] && ! kill -0 "$child_pid" 2>/dev/null; then
+      # The child is gone. Give it a brief grace to flush its terminal status
+      # (its trap writes it on exit), then re-read once.
+      sleep 1
+      if [ -f "$f" ]; then
+        st=$(jq -r '.status // ""' "$f" 2>/dev/null)
+        [ "$st" = "success" ] && return 0
+      fi
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+# run_detached_build <params-file>: the detached build entrypoint. Reads the
+# resolved params written by launch_detached_build, reconstructs the status
+# globals, takes the per-slot build lock (recording THIS process as holder so it
+# survives the caller), runs pod install if needed, runs the wrapped native
+# build, and writes a terminal status. A trap catches ANY termination (including
+# this process itself being killed) and marks the status file failed rather than
+# leaving it stuck at "running" forever. This is what stops zombie "running"
+# files: the build always reaches a terminal state on its own exit.
+run_detached_build() {
+  local paramfile=$1
+  [ -f "$paramfile" ] || die "detached build params not found: $paramfile"
+  local name slot run_cmd tflag tval port node_v
+  name=$(jq -r '.name' "$paramfile")
+  slot=$(jq -r '.slot' "$paramfile")
+  run_cmd=$(jq -r '.run_command' "$paramfile")
+  tflag=$(jq -r '.tflag' "$paramfile")
+  tval=$(jq -r '.tval' "$paramfile")
+  port=$(jq -r '.port' "$paramfile")
+  node_v=$(jq -r '.node_v' "$paramfile")
+
+  # Reconstruct the status globals in THIS process so status writes are correct.
+  ST_SLOT=$name
+  ST_REPO=$(jq -r '.repo' "$paramfile")
+  ST_BRANCH=$(jq -r '.branch' "$paramfile")
+  ST_PLATFORM=$(jq -r '.platform' "$paramfile")
+  ST_TARGET=$(jq -r '.target' "$paramfile")
+  ST_RUN_COMMAND=$run_cmd
+  ST_PORT=$port
+  ST_STARTED=$(jq -r '.started' "$paramfile")
+  ST_LOGFILE=$(jq -r '.logfile' "$paramfile")
+  ST_STATUS='running' ST_ERROR='null' ST_PERCENT='null' ST_PHASE_TOTAL=7
+  # This process now OWNS the build: record its pid so a reader can tell this
+  # live build from a zombie file, and so self-cleanup can reap it if it dies.
+  ST_PID=$$
+
+  # Are we a genuine process-group leader (our own isolated group)? Only then is
+  # a group-kill in the exit trap safe: a group leader's pid equals its pgid, and
+  # fm_setsid at launch makes the detached process exactly that. When it is not
+  # (fm_setsid unavailable, so we share the launcher's group), the trap must fall
+  # back to a targeted pid-kill instead of signalling the shared group.
+  DETACHED_OWNS_SESSION=0
+  if command -v ps >/dev/null 2>&1; then
+    local mypgid
+    mypgid=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')
+    [ -n "$mypgid" ] && [ "$mypgid" = "$$" ] && DETACHED_OWNS_SESSION=1
+  fi
+
+  # Terminal-status trap: on ANY exit that has NOT already reached a terminal
+  # status, mark the file failed with a specific reason. This fires when the
+  # detached build process is itself killed (SIGTERM/SIGINT/SIGHUP) or exits
+  # abnormally, converting a would-be zombie "running" file into an honest
+  # "failed". Terminal states (success / an explicit status_fail) set
+  # ST_STATUS away from running, so the trap becomes a no-op in the normal path.
+  # The lock is released here too.
+  # shellcheck disable=SC2064
+  trap "detached_build_on_exit '$name' '$paramfile'" EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+
+  # Take the per-slot build lock, now recorded against THIS surviving process.
+  if ! acquire_build_lock "$name"; then
+    ST_PHASE='pods' ST_PHASE_INDEX=4
+    status_fail "another build is already running for slot $name (held by pid $(cat "$(build_lock_dir "$name")/pid" 2>/dev/null || echo '?'))"
+    exit 1
+  fi
+
+  switch_node "$node_v"
+
+  # PHASE 4 (setup): ensure CocoaPods are installed before the wrapped build.
+  # The deps cache makes the RN CLI think pods are already installed, so a fresh
+  # slot can be missing Pods/ and its xcconfigs; run pod install ourselves.
+  status_phase pods 4 "checking CocoaPods install"
+  if ! ensure_pods "$slot"; then
+    status_fail "pod install failed for slot $name; see log at $ST_LOGFILE"
+    exit 1
+  fi
+
+  # PHASES 4-7: pods, compile, link, install - owned by the wrapped run_command.
+  run_wrapped_build "$name" "$slot" "$run_cmd" "$tflag" "$tval" "$port"
 
   status_success
   log ""
-  log "READY: $repo @ $branch on $target_label"
+  log "READY: $ST_REPO @ $ST_BRANCH on $ST_TARGET"
   info "slot:       $slot"
   info "metro port: $port"
-  info "$DEPS_LINE"
   info "log:        $ST_LOGFILE"
+  exit 0
+}
+
+# detached_build_on_exit <name>: EXIT-trap handler for the detached build. Kill
+# any still-running build subtree first (so a killed detached process does not
+# orphan xcodebuild), then, if the build never reached a terminal status
+# (ST_STATUS still 'running'), write a terminal 'failed' so no zombie "running"
+# file is left behind. Always release the build lock. Idempotent and safe on the
+# normal success/fail path (where ST_STATUS is no longer 'running').
+detached_build_on_exit() {
+  local name=$1 paramfile=${2:-}
+  # Write the terminal status FIRST, before any subtree kill, because a
+  # group-kill re-signals this very process and could abort the status write. If
+  # the build never reached a terminal status (still 'running'), it was killed or
+  # crashed mid-build: record a specific 'failed' so no zombie "running" file is
+  # left behind.
+  if [ "${ST_STATUS:-}" = "running" ]; then
+    status_fail "build process terminated before completion (killed or crashed mid-build); marked failed by its own exit trap"
+  fi
+  release_build_lock "$name"
+  # Now tear down any still-running build subtree so a killed detached process
+  # never orphans the CLI + xcodebuild.
+  if [ "${DETACHED_OWNS_SESSION:-0}" = "1" ]; then
+    # We are our own process-group leader ($$ == our pgid), genuinely isolated
+    # from the launcher's group, so group-signalling the whole subtree is safe;
+    # it never reaches the launcher's group. The re-signal to ourselves is
+    # harmless (we are already exiting).
+    kill -TERM "-$$" 2>/dev/null || true
+  elif [ "${BUILD_CHILD_PID:-0}" -gt 0 ] 2>/dev/null; then
+    # No isolated group (fm_setsid unavailable): killing our group would hit the
+    # launcher, so fall back to just the pipeline pid.
+    kill -TERM "$BUILD_CHILD_PID" 2>/dev/null || true
+  fi
+  # The params file was consumed at startup; drop it so it does not linger.
+  [ -n "$paramfile" ] && rm -f "$paramfile" 2>/dev/null || true
 }
 
 # ensure_slot_worktree <clone> <slot-path> <branch>: create the git worktree if
@@ -1073,6 +1401,72 @@ ensure_metro() {
   ( cd "$slot" && RCT_METRO_PORT="$port" nohup npx react-native start --port "$port" --no-interactive \
       >"$logf" 2>&1 & echo $! > "$STATE_DIR/metro-$port.pid" )
   info "metro: started on $port (log: $logf)"
+}
+
+# --- CocoaPods install -------------------------------------------------------
+#
+# The deps cache clones node_modules via APFS from a shared layer, so the RN CLI
+# sees an already-populated node_modules and skips its own `pod install`. But
+# Pods/ is NOT part of node_modules: a fresh slot worktree has ios/ with no
+# Pods/ dir, and the build then dies with
+#   Unable to open base configuration reference file .../Pods-<App>.debug.xcconfig
+# because the pod-generated xcconfig the Xcode project references was never
+# produced. The lab must therefore run pod install itself when it is missing,
+# under the fnm-switched node the checkout asks for. Confirmed on dashpivot-mobile:
+# a manual `bundle exec pod install` in the slot fixed the xcconfig error.
+
+# pods_present <slot>: 0 if the slot already has a usable CocoaPods install for
+# this build, 1 if pod install must run. Considers pods missing when ios/Pods is
+# absent, or when ios/Pods/Target Support Files exists but carries no
+# Pods-*.xcconfig (the exact artifact the Xcode project's base configuration
+# reference points at). This is the concrete failure the real build hit.
+pods_present() {
+  local slot=$1
+  [ -d "$slot/ios/Pods" ] || return 1
+  # If Target Support Files exists, at least one Pods-*.xcconfig must be present.
+  # A bare Pods/ dir with none of those xcconfigs is the broken state.
+  if [ -d "$slot/ios/Pods/Target Support Files" ]; then
+    if ! ls "$slot"/ios/Pods/Target\ Support\ Files/*/Pods-*.xcconfig >/dev/null 2>&1; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# ensure_pods <slot>: run pod install in the slot's ios/ dir when pods are
+# missing (see pods_present). Prefers `bundle exec pod install` when a Gemfile is
+# present (the repo pins CocoaPods via bundler), else plain `pod install`. Runs
+# under whatever node fnm switched to earlier (switch_node ran in run_build).
+# Best-effort but LOUD: a pod install failure is surfaced, not swallowed, so the
+# build does not proceed to the same xcconfig death. Returns non-zero on failure.
+ensure_pods() {
+  local slot=$1
+  if pods_present "$slot"; then
+    info "pods: already installed for this slot"
+    return 0
+  fi
+  if [ ! -d "$slot/ios" ]; then
+    warn "pods: no ios/ dir in $slot; skipping pod install (not an iOS checkout?)"
+    return 0
+  fi
+  if [ "${FM_MOBILE_LAB_NO_PODS:-0}" = "1" ]; then
+    info "pods: would run pod install in $slot/ios (FM_MOBILE_LAB_NO_PODS set; not running)"
+    return 0
+  fi
+  local podcmd
+  if [ -f "$slot/Gemfile" ] || [ -f "$slot/ios/Gemfile" ]; then
+    podcmd="bundle exec pod install"
+  else
+    podcmd="pod install"
+  fi
+  info "pods: installing (Pods/ or its xcconfig is missing) via: $podcmd"
+  status_message "running pod install ($podcmd)"
+  if ( cd "$slot/ios" && eval "$podcmd" ); then
+    info "pods: pod install complete"
+    return 0
+  fi
+  err "pods: '$podcmd' failed in $slot/ios"
+  return 1
 }
 
 # --- wrapped-build execution -------------------------------------------------
@@ -1157,12 +1551,23 @@ stream_build_output() {
   done
 }
 
+# BUILD_CHILD_PID: the pid of the backgrounded wrapped-build pipeline while it
+# runs, so run_wrapped_build can wait on it and the exit trap can fall back to
+# killing it directly. 0 when no build is running.
+BUILD_CHILD_PID=0
+# DETACHED_OWNS_SESSION: 1 when the detached build process is a genuine
+# process-group leader (its own group), so a group-kill in the exit trap is
+# safe. 0 when fm_setsid could not create a new group and the build shares the
+# launcher's group, in which case the trap must NOT group-kill (it would signal
+# the launcher too) and falls back to the pipeline pid.
+DETACHED_OWNS_SESSION=0
+
 # run_wrapped_build <slot-name> <slot-dir> <base-cmd> <target-flag> <target-value> <port>:
 # assemble and run the wrapped run_command, streaming + tee'ing through
 # stream_build_output, inferring phase transitions, and emitting the status
 # file. Fails (non-zero, terminal status) with a specific error when the CLI
-# exits non-zero. The build's PIPESTATUS[0] is the authoritative exit code (tee
-# via the reader must not mask a non-zero build).
+# exits non-zero. The build's real exit code is captured from a group shell via
+# rcfile (the reader must not mask a non-zero build).
 run_wrapped_build() {
   local name=$1 slot=$2 base=$3 tflag=$4 tval=$5 port=$6
   local full logfile rc=0
@@ -1174,20 +1579,49 @@ run_wrapped_build() {
   info "running: $full"
   info "log: $logfile"
 
-  # Pipe the wrapped command's combined stdout+stderr through the reader. The
-  # fixed Metro port is baked into the environment (RCT_METRO_PORT) so the built
-  # binary asks this slot's port for its bundle. PIPESTATUS[0] captures the
-  # build's own exit code independent of the reader.
+  # Pipe the wrapped command's combined stdout+stderr through the reader.
   #
   # run_command's own CLI (react-native, and npx expo after the Expo switch) is
   # a repo-local binary at <slot>/node_modules/.bin, NOT on the global PATH.
   # Prepending it here resolves ANY configured run_command generically, with
   # zero special-casing per CLI, and inherits the current shell's PATH so the
   # fnm-switched node from switch_node (called earlier in run_build) is what
-  # actually runs the command, not a stale ambient node.
-  ( cd "$slot" && PATH="$slot/node_modules/.bin:$PATH" RCT_METRO_PORT="$port" exec bash -c "$full" ) 2>&1 \
-    | stream_build_output "$logfile"
-  rc=${PIPESTATUS[0]}
+  # actually runs the command, not a stale ambient node. The fixed Metro port is
+  # baked in via RCT_METRO_PORT so the built binary asks this slot's port.
+  #
+  # The pipeline runs in the BACKGROUND and is waited on, so a signal delivered
+  # to the detached build process (SIGTERM from `stop` or an external kill) is
+  # handled PROMPTLY by the trap instead of being deferred until a foreground
+  # pipeline finishes. The build inherits the detached process's own isolated
+  # session/group (set at launch by fm_setsid), so the exit trap can group-signal
+  # the whole build subtree (CLI + xcodebuild) without touching the launcher's.
+  #
+  # The build's own exit code is captured to rcfile: `wait` on a backgrounded
+  # PIPELINE yields the LAST element's status (the reader, always 0), not the
+  # build's, and PIPESTATUS is not preserved across the background boundary. The
+  # group shell writes the build's real exit code to rcfile, the authoritative
+  # result the reader can never mask.
+  local rcfile
+  rcfile="$STATE_DIR/build-$name.rc"
+  rm -f "$rcfile"
+  {
+    # $1..$3 are the INNER bash's positionals, intentionally single-quoted.
+    # No `exec` here: the group shell must survive the build so the following
+    # `printf $?` line runs and records the build's real exit code.
+    # shellcheck disable=SC2016
+    bash -c 'cd "$1" && PATH="$1/node_modules/.bin:$PATH" RCT_METRO_PORT="$2" bash -c "$3"' \
+      _ "$slot" "$port" "$full" 2>&1
+    printf '%s' "$?" > "$rcfile"
+  } | stream_build_output "$logfile" &
+  BUILD_CHILD_PID=$!
+  # `|| true`: wait returns the pipeline's status (non-zero on a failed build
+  # under pipefail); the authoritative rc comes from rcfile, so errexit must not
+  # abort here before we read it.
+  wait "$BUILD_CHILD_PID" || true
+  BUILD_CHILD_PID=0
+  rc=$(cat "$rcfile" 2>/dev/null || echo 1)
+  case "$rc" in ''|*[!0-9]*) rc=1 ;; esac
+  rm -f "$rcfile"
 
   if [ "$rc" -ne 0 ]; then
     status_fail "wrapped run_command failed (exit $rc): $full - see log at $logfile"
@@ -1442,7 +1876,7 @@ fm-mobile-lab - build/test React Native branches on iOS sims and devices by
                 framework-slice pre-flight gate, and streaming progress.
 
 USAGE:
-  fm-mobile-lab <repo> <branch> --sim|--device [--slot N]
+  fm-mobile-lab <repo> <branch> --sim|--device [--slot N] [--wait]
   fm-mobile-lab ls
   fm-mobile-lab stop <slot-name>|--all
   fm-mobile-lab gc
@@ -1453,6 +1887,16 @@ PLATFORM IS EXPLICIT: you must pass --sim or --device (no default).
 <repo>   a repo key defined in config/mobile-lab.json (not the path).
 <branch> the git branch to try; fetched into a worktree, never into the clone.
 --slot N pin to slot index N (0-based) instead of the LRU/auto choice.
+--wait   block until the build finishes and exit with its status (for CI/scripts).
+--foreground  alias for --wait.
+
+BY DEFAULT the native build runs DETACHED: after synchronous setup (target
+resolution, worktree, deps, Metro), the lab launches the build in a process that
+outlives this command and returns immediately, printing where to watch it. The
+build survives this shell being killed or timed out, so a reaped caller can no
+longer kill an in-progress build or leave a zombie "running" status file. Watch
+progress via state/lab-build-<slot>.json or by tailing the printed logfile. Pass
+--wait to block until it finishes and get the final exit code instead.
 
 The lab wraps the repo's configured run_command (e.g. react-native run-ios;
 post-Expo, npx expo run:ios), appending the resolved concrete target (--udid)
@@ -1477,22 +1921,28 @@ main() {
     stop)    shift; cmd_stop "$@" ;;
     gc)      shift; cmd_gc "$@" ;;
     doctor)  shift; cmd_doctor "$@" ;;
+    __build-detached)
+      # Internal: the detached build entrypoint, re-launched by
+      # launch_detached_build. Not a user-facing subcommand.
+      shift; run_detached_build "$@"
+      ;;
     *)
-      # Positional: <repo> <branch> --sim|--device [--slot N]
-      local repo=$1 branch=${2:-} platform='' slot=''
+      # Positional: <repo> <branch> --sim|--device [--slot N] [--wait]
+      local repo=$1 branch=${2:-} platform='' slot='' wait_mode=''
       shift || true; shift || true
       while [ $# -gt 0 ]; do
         case "$1" in
           --sim)    platform=sim ;;
           --device) platform=device ;;
           --slot)   shift; slot=${1:-} ;;
+          --wait|--foreground) wait_mode=1 ;;
           *) die "unknown argument: $1 (see 'fm-mobile-lab --help')" ;;
         esac
         shift
       done
       [ -n "$branch" ] || { usage; die "missing <branch>"; }
       [ -n "$platform" ] || die "platform is required: pass --sim or --device (no default)"
-      run_build "$repo" "$branch" "$platform" "$slot"
+      run_build "$repo" "$branch" "$platform" "$slot" "$wait_mode"
       ;;
   esac
 }
