@@ -92,7 +92,9 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,87p' "$0" | sed 's/^# \{0,1\}//'
+  # Print the whole comment header, stopping at the first non-comment line, so
+  # the help text can never silently truncate as the header grows.
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
 case "${1:-}" in
@@ -640,11 +642,17 @@ fm_cawldron_spawn_gate() {
   # truncated or corrupt write) is still a lock: a damaged state file must never
   # silently disarm this gate.
   [ "$rc" -ne 1 ] || return 0
-  [ "$FORCE_LOCKED_EFFECTIVE" -eq 0 ] || return 0
   if [ "$rc" -eq 0 ]; then
     detail=$(fm_cawldron_lock_detail ok "$FM_CAWL_SINCE" "$FM_CAWL_NOTE")
   else
     detail=$(fm_cawldron_lock_detail corrupt '' '')
+  fi
+  # An override is the one case a later collision with the captain's unlanded
+  # live edits most needs a trace, and nothing is recorded in state/<id>.meta -
+  # so say so on the way past.
+  if [ "$FORCE_LOCKED_EFFECTIVE" -ne 0 ]; then
+    echo "warning: $proj_name is Cawldron-locked ($detail); spawning anyway per --force-locked" >&2
+    return 0
   fi
   {
     printf '●%s\n' "$FM_CAWLDRON_RULE"

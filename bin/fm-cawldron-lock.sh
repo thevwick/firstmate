@@ -92,6 +92,12 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ "$CLEAR" -eq 0 ] || [ -z "$NOTE" ] || { echo "error: --note and --clear are mutually exclusive" >&2; exit 1; }
+# The marker is a line-oriented "key=value" file, so a newline in the note would
+# be parsed back as a further key - a note line starting "since=" would forge the
+# timestamp. Reject it at this boundary rather than writing a corruptible marker.
+case "$NOTE" in
+  *$'\n'*) echo "error: --note must be a single line (no newlines)" >&2; exit 1 ;;
+esac
 
 mkdir -p "$STATE"
 MARKER=$(fm_cawldron_lock_path "$STATE" "$PROJECT")

@@ -178,7 +178,22 @@ test_spawn_gate_force_locked_flag_overrides() {
   [ "$status" -ne 0 ] || fail "spawn with a missing brief should still fail"
   assert_not_contains "$out" "CAWLDRON LOCK ACTIVE" "--force-locked should suppress the lock banner"
   assert_contains "$out" "error: no brief at" "spawn should have reached the missing-brief check, not the lock gate"
+  assert_contains "$out" "warning: locked-flag is Cawldron-locked" "an override must still leave an audit trail"
   pass "fm-spawn.sh --force-locked overrides the Cawldron lock refusal"
+}
+
+# A --note carrying a newline would be read back as a further key= line, letting
+# a "since=" line forge the timestamp; it must be rejected at the CLI boundary.
+test_multiline_note_rejected() {
+  local home out status
+  home=$(new_home)
+  mkdir -p "$home/projects/note-proj"
+  out=$(run_lock "$home" note-proj --note "$(printf 'live\nsince=0')")
+  status=$?
+  [ "$status" -ne 0 ] || fail "a multi-line --note should be rejected"
+  assert_contains "$out" "error: --note must be a single line" "multi-line note rejection message missing"
+  assert_absent "$home/state/cawldron-lock-note-proj" "a marker was written from a multi-line note"
+  pass "a --note containing a newline is rejected instead of corrupting the marker"
 }
 
 # FM_SPAWN_FORCE_LOCKED=1 is the same override, via environment instead of flag.
@@ -248,3 +263,4 @@ test_spawn_gate_refuses_when_locked
 test_spawn_gate_silent_when_unlocked
 test_spawn_gate_force_locked_flag_overrides
 test_spawn_gate_force_locked_env_overrides
+test_multiline_note_rejected

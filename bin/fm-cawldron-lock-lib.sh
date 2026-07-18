@@ -52,17 +52,22 @@ fm_cawldron_lock_read() {
 # fm_cawldron_lock_write <marker-path> <since-epoch> [<note>]: write the marker,
 # overwriting any prior content. Omits the note= line when <note> is empty.
 # Writes to a temp sibling and renames, so an interrupted or out-of-space write
-# can never leave a truncated marker in place of a good one.
+# can never leave a truncated marker in place of a good one. The temp is also
+# removed on INT/TERM/HUP, so an interrupt between the redirect and the rename
+# leaves no stray temp behind either.
 fm_cawldron_lock_write() {
   local path=$1 since=$2 note=${3:-} tmp
   # Dot-prefixed so the in-flight temp never matches fm_cawldron_lock_list's
   # cawldron-lock-* glob.
   tmp="$(dirname "$path")/.cawldron-lock-tmp.$$"
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" INT TERM HUP
   {
     printf 'since=%s\n' "$since"
     [ -z "$note" ] || printf 'note=%s\n' "$note"
-  } > "$tmp" || { rm -f "$tmp"; return 1; }
-  mv -f "$tmp" "$path" || { rm -f "$tmp"; return 1; }
+  } > "$tmp" || { trap - INT TERM HUP; rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$path" || { trap - INT TERM HUP; rm -f "$tmp"; return 1; }
+  trap - INT TERM HUP
 }
 
 # fm_cawldron_lock_age_human <since-epoch> [<now-epoch>]: print a short
