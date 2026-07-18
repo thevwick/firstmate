@@ -37,6 +37,8 @@ Each key is the repo name you pass on the command line; each value is an object:
 | `pkgmgr` | no | Documentation hint only. The engine detects the package manager per checkout from the lockfile, so this is not authoritative. |
 | `metro_port_base` | no | Base Metro port for this repo's slots. Slot N gets `base + N`. Defaults to 8081. |
 | `pool_size` | no | Number of warm slots for this repo. Defaults to 3. |
+| `sim_device` | no | For the x86_64-via-Rosetta `--sim` path only: a device-name substring (e.g. `iPhone 16`) to prefer when the lab must pick an x86_64-capable (iOS <= 18) simulator. Ignored for the native arm64 sim path and for `--device`. |
+| `sim_runtime` | no | For the x86_64-via-Rosetta `--sim` path only: an exact iOS runtime version (e.g. `18.5`) to prefer when picking the x86_64-capable simulator. Ignored otherwise. |
 
 Give each repo a distinct `metro_port_base` range so their slots never collide.
 The example uses 8101-8103 for sitemate-mobile and 8111-8113 for dashpivot-mobile.
@@ -67,7 +69,7 @@ Run `fm-mobile-lab doctor` first on a new machine to see what is present (Xcode,
 The lab runs seven canonical phases (the same phase vocabulary the status file emits).
 Not every run hits every phase (a deps cache hit makes the deps phase near-instant).
 
-1. `preflight` - resolve the concrete target (the booted simulator's udid for `--sim`, the connected device's udid for `--device`) and, after checkout, run the framework-slice gate. There is no vague `generic/platform=iOS Simulator` destination; the lab always resolves a specific udid.
+1. `preflight` - resolve the concrete target (the booted simulator's udid for `--sim`, the connected device's udid for `--device`) and, after checkout, resolve the simulator build arch and run the framework-slice gate (see "Pre-flight framework-slice gate and simulator arch resolution"). For the x86_64-via-Rosetta sim path the target may be re-resolved to an x86_64-capable (iOS <= 18) simulator after the arch is known.
 2. `worktree` - fetch the branch (into the clone's object store only, never a checkout in the clone) and check it out in the slot's worktree (detached, so slots never collide over a branch).
 3. `deps` - hash the lockfile. Cache hit restores `node_modules` by APFS clone; miss installs and then snapshots to the cache.
 4. `pods`, then `compile`, `link`, `install` - all owned by the wrapped `run_command`. The lab assembles the full command (`run_command` + `--udid <target>` + `--port <slot-port>`), runs it from the slot with the fixed `RCT_METRO_PORT` in the environment, and streams and infers phases from the CLI's own output. Before invoking `run_command`, the `pods` phase runs `pod install` itself when the slot is missing `ios/Pods/` or the app target's `Pods-*.xcconfig` (see "CocoaPods install" below).
@@ -76,14 +78,27 @@ Between step 2 and step 3 the lab also detects the toolchain from the checkout (
 
 Steps 1-3 (plus Metro) run synchronously when you invoke the lab; the long native build in step 4 is then launched detached and runs on its own (see "Detached build").
 
-### Pre-flight framework-slice gate
+### Pre-flight framework-slice gate and simulator arch resolution
 
-Before the build, the lab enumerates the app's vendored `*.framework` binaries and `*.a` static libraries under `ios/`, runs `lipo` and `vtool` on each, and confirms at least one carries a slice for the concrete target platform and arch.
-If a vendored binary declares the target arch but has no slice for the target platform, the build fails fast with a one-line error naming the framework, the missing slice, and the viable alternative, instead of starting a long build that dies at link time.
+Before the build, the lab enumerates the app's vendored `*.framework` binaries and `*.a` static libraries under `ios/`, runs `lipo` and `vtool` on each, and confirms every vendored binary carries a slice for the target platform and the build arch.
 
-The motivating case is dashpivot's FFmpeg framework: `ios/libavcodec.framework/libavcodec` carries only an `x86_64`-IOSSIMULATOR slice and an `arm64`-IOS (device) slice, with no `arm64`-simulator slice.
-On Apple Silicon an arm64 simulator build therefore cannot link it, so `--sim` fails immediately with `libavcodec has no arm64-simulator slice ... re-run with --device`, and `--device` is the viable path.
-`doctor` runs this same check per repo and reports which platforms are viable, so the incompatibility surfaces before any build.
+For `--device` the build arch is the host arch, and the gate fails fast (naming the framework and missing slice) when a vendored binary has no matching device slice.
+
+For `--sim` the lab resolves the build arch by trying two viable paths in order:
+
+1. **Native arm64.** If every vendored framework has an `arm64`-simulator slice, the sim build uses the host arch (arm64 on Apple Silicon), the fast native path.
+2. **x86_64 via Rosetta.** If there is no `arm64`-simulator slice but every vendored framework has an `x86_64`-simulator slice, and Rosetta can run x86_64 on the host, the lab builds the sim app as `x86_64` (forcing `ARCHS=x86_64` through the RN CLI's `--extra-params`) and runs it on the simulator under Rosetta.
+
+The motivating case is dashpivot's FFmpeg frameworks: `ios/libavcodec.framework/libavcodec` (and the other FFmpeg frameworks) carry only an `x86_64`-IOSSIMULATOR slice and an `arm64`-IOS (device) slice, with no `arm64`-simulator slice.
+A native arm64 sim build cannot link them, so the lab takes the x86_64-via-Rosetta path instead: this is how dashpivot runs on the simulator.
+Only if neither path is viable (no simulator slice at all, or an x86_64-only sim app with no Rosetta) does `--sim` fail fast, steering to `--device`.
+
+An `x86_64` simulator build has one further constraint: Apple dropped x86_64 execution from the iOS 26 simulator runtimes, so an x86_64 app installs and runs only on a simulator whose runtime is iOS 18 or earlier (an iOS 26+ simulator rejects it with "Needs to Be Updated").
+When the x86_64 path is chosen, the lab therefore targets an x86_64-capable simulator: it reuses an already-booted iOS <= 18 simulator, otherwise picks one (honouring the repo's optional `sim_device` / `sim_runtime` config hints, else the newest iOS <= 18 iPhone) and boots it.
+If no iOS <= 18 runtime is installed at all, the build fails fast with a message steering to install an older runtime in Xcode or use `--device`.
+(This iOS 18 boundary is verified live: an x86_64 dashpivot build installed and launched on an iOS 18.5 simulator via Rosetta, while the iOS 26.4 simulator refused the same binary. See "Verification evidence".)
+
+`doctor` runs this same resolution per repo and reports which platforms are viable, including `viable (x86_64 via Rosetta)` for the FFmpeg case, so the path surfaces before any build.
 
 ### Streaming progress, logfile, and status file
 
@@ -92,7 +107,7 @@ It prints a phase banner (with a `[index/total]` marker) at each inferred transi
 
 It also writes a machine-readable status file at `state/lab-build-<slot>.json` under **firstmate's own** state dir (`$FM_HOME/state`, resolved the same way every other `bin/` script resolves it: `FM_STATE_OVERRIDE`, else `$FM_HOME/state`), not the lab's private home, because that is what the console's `readLabBuildStatuses` scans.
 The file is written atomically (temp file then `mv`) on every phase transition and at least every 10 seconds.
-The file follows the contract in `data/mobile-lab-status-contract.md`: phase, phase index/total, an honest percent (`null` when genuinely unknown; never a fake smooth bar; refined within `compile` only when the CLI emits a parseable `X/Y` count), status (`running`/`success`/`failed`), timestamps, the resolved target, the wrapped `run_command`, and, on failure, a specific `error` string.
+The file follows the contract in `data/mobile-lab-status-contract.md`: phase, phase index/total, an honest percent (`null` when genuinely unknown; never a fake smooth bar; refined within `compile` only when the CLI emits a parseable `X/Y` count), status (`running`/`success`/`failed`), timestamps, the resolved target, the wrapped `run_command`, a `metro_running` boolean (whether Metro is actually answering on the slot's port, refreshed from a real liveness probe on every write), and, on failure, a specific `error` string.
 The `logfile` field is an absolute path to the build log under the lab's own private state dir, since that log does not live alongside the status file: an absolute path is what lets the console (or a captain) actually open it regardless of which state dir they are reading from.
 A separate console reads the status file to render a live Mobile Lab view; the lab is the sole writer of the contract.
 
@@ -159,6 +174,8 @@ The engine refuses a multi-GB clone or install when free disk is below `FM_MOBIL
 | `FM_MOBILE_LAB_HEARTBEAT_SECS` | `10` | Heartbeat cadence (seconds) for a long build phase and the minimum status-file refresh interval. |
 | `FM_MOBILE_LAB_LOCK_WAIT` | `0` | Seconds to wait for a busy slot's build lock before failing. |
 | `FM_MOBILE_LAB_NO_METRO` | unset | When `1`, report the Metro port but do not start Metro. |
+| `FM_MOBILE_LAB_X86_SIM_MAX_MAJOR` | `18` | Highest iOS major version whose simulator runtime still runs x86_64 apps under Rosetta. The x86_64-via-Rosetta sim path targets a runtime at or below this; raise it only if a future iOS restores x86_64 simulator support. |
+| `FM_MOBILE_LAB_FORCE_ROSETTA` | unset | Test-only override for the Rosetta probe: `1` forces "Rosetta available", `0` forces "not available", unset probes with `arch -x86_64`. |
 
 ## Verification evidence
 
@@ -167,7 +184,17 @@ The two risky mechanics were de-risked by a smoke test before the original engin
 - APFS clonefile copy-on-write of a hoisted `node_modules` across a git-worktree boundary: PASS. The full 8.6 GiB, 188,165-file `node_modules` of sitemate-mobile cloned in about 71 seconds with near-zero additional disk, a fully functional module tree, and correct copy-on-write divergence. Caveat carried into the engine: clone time scales with file count, not byte count, so a slot restore is seconds-to-low-minutes, not instant.
 - `RCT_METRO_PORT` baked at compile time: PASS on the mechanism and on the dual-Metro side-by-side requirement (two Metro servers on distinct fixed ports ran concurrently).
 
-The FFmpeg slice incompatibility that motivates the pre-flight gate was verified against the live dashpivot slot (`data/mobile-lab-audit-a7/report.md`, 2026-07-18): `lipo -archs libavcodec` reports `x86_64 arm64`, `vtool -arch arm64 -show-build` reports `platform IOS` (device), and `vtool -arch x86_64 -show-build` reports `platform IOSSIMULATOR`, so there is no arm64-simulator slice and an Apple Silicon simulator build is impossible.
+The FFmpeg slice layout that drives the sim-arch resolution was verified against the live dashpivot slot (`data/mobile-lab-audit-a7/report.md`, 2026-07-18): `lipo -archs libavcodec` reports `x86_64 arm64`, `vtool -arch arm64 -show-build` reports `platform IOS` (device), and `vtool -arch x86_64 -show-build` reports `platform IOSSIMULATOR`. So there is no arm64-simulator slice; a native arm64 simulator build is impossible, but an x86_64-simulator build is available.
+
+The x86_64-via-Rosetta simulator path was verified live on an Apple Silicon Mac (arm64), 2026-07-18:
+
+- `arch -x86_64 /usr/bin/true` succeeds, so Rosetta can run x86_64 here.
+- Building dashpivot's `release/26.9` for the simulator with `ARCHS=x86_64 ONLY_ACTIVE_ARCH=NO` (via `react-native run-ios --extra-params`, which the RN 0.80 CLI forwards to xcodebuild against its `generic/platform=iOS Simulator` sim destination) linked the FFmpeg `x86_64`-simulator slices and reached `** BUILD SUCCEEDED **`.
+- The produced `Dashpivot.app` binary is `Mach-O 64-bit executable x86_64` (`lipo -archs` reports `x86_64`; `vtool` reports `platform IOSSIMULATOR`).
+- That x86_64 app installed and launched on an iOS 18.5 simulator (`com.au.constructioncloud`, pid live in `launchctl`, splash screen rendered), running via Rosetta on the arm64 host.
+- The same x86_64 app was REFUSED by the iOS 26.4 simulator ("Failed to find matching arch ... Needs to Be Updated"), which is why the lab targets an iOS <= 18 runtime for the x86_64 path.
+
+A native x86_64-host build is not exercised here (this machine is Apple Silicon); on such a host the sim build is simply the native arch and no Rosetta is involved.
 
 ## Testing
 
