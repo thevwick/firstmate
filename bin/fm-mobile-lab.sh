@@ -288,14 +288,20 @@ shell_quote() {
   printf "'%s'" "${s//\'/$q}"
 }
 
-# build_run_command <base-cmd> <target-flag> <target-value> <port>: append the
-# resolved concrete target and Metro port to the repo's base run_command.
+# build_run_command <base-cmd> <target-flag> <target-value> <port> [extra-args]:
+# append the resolved concrete target, Metro port, and any extra build args to
+# the repo's base run_command.
 # <target-flag> is one of --udid / --simulator / --device (RN 0.80 run-ios
 # supports all three; Expo run:ios accepts --device and a udid via --device).
 # An empty target-flag appends nothing for the target (target already implied).
-# Prints the full command string. Deterministic and pure: no environment reads.
+# [extra-args] is an already-formed, already-quoted flag string appended verbatim
+# after the port (empty appends nothing). The lab uses it to force the sim build
+# arch on the Rosetta path (e.g. "--extra-params 'ARCHS=x86_64 ONLY_ACTIVE_ARCH=NO'"),
+# passed through to xcodebuild by the RN CLI. It is intentionally opaque here so
+# the assembly stays generic (Expo forwards its own trailing xcodebuild args the
+# same way). Prints the full command string. Deterministic and pure: no env reads.
 build_run_command() {
-  local base=$1 target_flag=$2 target_value=$3 port=$4
+  local base=$1 target_flag=$2 target_value=$3 port=$4 extra_args=${5:-}
   local out=$base
   if [ -n "$target_flag" ]; then
     out="$out $target_flag $(shell_quote "$target_value")"
@@ -303,18 +309,45 @@ build_run_command() {
   if [ -n "$port" ]; then
     out="$out --port $port"
   fi
+  if [ -n "$extra_args" ]; then
+    out="$out $extra_args"
+  fi
   printf '%s\n' "$out"
+}
+
+# sim_arch_extra_args <arch>: the extra run_command args that force a --sim build
+# to compile for <arch>, for the RN/Expo CLI to forward to xcodebuild. Only the
+# Rosetta x86_64 path needs forcing; a native arm64 sim build uses the CLI's
+# default (no override), so this prints nothing for arm64. For x86_64 it forces
+# ARCHS=x86_64 and disables ONLY_ACTIVE_ARCH so the whole app (including pods)
+# builds x86_64, via react-native run-ios's --extra-params (verified with RN
+# 0.80: buildProject always uses `generic/platform=iOS Simulator` as the sim
+# build destination, so ARCHS=x86_64 alone selects the x86_64-simulator slice;
+# an arch= in the DESTINATION must NOT be used, as a concrete-sim destination
+# with arch=x86_64 fails to resolve on Apple Silicon).
+sim_arch_extra_args() {
+  local arch=$1
+  case "$arch" in
+    x86_64) printf -- "--extra-params 'ARCHS=x86_64 ONLY_ACTIVE_ARCH=NO'\n" ;;
+    *)      printf '\n' ;;
+  esac
 }
 
 # --- pure logic: framework-slice compatibility gate -------------------------
 #
-# The one genuinely lab-specific safety check. Before a build, enumerate the
-# app's vendored *.framework/<binary> and *.a static libraries under ios/, and
-# confirm at least one carries a slice for the concrete target platform+arch.
-# The FFmpeg case (dashpivot's libavcodec has only x86_64-IOSSIMULATOR +
-# arm64-IOS(device) slices, no arm64-simulator) makes an arm64-sim build
-# impossible; this gate turns a 10-minute link-time death into a one-line
-# pre-flight error steering to --device.
+# The one genuinely lab-specific safety check, and a per-(platform,arch)
+# primitive: enumerate the app's vendored *.framework/<binary> and *.a static
+# libraries under ios/, and confirm every one carries a slice for that platform
+# and arch. It is called directly for --device (host arch), and is the building
+# block resolve_sim_arch uses to choose the sim build arch: it probes sim+arm64
+# and sim+x86_64 to decide between a native arm64 sim build and an x86_64 build
+# run via Rosetta (see resolve_sim_arch). Turning a 10-minute link-time death
+# into a one-line pre-flight decision. The FFmpeg case (dashpivot's libavcodec
+# has only x86_64-IOSSIMULATOR + arm64-IOS(device) slices, no arm64-simulator)
+# fails the sim+arm64 probe but passes sim+x86_64, so resolve_sim_arch takes the
+# Rosetta path rather than blocking the sim. The gate's own "re-run with
+# --device" message is the arch-specific reason resolve_sim_arch surfaces only
+# when NEITHER sim arch is viable.
 
 # target_platform_token <platform>: the Mach-O build platform token vtool prints
 # for a given lab platform. sim -> IOSSIMULATOR, device -> IOS.
@@ -652,6 +685,12 @@ ST_MESSAGE='' ST_LOGFILE='' ST_ERROR='null'
 # to tell a live build from a zombie "running" file whose process is gone. 0
 # means unset (no owning process recorded yet).
 ST_PID=0
+# ST_METRO_RUNNING is the JSON literal true/false recorded in the status file's
+# metro_running field. It is refreshed from a real liveness probe of ST_PORT on
+# every status_write (see status_write), so the console can show whether Metro is
+# actually serving the JS bundle for this slot, not just which port it should be
+# on. Defaults false until the first write probes the port.
+ST_METRO_RUNNING='false'
 
 # status_file_path <slot-name>: the console-facing status file path for a slot,
 # under firstmate's OWN state dir (see FM_STATE_DIR above), not the lab's
@@ -669,6 +708,14 @@ status_write() {
   local out tmp now
   out=$(status_file_path "$ST_SLOT")
   now=$(date +%s)
+  # Refresh Metro liveness from a real probe of the slot's port, so the emitted
+  # metro_running reflects whether Metro is actually serving the JS bundle, not
+  # just which port it should be on. A missing/zero port is never "running".
+  if [ "${ST_PORT:-0}" -gt 0 ] 2>/dev/null && metro_running "$ST_PORT"; then
+    ST_METRO_RUNNING='true'
+  else
+    ST_METRO_RUNNING='false'
+  fi
   mkdir -p "$FM_STATE_DIR"
   tmp=$(mktemp "$FM_STATE_DIR/lab-build-$ST_SLOT.json.XXXXXX")
   if jq -n \
@@ -692,12 +739,13 @@ status_write() {
     --arg logfile "$ST_LOGFILE" \
     --argjson error "${ST_ERROR:-null}" \
     --argjson pid "${ST_PID:-0}" \
+    --argjson metro_running "${ST_METRO_RUNNING:-false}" \
     '{schema:$schema, slot:$slot, repo:$repo, branch:$branch, platform:$platform,
       target:$target, run_command:$run_command, port:$port, phase:$phase,
       phase_index:$phase_index, phase_total:$phase_total, percent:$percent,
       status:$status, started_epoch:$started_epoch, updated_epoch:$updated_epoch,
       phase_started_epoch:$phase_started_epoch, message:$message,
-      logfile:$logfile, error:$error, pid:$pid}' \
+      logfile:$logfile, error:$error, pid:$pid, metro_running:$metro_running}' \
     > "$tmp" 2>/dev/null; then
     mv "$tmp" "$out"
   else
@@ -867,8 +915,67 @@ ensure_node_modules() {
 # (--udid/--device). host_arch is the deterministic target arch on this host.
 
 # host_arch: the target CPU arch for this host. Apple Silicon builds arm64;
-# an Intel host builds x86_64. This is the arch a sim/device build must match.
+# an Intel host builds x86_64. This is the arch a device build must match, and
+# the PREFERRED arch for a sim build (a native arm64 sim build when the app
+# supports it). resolve_sim_arch may override it to x86_64 for the Rosetta path.
 host_arch() { uname -m 2>/dev/null || printf 'arm64\n'; }
+
+# rosetta_available: 0 when this host can execute x86_64 binaries via Rosetta,
+# 1 otherwise. On Apple Silicon this is what makes an x86_64-simulator build
+# runnable (the simulator runs the x86_64 app under Rosetta). `arch -x86_64` is
+# the direct, deterministic probe: it succeeds only when Rosetta can actually run
+# an x86_64 process. On a native x86_64 host it also succeeds (running x86_64 is
+# native there), which is correct: an x86_64-simulator build runs fine.
+# FM_MOBILE_LAB_FORCE_ROSETTA (0/1) overrides the probe for tests.
+rosetta_available() {
+  case "${FM_MOBILE_LAB_FORCE_ROSETTA:-}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  arch -x86_64 /usr/bin/true >/dev/null 2>&1
+}
+
+# resolve_sim_arch <checkout-dir>: decide which arch a --sim build must use for
+# this app, printing a single TAB-separated "<arch>\t<reason>" line on stdout.
+# Two viable paths, in preference order:
+#   (a) NATIVE: an arm64-simulator slice exists for every vendored framework ->
+#       build arm64 (the fast, native Apple-Silicon sim path).
+#   (b) ROSETTA: no arm64-simulator slice, but an x86_64-simulator slice exists
+#       for every vendored framework AND Rosetta can run x86_64 here -> build
+#       x86_64 and run it on the simulator under Rosetta. This is exactly how an
+#       FFmpeg-bearing app (arm64-device + x86_64-simulator slices, no
+#       arm64-simulator slice) ran on the sim before the gate was tightened.
+# On a viable path prints "<arch>\t<reason>" and returns 0. When neither path is
+# viable (no sim slice at all, or an x86_64-only sim app with no Rosetta) it
+# prints "\t<reason>" (empty arch field) and returns 1, so the caller can read
+# the reason from the second field and fail fast. host_arch is the native arch
+# tried first (arm64 on Apple Silicon).
+resolve_sim_arch() {
+  local dir=$1 native reason
+  native=$(host_arch)
+  # (a) Native sim slice for the host arch present for every framework?
+  if slice_gate "$dir" sim "$native" >/dev/null 2>&1; then
+    printf '%s\t%s\n' "$native" "native $native-simulator slice available"
+    return 0
+  fi
+  # (b) x86_64-simulator slice present for every framework + Rosetta on host?
+  if [ "$native" != "x86_64" ] \
+     && slice_gate "$dir" sim x86_64 >/dev/null 2>&1 \
+     && rosetta_available; then
+    printf '%s\t%s\n' "x86_64" \
+      "x86_64-simulator slices present and Rosetta available; building x86_64 and running via Rosetta"
+    return 0
+  fi
+  # Neither path works: report WHY via the native-arch gate reason so the caller
+  # can surface a specific message (the slice_gate reason is the most useful one).
+  reason=$(slice_gate "$dir" sim "$native" 2>/dev/null) || true
+  if [ "$native" != "x86_64" ] && slice_gate "$dir" sim x86_64 >/dev/null 2>&1; then
+    # x86_64 sim slices exist but Rosetta is unavailable: name that precisely.
+    reason="x86_64-simulator slices exist but Rosetta is not available on this host, so the simulator cannot run the app; use --device"
+  fi
+  printf '\t%s\n' "$reason"
+  return 1
+}
 
 # booted_sim_udid: the udid of a currently-booted simulator, or empty. Prefers
 # the first Booted device simctl reports.
@@ -888,6 +995,108 @@ booted_sim_name_os() {
                         printf "%s (iOS %s)\n", name, os; exit}'
 }
 
+# --- simulator arch/runtime selection (the x86_64-Rosetta path) --------------
+#
+# An x86_64 (Rosetta) sim build needs a simulator RUNTIME that can actually run
+# an x86_64 app. Apple dropped x86_64 execution from the iOS 26 simulator
+# runtimes: an iOS 26 sim rejects an x86_64 install with "Failed to find matching
+# arch ... Needs to Be Updated", but an iOS 18 (and earlier) sim runs the same
+# x86_64 app fine under Rosetta. Verified live on this machine, 2026-07-18: an
+# x86_64 Dashpivot build installed+launched on an iOS 18.5 sim (splash rendered)
+# but the iOS 26.4 sim refused it. So for the x86_64 path the lab must target an
+# x86_64-capable (iOS < 26) runtime, not just any booted sim. arm64 native
+# builds run on any sim, so that path keeps using the plain booted sim.
+
+# X86_SIM_MAX_MAJOR: the highest iOS major version whose simulator runtime still
+# runs x86_64 apps under Rosetta. Runtimes with a major > this reject x86_64.
+# Override with FM_MOBILE_LAB_X86_SIM_MAX_MAJOR for a future OS boundary change.
+X86_SIM_MAX_MAJOR="${FM_MOBILE_LAB_X86_SIM_MAX_MAJOR:-18}"
+
+# sim_runtime_runs_x86 <ios-version>: 0 if a simulator runtime at <ios-version>
+# (e.g. "18.5", "26.4") can run an x86_64 app under Rosetta, 1 otherwise. The
+# major version is compared against X86_SIM_MAX_MAJOR. A blank/garbage version is
+# treated as NOT x86-capable (fail closed: never claim a sim runs x86 when unsure).
+sim_runtime_runs_x86() {
+  local ver=$1 major
+  major=${ver%%.*}
+  case "$major" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$major" -le "$X86_SIM_MAX_MAJOR" ]
+}
+
+# booted_sim_runtime_version <udid>: the iOS runtime version (e.g. "18.5") of a
+# booted sim, or empty. Uses simctl -j so it is robust to name spacing.
+sim_runtime_version() {
+  local udid=$1
+  command -v xcrun >/dev/null 2>&1 || return 0
+  xcrun simctl list devices available -j 2>/dev/null | jq -r --arg u "$udid" '
+    .devices | to_entries[]
+    | .key as $rt
+    | .value[] | select(.udid == $u)
+    | $rt' 2>/dev/null \
+    | sed -E 's/.*SimRuntime\.iOS-//; s/-/./g' | head -1
+}
+
+# sim_label <udid>: "<name> (iOS X.Y)" for any sim by udid, or empty.
+sim_label() {
+  local udid=$1 name ver
+  command -v xcrun >/dev/null 2>&1 || return 0
+  name=$(xcrun simctl list devices available -j 2>/dev/null | jq -r --arg u "$udid" '
+    .devices[][] | select(.udid == $u) | .name' 2>/dev/null | head -1)
+  ver=$(sim_runtime_version "$udid")
+  [ -n "$name" ] || return 0
+  printf '%s (iOS %s)\n' "$name" "${ver:-?}"
+}
+
+# booted_x86_capable_sim_udid: the udid of a booted sim whose runtime can run
+# x86_64 (iOS <= X86_SIM_MAX_MAJOR), or empty. Lets an already-booted iOS 18 sim
+# be reused for the Rosetta path instead of booting a fresh one.
+booted_x86_capable_sim_udid() {
+  command -v xcrun >/dev/null 2>&1 || return 0
+  local udid
+  while IFS= read -r udid; do
+    [ -n "$udid" ] || continue
+    if sim_runtime_runs_x86 "$(sim_runtime_version "$udid")"; then
+      printf '%s\n' "$udid"; return 0
+    fi
+  done < <(xcrun simctl list devices booted 2>/dev/null \
+             | grep -oE '\([0-9A-Fa-f-]{36}\) \(Booted\)' | grep -oE '[0-9A-Fa-f-]{36}')
+}
+
+# pick_x86_capable_sim <preferred-device> <preferred-runtime>: choose an
+# x86_64-capable (iOS <= X86_SIM_MAX_MAJOR) available sim udid, preferring one
+# already booted, then a config-named device/runtime, then the newest x86-capable
+# runtime's first iPhone. Prints the udid or nothing. Does NOT boot it; the caller
+# boots and waits. preferred-device/-runtime are the repo config's optional
+# sim_device / sim_runtime hints (empty to auto-pick).
+pick_x86_capable_sim() {
+  local want_device=$1 want_runtime=$2 udid
+  command -v xcrun >/dev/null 2>&1 || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  # 1. An already-booted x86-capable sim wins (no boot needed).
+  udid=$(booted_x86_capable_sim_udid)
+  [ -n "$udid" ] && { printf '%s\n' "$udid"; return 0; }
+  # 2/3. Scan available devices under x86-capable runtimes. Honour the config's
+  # sim_device (name substring) and sim_runtime (e.g. "18.5") hints when set;
+  # otherwise take the highest x86-capable runtime's first available iPhone.
+  xcrun simctl list devices available -j 2>/dev/null | jq -r \
+    --arg dev "$want_device" --arg rt "$want_runtime" --argjson maxmaj "$X86_SIM_MAX_MAJOR" '
+    [ .devices | to_entries[]
+      | (.key | capture("iOS-(?<maj>[0-9]+)-(?<min>[0-9]+)")) as $v
+      | select(($v.maj|tonumber) <= $maxmaj)
+      | .value[]
+      | select(.isAvailable != false)
+      | select(.name | test("iPhone"))
+      | { udid, name, maj: ($v.maj|tonumber), min: ($v.min|tonumber),
+          ver: ($v.maj + "." + $v.min) }
+    ]
+    | map(select($dev == "" or (.name | test($dev; "i"))))
+    | map(select($rt == "" or (.ver == $rt)))
+    | sort_by(.maj, .min) | reverse
+    | (.[0].udid // "")' 2>/dev/null | head -1
+}
+
 # connected_device_udid: the udid of the first connected physical iOS device.
 connected_device_udid() {
   command -v xcrun >/dev/null 2>&1 || return 0
@@ -905,6 +1114,48 @@ connected_device_label() {
     | grep -E '\([0-9]+\.[0-9]+.*\) \([0-9A-Fa-f-]{8,}\)' \
     | head -1 | sed -E 's/ \([0-9A-Fa-f-]{8,}\)[[:space:]]*$//' \
     | sed -E 's/[[:space:]]+$//'
+}
+
+# ensure_x86_capable_sim <preferred-device> <preferred-runtime>: make sure an
+# x86_64-capable (iOS <= X86_SIM_MAX_MAJOR) simulator is BOOTED for the Rosetta
+# path, and print "<udid>\t<label>". Reuses an already-booted x86-capable sim,
+# else picks one (honouring the config's sim_device/sim_runtime hints) and boots
+# it, waiting until it is ready. Returns non-zero with a specific reason on stderr
+# when no x86-capable runtime/device is available at all (e.g. only iOS 26
+# runtimes are installed), so the caller can steer the captain to install an
+# iOS <= X86_SIM_MAX_MAJOR runtime or use --device.
+ensure_x86_capable_sim() {
+  local want_device=$1 want_runtime=$2 udid label
+  command -v xcrun >/dev/null 2>&1 || { err "xcrun not found; cannot resolve a simulator"; return 1; }
+  # Already-booted x86-capable sim: reuse it as-is.
+  udid=$(booted_x86_capable_sim_udid)
+  if [ -n "$udid" ]; then
+    label=$(sim_label "$udid"); [ -n "$label" ] || label="simulator $udid"
+    printf '%s\t%s\n' "$udid" "$label"
+    return 0
+  fi
+  # Pick an available x86-capable sim (config hints first, else newest such).
+  udid=$(pick_x86_capable_sim "$want_device" "$want_runtime")
+  if [ -z "$udid" ]; then
+    local hint=''
+    [ -n "$want_device" ] && hint=" matching device \"$want_device\""
+    [ -n "$want_runtime" ] && hint="$hint / runtime \"$want_runtime\""
+    err "this app must build as x86_64 for the simulator (no arm64-simulator slice), which needs a simulator running iOS $X86_SIM_MAX_MAJOR or earlier (iOS 26+ simulators cannot run x86_64 apps), but none is installed${hint}. Install an older iOS runtime in Xcode (Settings > Components) or build with --device."
+    return 1
+  fi
+  label=$(sim_label "$udid"); [ -n "$label" ] || label="simulator $udid"
+  info "booting x86_64-capable simulator for the Rosetta path: $label"
+  xcrun simctl boot "$udid" >/dev/null 2>&1 || true
+  # Wait until the sim reaches Booted (bounded), so a following install/launch
+  # does not race the boot.
+  local i state
+  for ((i=0; i<30; i++)); do
+    state=$(xcrun simctl list devices -j 2>/dev/null | jq -r --arg u "$udid" '
+      .devices[][] | select(.udid==$u) | .state' 2>/dev/null | head -1)
+    [ "$state" = "Booted" ] && break
+    sleep 1
+  done
+  printf '%s\t%s\n' "$udid" "$label"
 }
 
 # resolve_target <platform>: resolve the concrete target for a platform. On
@@ -1022,10 +1273,14 @@ run_build() {
     fi
   fi
 
-  # PHASE 1: preflight - resolve the concrete target and run the slice gate.
+  # PHASE 1: preflight - resolve the concrete target. The build ARCH is resolved
+  # AFTER the worktree phase below, because a --sim build's viable arch depends on
+  # the app's vendored framework slices (which live in the slot checkout): a
+  # native arm64 sim build when an arm64-simulator slice exists, else an x86_64
+  # sim build run via Rosetta when only an x86_64-simulator slice exists. A device
+  # build is always the host arch.
   status_phase preflight 1 "resolving target and checking framework slices"
-  local target_flag target_value target_label arch
-  arch=$(host_arch)
+  local target_flag target_value target_label arch build_extra_args=''
   local resolved
   if ! resolved=$(resolve_target "$platform"); then
     status_fail "could not resolve a concrete $platform target (see terminal output)"
@@ -1033,10 +1288,10 @@ run_build() {
   fi
   IFS=$'\t' read -r target_flag target_value target_label <<< "$resolved"
   ST_TARGET=$target_label
-  info "target: $target_label ($arch)"
-  status_message "resolved target: $target_label ($arch)"
-  # The slice gate needs the checked-out ios/ tree, so it runs AFTER the worktree
-  # phase below (the frameworks live in the slot's checkout, not before it).
+  info "target: $target_label"
+  status_message "resolved target: $target_label"
+  # The slice gate / arch resolution needs the checked-out ios/ tree, so it runs
+  # AFTER the worktree phase below (the frameworks live in the slot checkout).
 
   # PHASE 2: worktree - fetch and check out the branch in the slot worktree.
   status_phase worktree 2 "checking out $branch"
@@ -1045,13 +1300,62 @@ run_build() {
     || warn "could not fetch origin/$branch (offline, or branch is local-only); using whatever '$branch' already resolves to"
   ensure_slot_worktree "$clone" "$slot" "$branch"
 
-  # Now the slot is populated: run the slice gate against the real ios/ tree.
-  status_message "checking framework slices for $arch/$platform"
-  local gate_reason
-  if ! gate_reason=$(slice_gate "$slot" "$platform" "$arch"); then
-    status_fail "$gate_reason"
-    err "$gate_reason"
-    die "pre-flight slice check failed: $gate_reason"
+  # Now the slot is populated: resolve the build arch and run the slice gate
+  # against the real ios/ tree.
+  if [ "$platform" = "sim" ]; then
+    # A --sim build tries a native arm64 sim build first, then falls back to an
+    # x86_64 build run via Rosetta when only x86_64-simulator slices exist. This
+    # is what restores an FFmpeg-bearing app (x86_64-simulator + arm64-device
+    # slices, no arm64-simulator slice) on the simulator. resolve_sim_arch prints
+    # "<arch>\t<reason>"; an empty arch field means neither path is viable.
+    local sim_resolved sim_reason
+    status_message "resolving simulator build arch (native arm64 vs x86_64+Rosetta)"
+    sim_resolved=$(resolve_sim_arch "$slot") || {
+      sim_reason=${sim_resolved#*$'\t'}
+      [ -n "$sim_reason" ] || sim_reason="no viable simulator arch for this app"
+      status_fail "$sim_reason"
+      err "$sim_reason"
+      die "pre-flight simulator arch check failed: $sim_reason"
+    }
+    arch=${sim_resolved%%$'\t'*}
+    sim_reason=${sim_resolved#*$'\t'}
+    build_extra_args=$(sim_arch_extra_args "$arch")
+    if [ "$arch" = "x86_64" ]; then
+      info "sim arch: x86_64 via Rosetta ($sim_reason)"
+      status_message "sim build arch: x86_64 via Rosetta"
+      # The x86_64 app can only be installed/run on a simulator whose runtime
+      # still supports x86_64 (iOS <= X86_SIM_MAX_MAJOR); an iOS 26+ sim rejects
+      # it. If the target resolved earlier is not x86-capable, switch to (and boot
+      # if needed) a compatible sim, honouring the repo's optional sim_device /
+      # sim_runtime config hints.
+      if ! sim_runtime_runs_x86 "$(sim_runtime_version "$target_value")"; then
+        local want_dev want_rt x86_resolved x86_udid x86_label
+        want_dev=$(config_repo_field "$repo" sim_device)
+        want_rt=$(config_repo_field "$repo" sim_runtime)
+        status_message "selecting an x86_64-capable simulator (iOS <= $X86_SIM_MAX_MAJOR) for the Rosetta path"
+        if ! x86_resolved=$(ensure_x86_capable_sim "$want_dev" "$want_rt"); then
+          status_fail "x86_64 simulator build needs an iOS <= $X86_SIM_MAX_MAJOR simulator, but none is available (see terminal output)"
+          die "no x86_64-capable simulator available for the Rosetta path"
+        fi
+        IFS=$'\t' read -r x86_udid x86_label <<< "$x86_resolved"
+        target_flag='--udid'; target_value=$x86_udid; target_label=$x86_label
+        ST_TARGET=$target_label
+        info "sim target switched to x86_64-capable: $target_label"
+        status_message "resolved x86_64-capable target: $target_label"
+      fi
+    else
+      info "sim arch: $arch native ($sim_reason)"
+      status_message "sim build arch: $arch native"
+    fi
+  else
+    arch=$(host_arch)
+    status_message "checking framework slices for $arch/$platform"
+    local gate_reason
+    if ! gate_reason=$(slice_gate "$slot" "$platform" "$arch"); then
+      status_fail "$gate_reason"
+      err "$gate_reason"
+      die "pre-flight slice check failed: $gate_reason"
+    fi
   fi
   info "slice check: OK (a $arch/$platform slice is available for every vendored framework)"
 
@@ -1084,7 +1388,7 @@ run_build() {
   # detached process. It re-runs this engine as `__build-detached` with the
   # resolved params, holds the build lock, and writes its own terminal status.
   launch_detached_build "$name" "$slot" "$run_cmd" "$target_flag" "$target_value" \
-    "$port" "$node_v" "$wait_mode"
+    "$port" "$node_v" "$wait_mode" "$build_extra_args"
   return $?
 }
 
@@ -1106,7 +1410,7 @@ run_build_setup_on_exit() {
 # stdout pipe. It therefore keeps running to completion even if this caller is
 # killed or times out. wait_mode=1 blocks on the child and returns its exit code.
 launch_detached_build() {
-  local name=$1 slot=$2 run_cmd=$3 tflag=$4 tval=$5 port=$6 node_v=$7 wait_mode=${8:-}
+  local name=$1 slot=$2 run_cmd=$3 tflag=$4 tval=$5 port=$6 node_v=$7 wait_mode=${8:-} extra_args=${9:-}
   local logfile driverlog paramfile
   logfile="$STATE_DIR/build-$name.log"
   # The contract logfile is the CLEAN build output that stream_build_output
@@ -1128,10 +1432,11 @@ launch_detached_build() {
     --arg target "$ST_TARGET" --arg run_command "$run_cmd" \
     --arg tflag "$tflag" --arg tval "$tval" --argjson port "$port" \
     --arg node_v "$node_v" --argjson started "$ST_STARTED" \
-    --arg logfile "$logfile" \
+    --arg logfile "$logfile" --arg extra_args "$extra_args" \
     '{name:$name, slot:$slot, repo:$repo, branch:$branch, platform:$platform,
       target:$target, run_command:$run_command, tflag:$tflag, tval:$tval,
-      port:$port, node_v:$node_v, started:$started, logfile:$logfile}' \
+      port:$port, node_v:$node_v, started:$started, logfile:$logfile,
+      extra_args:$extra_args}' \
     > "$ptmp"; then
     mv "$ptmp" "$paramfile" || { rm -f "$ptmp"; die "could not write build params for slot $name"; }
   else
@@ -1216,7 +1521,7 @@ wait_for_detached_build() {
 run_detached_build() {
   local paramfile=$1
   [ -f "$paramfile" ] || die "detached build params not found: $paramfile"
-  local name slot run_cmd tflag tval port node_v
+  local name slot run_cmd tflag tval port node_v extra_args
   name=$(jq -r '.name' "$paramfile")
   slot=$(jq -r '.slot' "$paramfile")
   run_cmd=$(jq -r '.run_command' "$paramfile")
@@ -1224,6 +1529,7 @@ run_detached_build() {
   tval=$(jq -r '.tval' "$paramfile")
   port=$(jq -r '.port' "$paramfile")
   node_v=$(jq -r '.node_v' "$paramfile")
+  extra_args=$(jq -r '.extra_args // ""' "$paramfile")
 
   # Reconstruct the status globals in THIS process so status writes are correct.
   ST_SLOT=$name
@@ -1284,7 +1590,7 @@ run_detached_build() {
   fi
 
   # PHASES 4-7: pods, compile, link, install - owned by the wrapped run_command.
-  run_wrapped_build "$name" "$slot" "$run_cmd" "$tflag" "$tval" "$port"
+  run_wrapped_build "$name" "$slot" "$run_cmd" "$tflag" "$tval" "$port" "$extra_args"
 
   status_success
   log ""
@@ -1350,17 +1656,43 @@ ensure_slot_worktree() {
     || die "failed to checkout $ref in slot $slot"
 }
 
-# switch_node <version>: switch node via fnm if available and a version is asked
-# for. Best-effort; a missing fnm/version is a warning, not a failure.
+# switch_node <version>: put the checkout's requested node on PATH. Best-effort;
+# a missing fnm/version is a warning, not a failure.
+#
+# The AMBIENT node is checked FIRST, before touching fnm. This is deliberate and
+# is the fix for the SMM deps failure: `eval "$(fnm env)"` switches the shell to
+# fnm's DEFAULT node, so calling it unconditionally (as before) DOWNGRADED an
+# ambient node that already satisfied the request whenever fnm lacked that
+# version. On this machine fnm has only node 20, node 24 was installed via nvm,
+# and SMM asks for node 24: the old code eval'd fnm env (dropping to node 20),
+# `fnm use 24` failed, and pnpm (which needs node >= 22.13) then died under node
+# 20, failing the deps phase before the build even started. So: if the ambient
+# node already satisfies the request, KEEP it untouched. Only reach into fnm when
+# the ambient node does not satisfy the request, and only commit to fnm's env
+# when fnm can actually provide the version. If fnm cannot, restore whatever the
+# ambient node was rather than leaving the shell on fnm's (possibly worse)
+# default. This never downgrades a working node out from under the build.
 switch_node() {
   local v=$1
   [ -n "$v" ] || return 0
+  # 1. Ambient node already satisfies the request: keep it, do not touch fnm.
+  if node_version_matches "$v" "$(node --version 2>/dev/null)"; then
+    return 0
+  fi
   if command -v fnm >/dev/null 2>&1; then
+    # Snapshot the ambient PATH so a failed fnm switch can be rolled back rather
+    # than leaving the shell on fnm's default node (which downgraded pnpm above).
+    local ambient_path=$PATH ambient_node
+    ambient_node=$(node --version 2>/dev/null || echo unknown)
     eval "$(fnm env)" 2>/dev/null || true
     if fnm use "$v" >/dev/null 2>&1 && node_version_matches "$v" "$(node --version 2>/dev/null)"; then
       return 0
     fi
-    warn "fnm failed to switch to node $v; still on ambient node ($(node --version 2>/dev/null || echo unknown)) - builds may fail if this repo is engine-strict"
+    # fnm could not provide the requested version: undo the fnm env switch so we
+    # fall back to the ambient node instead of fnm's default (which may be older
+    # and break an engine-strict package manager).
+    PATH=$ambient_path
+    warn "fnm could not switch to node $v (not installed?); using ambient node ($ambient_node) - builds may fail if this repo is engine-strict. Install it with 'fnm install $v'."
   else
     warn "node $v requested but fnm is not installed; using ambient node ($(node --version 2>/dev/null || echo unknown))"
   fi
@@ -1562,16 +1894,18 @@ BUILD_CHILD_PID=0
 # the launcher too) and falls back to the pipeline pid.
 DETACHED_OWNS_SESSION=0
 
-# run_wrapped_build <slot-name> <slot-dir> <base-cmd> <target-flag> <target-value> <port>:
+# run_wrapped_build <slot-name> <slot-dir> <base-cmd> <target-flag> <target-value> <port> [extra-args]:
 # assemble and run the wrapped run_command, streaming + tee'ing through
 # stream_build_output, inferring phase transitions, and emitting the status
-# file. Fails (non-zero, terminal status) with a specific error when the CLI
+# file. [extra-args] is the already-formed arch-forcing flag string for the
+# Rosetta sim path (empty otherwise), appended verbatim by build_run_command.
+# Fails (non-zero, terminal status) with a specific error when the CLI
 # exits non-zero. The build's real exit code is captured from a group shell via
 # rcfile (the reader must not mask a non-zero build).
 run_wrapped_build() {
-  local name=$1 slot=$2 base=$3 tflag=$4 tval=$5 port=$6
+  local name=$1 slot=$2 base=$3 tflag=$4 tval=$5 port=$6 extra_args=${7:-}
   local full logfile rc=0
-  full=$(build_run_command "$base" "$tflag" "$tval" "$port")
+  full=$(build_run_command "$base" "$tflag" "$tval" "$port" "$extra_args")
   logfile="$STATE_DIR/build-$name.log"
   : > "$logfile"
 
@@ -1807,9 +2141,12 @@ cmd_doctor() {
 }
 
 # doctor_repo_viability: for each configured repo, find an ios/ tree to inspect
-# (a warm slot worktree first, else the clone) and run the slice gate for both
-# platforms with the host arch, reporting which are viable. Reports "no ios/
-# tree found" when neither a slot nor the clone has one.
+# (a warm slot worktree first, else the clone) and report which platforms are
+# viable. The --sim report uses the same two-path resolution the build does
+# (resolve_sim_arch): viable as a native host-arch sim build, viable as an
+# x86_64 build run via Rosetta, or NO with the specific reason. The --device
+# report uses the host-arch slice gate. Reports "no ios/ tree found" when neither
+# a slot nor the clone has one.
 doctor_repo_viability() {
   local repo arch; arch=$(host_arch)
   while IFS= read -r repo; do
@@ -1824,10 +2161,20 @@ doctor_repo_viability() {
       info "$repo: no ios/ tree found (warm a slot or clone first to check slices)"
       continue
     fi
-    local sim_r dev_r sim_ok dev_ok
-    if sim_r=$(slice_gate "$dir" sim "$arch"); then sim_ok="viable"; else sim_ok="NO ($sim_r)"; fi
+    local sim_resolved sim_arch sim_reason dev_r sim_ok dev_ok
+    if sim_resolved=$(resolve_sim_arch "$dir"); then
+      sim_arch=${sim_resolved%%$'\t'*}
+      if [ "$sim_arch" = "x86_64" ]; then
+        sim_ok="viable (x86_64 via Rosetta)"
+      else
+        sim_ok="viable ($sim_arch native)"
+      fi
+    else
+      sim_reason=${sim_resolved#*$'\t'}
+      sim_ok="NO ($sim_reason)"
+    fi
     if dev_r=$(slice_gate "$dir" device "$arch"); then dev_ok="viable"; else dev_ok="NO ($dev_r)"; fi
-    info "$repo ($arch): --sim: $sim_ok"
+    info "$repo: --sim: $sim_ok"
     info "$repo ($arch): --device: $dev_ok"
   done <<< "$(config_repos)"
 }
@@ -1901,10 +2248,12 @@ progress via state/lab-build-<slot>.json or by tailing the printed logfile. Pass
 The lab wraps the repo's configured run_command (e.g. react-native run-ios;
 post-Expo, npx expo run:ios), appending the resolved concrete target (--udid)
 and this slot's Metro port. It does NOT reimplement xcodebuild. A pre-flight
-framework-slice check fails fast when the app cannot build for the target (e.g.
-an FFmpeg framework with no arm64-simulator slice -> "use --device"). Build
-progress streams to the terminal and to state/build-<slot>.log, and a
-machine-readable status file lands at state/lab-build-<slot>.json.
+framework-slice check resolves the --sim build arch (native arm64, else x86_64
+run via Rosetta when only x86_64-simulator slices exist, as with an FFmpeg app)
+and fails fast only when no sim arch is viable. An x86_64 sim build targets an
+iOS <= 18 simulator (iOS 26+ sims cannot run x86_64). Build progress streams to
+the terminal and to state/build-<slot>.log, and a machine-readable status file
+lands at state/lab-build-<slot>.json.
 
 Config lives at: $CONFIG
 Lab home:        $LAB_HOME
