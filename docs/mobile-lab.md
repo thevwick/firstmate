@@ -47,7 +47,7 @@ This is what lets the lab stay command-agnostic: it never parses or reasons abou
 ## Usage
 
 ```sh
-fm-mobile-lab <repo> <branch> --sim|--device [--slot N]
+fm-mobile-lab <repo> <branch> --sim|--device [--slot N] [--wait]
 fm-mobile-lab ls
 fm-mobile-lab stop <slot-name>|--all
 fm-mobile-lab gc
@@ -58,6 +58,7 @@ Platform is explicit: you must pass `--sim` or `--device`, there is no default.
 `<repo>` is a repo key from the config, not a path.
 `<branch>` is fetched into a worktree of the clone; the clone itself is never modified.
 `--slot N` pins to a specific 0-based slot instead of the automatic least-recently-used choice.
+`--wait` (alias `--foreground`) blocks until the build finishes and exits with its status, for CI and scripts; by default the build is detached and the command returns as soon as the build is launched (see "Detached build" below).
 
 Run `fm-mobile-lab doctor` first on a new machine to see what is present (Xcode, CocoaPods, fnm, `lipo`/`vtool`, simulators, connected devices, disk headroom, config) and which platforms each configured repo can actually build for.
 
@@ -69,9 +70,11 @@ Not every run hits every phase (a deps cache hit makes the deps phase near-insta
 1. `preflight` - resolve the concrete target (the booted simulator's udid for `--sim`, the connected device's udid for `--device`) and, after checkout, run the framework-slice gate. There is no vague `generic/platform=iOS Simulator` destination; the lab always resolves a specific udid.
 2. `worktree` - fetch the branch (into the clone's object store only, never a checkout in the clone) and check it out in the slot's worktree (detached, so slots never collide over a branch).
 3. `deps` - hash the lockfile. Cache hit restores `node_modules` by APFS clone; miss installs and then snapshots to the cache.
-4. `pods`, then `compile`, `link`, `install` - all owned by the wrapped `run_command`. The lab assembles the full command (`run_command` + `--udid <target>` + `--port <slot-port>`), runs it from the slot with the fixed `RCT_METRO_PORT` in the environment, and streams and infers phases from the CLI's own output.
+4. `pods`, then `compile`, `link`, `install` - all owned by the wrapped `run_command`. The lab assembles the full command (`run_command` + `--udid <target>` + `--port <slot-port>`), runs it from the slot with the fixed `RCT_METRO_PORT` in the environment, and streams and infers phases from the CLI's own output. Before invoking `run_command`, the `pods` phase runs `pod install` itself when the slot is missing `ios/Pods/` or the app target's `Pods-*.xcconfig` (see "CocoaPods install" below).
 
 Between step 2 and step 3 the lab also detects the toolchain from the checkout (the package manager from the lockfile, the node version from `.nvmrc`/`.node-version`/`package.json` engines, switching via fnm when available) and starts Metro on this slot's fixed port.
+
+Steps 1-3 (plus Metro) run synchronously when you invoke the lab; the long native build in step 4 is then launched detached and runs on its own (see "Detached build").
 
 ### Pre-flight framework-slice gate
 
@@ -92,6 +95,28 @@ The file is written atomically (temp file then `mv`) on every phase transition a
 The file follows the contract in `data/mobile-lab-status-contract.md`: phase, phase index/total, an honest percent (`null` when genuinely unknown; never a fake smooth bar; refined within `compile` only when the CLI emits a parseable `X/Y` count), status (`running`/`success`/`failed`), timestamps, the resolved target, the wrapped `run_command`, and, on failure, a specific `error` string.
 The `logfile` field is an absolute path to the build log under the lab's own private state dir, since that log does not live alongside the status file: an absolute path is what lets the console (or a captain) actually open it regardless of which state dir they are reading from.
 A separate console reads the status file to render a live Mobile Lab view; the lab is the sole writer of the contract.
+
+### Detached build
+
+A native iOS build runs for 10-15 minutes, so its lifetime is decoupled from whoever invoked the lab.
+After the synchronous setup (preflight, worktree, deps, Metro), the lab launches the native build (pods, compile, link, install) in a process that has its own session and is detached from the caller's controlling terminal and stdio, then returns immediately, printing `build started in slot <slot>` plus where to watch it (the status file and the logfile).
+The build keeps running to completion even if the process that invoked `fm-mobile-lab` exits, is killed, or times out (a background task, a shell with a time limit, a reaped process).
+This is what makes a real device build completable: a reaped caller can no longer kill an in-progress build.
+
+The detached build always reaches a terminal status on its own exit.
+On success or a build failure it writes `success`/`failed` as before; and an exit trap catches the build process itself being killed or crashing and writes a terminal `failed` (`build process terminated ...`), so a killed build never leaves a zombie file stuck at `running`.
+The build's owning pid is recorded in the status file's `pid` field, so a reader can tell a live build from a zombie `running` file with `kill -0 <pid>`.
+When a new build starts in a slot whose previous status file is still `running` but whose recorded `pid` is no longer alive, the lab reaps that zombie (rewrites it `failed`) before starting.
+
+Pass `--wait` (or `--foreground`) to block until the build finishes and exit with the build's own status, which is the behavior CI and scripts want.
+
+### CocoaPods install
+
+The `deps` cache clones `node_modules` by APFS from a shared layer, so the RN CLI sees an already-populated `node_modules` and skips its own `pod install`.
+But `Pods/` is not part of `node_modules`: a fresh slot worktree can have `ios/` with no `Pods/`, and the build then dies with `Unable to open base configuration reference file ... Pods-<App>.debug.xcconfig` because the pod-generated xcconfig the Xcode project references was never produced.
+So the `pods` phase runs `pod install` itself when the slot is missing `ios/Pods/` or the app target's `Pods-*.xcconfig` under `ios/Pods/Target Support Files`.
+It uses `bundle exec pod install` when a `Gemfile` is present (the repo pins CocoaPods via bundler), otherwise `pod install`, run in the slot's `ios/` dir under the fnm-switched node.
+A pod-install failure is loud and fails the build (rather than proceeding to the same xcconfig death).
 
 ### Per-slot build lock
 
@@ -146,6 +171,7 @@ The FFmpeg slice incompatibility that motivates the pre-flight gate was verified
 
 ## Testing
 
-`tests/fm-mobile-lab.test.sh` covers the unit-testable logic without a real build: package-manager and node-version detection, lockfile-hash determinism, per-slot port assignment, LRU slot picking, config parsing (including `run_command`), run-command assembly (the exact command string built from a config plus a resolved target and port), the framework-slice gate (with a fixture fat binary and stubbed `lipo`/`vtool`, asserting fail-fast for an incompatible target and pass for a compatible one), build-status-file emission (a contract-shaped JSON is written for a phase), and the per-slot build lock (a second build refuses a locked slot and a stale lock is cleared).
-Full device and simulator builds cannot run in CI, so the tests exercise the logic (command assembly, gate, status shape, lock), not a real build.
+`tests/fm-mobile-lab.test.sh` covers the unit-testable logic without a real device build: package-manager and node-version detection, lockfile-hash determinism, per-slot port assignment, LRU slot picking, config parsing (including `run_command`), run-command assembly (the exact command string built from a config plus a resolved target and port), the framework-slice gate (with a fixture fat binary and stubbed `lipo`/`vtool`, asserting fail-fast for an incompatible target and pass for a compatible one), build-status-file emission (a contract-shaped JSON is written for a phase, including the `pid` field), the per-slot build lock (a second build refuses a locked slot and a stale lock is cleared), stale-zombie reaping (a `running` file with a dead `pid` is marked `failed`, a live-`pid` or terminal file is left), and the CocoaPods gap (`pod install` runs when `Pods/` or the app xcconfig is missing, with a stubbed `pod`/`bundle`).
+It also drives the detached-build behavior end to end against the real binary with a stubbed CLI: the default invocation launches detached and returns before the build finishes, the build runs to a terminal status on its own, a killed detached build writes a terminal `failed` (no zombie), `--wait` blocks until completion and propagates the exit code, and a new build reaps a stale zombie slot file.
+Full device and simulator builds cannot run in CI, so the tests exercise the logic and the process-level detach/terminal-status behavior with a stubbed CLI, not a real xcodebuild.
 The device-dependent build and launch are exercised on real hardware via `doctor` plus a live dry-run.
