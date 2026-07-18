@@ -20,6 +20,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # shellcheck source=bin/fm-cawldron-lock-lib.sh
 . "$SCRIPT_DIR/fm-cawldron-lock-lib.sh"
+# shellcheck source=bin/fm-usage-lib.sh
+. "$SCRIPT_DIR/fm-usage-lib.sh"
 "$FM_ROOT/bin/fm-guard.sh" || true
 
 FORCE_LOCKED=0
@@ -28,6 +30,7 @@ USAGE='usage: fm-promote.sh <task-id> [--force-locked]'
 for a in "$@"; do
   case "$a" in
     --force-locked) FORCE_LOCKED=1 ;;
+    -h|--help) fm_usage_header "$0"; exit 0 ;;
     # A misspelled flag or a stray extra positional must not be silently
     # swallowed: "--forc-locked" would otherwise be dropped and the promote
     # would quietly refuse under a lock the captain meant to override.

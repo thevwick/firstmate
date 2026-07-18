@@ -62,6 +62,51 @@ run_promote() {
     "$PROMOTE" "$@" 2>&1
 }
 
+# A full spawn that actually reaches the meta write, so the durable
+# cawldron_force_locked= audit field can be asserted rather than inferred from
+# the stderr warning. The Orca backend is the one adapter whose whole session
+# lifecycle is a CLI, so a fake `orca` on PATH carries a spawn all the way to
+# the metadata write without a real terminal, worktree helper, or agent - the
+# same fixture tests/fm-backend-orca.test.sh uses for its spawn cases.
+run_full_spawn() {  # <home> <id> <project-name> [extra spawn args...]
+  local home=$1 id=$2 project=$3
+  shift 3
+  local proj="$home/projects/$project" wt="$TMP_ROOT/wt-$id"
+  local case_dir="$TMP_ROOT/orca-$id" fb resp
+  fb="$case_dir/fakebin"
+  resp="$case_dir/responses"
+  mkdir -p "$fb" "$resp" "$home/data/$id"
+  cat > "$fb/orca" <<'SH'
+#!/usr/bin/env bash
+set -u
+RESP="${FM_ORCA_RESPONSES:?}"
+COUNT_FILE="$RESP/.count"
+next=$(( $(cat "$COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
+if [ "${1:-}" = status ]; then
+  printf '{"ok":true,"result":{"runtime":{"reachable":true,"state":"ready"}}}\n'
+  exit 0
+fi
+echo "$next" > "$COUNT_FILE"
+[ ! -f "$RESP/$next.exit" ] || exit "$(cat "$RESP/$next.exit")"
+[ ! -f "$RESP/$next.out" ] || cat "$RESP/$next.out"
+exit 0
+SH
+  chmod +x "$fb/orca"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+  # 1: repo lookup misses, 2: repo registered, 3: worktree created with an
+  # implicit terminal. Everything after that is a terminal send.
+  printf '1\n' > "$resp/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-%s"}}}\n' "$id" > "$resp/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-%s","path":"%s"},"terminal":{"handle":"term-%s"}}}\n' \
+    "$id" "$wt" "$id" > "$resp/3.out"
+  PATH="$fb:$PATH" FM_ORCA_RESPONSES="$resp" \
+    FM_ROOT_OVERRIDE='' FM_STATE_OVERRIDE='' FM_DATA_OVERRIDE='' FM_PROJECTS_OVERRIDE='' FM_CONFIG_OVERRIDE='' \
+    FM_HOME="$home" \
+    FM_SPAWN_NO_GUARD=1 \
+    "$SPAWN" "$id" "$proj" claude --backend orca "$@" 2>&1
+}
+
 # Seed a scout task whose meta records project=<project>, the field the promote
 # gate keys off.
 seed_scout() {
@@ -456,6 +501,55 @@ test_promote_rejects_unknown_argument() {
   pass "fm-promote.sh rejects an unrecognized argument instead of dropping it"
 }
 
+# The durable half of the override: a --force-locked spawn that actually bypassed
+# an active lock must record cawldron_force_locked=1 in the task's meta, so a
+# later collision with the captain's unlanded live edits is investigable after
+# the spawn-time stderr warning is long gone.
+test_spawn_records_force_locked_override_in_meta() {
+  local home out status
+  home=$(new_home)
+  mkdir -p "$home/projects"
+  run_lock "$home" meta-locked >/dev/null 2>&1 || true
+
+  out=$(run_full_spawn "$home" cawl-meta-z1 meta-locked --force-locked)
+  status=$?
+  expect_code 0 "$status" "the forced spawn should have completed"$'\n'"$out"
+  assert_grep "cawldron_force_locked=1" "$home/state/cawl-meta-z1.meta" \
+    "an override that bypassed an active lock left no durable trace in the task's meta"
+  rm -rf "/tmp/fm-cawl-meta-z1"
+  pass "fm-spawn.sh records cawldron_force_locked=1 when --force-locked bypassed an active lock"
+}
+
+# The other side of the same field: --force-locked with nothing to override is
+# not an override, so the meta must stay clean rather than claiming a bypass
+# that never happened.
+test_spawn_omits_force_locked_when_nothing_was_overridden() {
+  local home out status
+  home=$(new_home)
+  mkdir -p "$home/projects"
+
+  out=$(run_full_spawn "$home" cawl-meta-z2 meta-unlocked --force-locked)
+  status=$?
+  expect_code 0 "$status" "the unlocked spawn should have completed"$'\n'"$out"
+  assert_no_grep "cawldron_force_locked" "$home/state/cawl-meta-z2.meta" \
+    "an unlocked spawn must not record a bypass that never happened"
+  rm -rf "/tmp/fm-cawl-meta-z2"
+  pass "fm-spawn.sh omits cawldron_force_locked= when there was no lock to override"
+}
+
+# -h/--help prints the documented usage header instead of being swallowed by the
+# unknown-argument rejection, matching bin/fm-cawldron-lock.sh.
+test_promote_help_prints_usage() {
+  local home out status
+  home=$(new_home)
+  out=$(run_promote "$home" --help)
+  status=$?
+  expect_code 0 "$status" "--help should exit 0"
+  assert_contains "$out" "Usage: fm-promote.sh <task-id> [--force-locked]" "--help did not print the usage header"
+  assert_not_contains "$out" "error: unknown argument" "--help was rejected as an unknown argument"
+  pass "fm-promote.sh -h/--help prints its usage header"
+}
+
 test_set_clear_list_roundtrip
 test_clear_when_not_locked
 test_empty_project_rejected
@@ -478,4 +572,7 @@ test_promote_gate_force_locked_env_overrides
 test_promote_gate_corrupt_marker_still_gates
 test_promote_warns_when_meta_has_no_project
 test_promote_rejects_unknown_argument
+test_promote_help_prints_usage
+test_spawn_records_force_locked_override_in_meta
+test_spawn_omits_force_locked_when_nothing_was_overridden
 test_bootstrap_reports_lock_in_detect_only
