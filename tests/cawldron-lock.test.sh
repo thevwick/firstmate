@@ -415,6 +415,24 @@ test_promote_gate_corrupt_marker_still_gates() {
   pass "an unreadable marker still gates fm-promote.sh"
 }
 
+# A task meta with no project= line leaves the gate nothing to test against. The
+# promote still proceeds, but it must say so rather than skipping the lock check
+# in silence, so an unverifiable gate is never mistaken for a passed one.
+test_promote_warns_when_meta_has_no_project() {
+  local home out status
+  home=$(new_home)
+  printf 'kind=scout\nwindow=fm-%s\n' scout-noproj-p7 > "$home/state/scout-noproj-p7.meta"
+
+  out=$(run_promote "$home" scout-noproj-p7)
+  status=$?
+  expect_code 0 "$status" "a meta without project= should still promote"
+  assert_contains "$out" "warning: cannot verify the Cawldron lock for scout-noproj-p7" \
+    "the unverifiable lock check was skipped silently"
+  assert_contains "$out" "$home/state/scout-noproj-p7.meta" "the warning must name the meta path"
+  assert_grep "kind=ship" "$home/state/scout-noproj-p7.meta" "the promote did not flip kind= to ship"
+  pass "fm-promote.sh warns instead of silently skipping an unverifiable Cawldron lock check"
+}
+
 # A misspelled flag must be rejected rather than silently dropped - swallowing
 # "--forc-locked" would quietly refuse a promote the captain meant to override.
 test_promote_rejects_unknown_argument() {
@@ -451,5 +469,6 @@ test_promote_gate_silent_when_unlocked
 test_promote_gate_force_locked_flag_overrides
 test_promote_gate_force_locked_env_overrides
 test_promote_gate_corrupt_marker_still_gates
+test_promote_warns_when_meta_has_no_project
 test_promote_rejects_unknown_argument
 test_bootstrap_reports_lock_in_detect_only
