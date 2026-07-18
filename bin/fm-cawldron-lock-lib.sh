@@ -15,7 +15,7 @@
 # or garbled write must never silently disarm the spawn gate, so readers surface
 # it and treat it as locked.
 #
-# Sourced by the three callers above. No side effects on source. set -u / set -e
+# Sourced by the four callers above. No side effects on source. set -u / set -e
 # safe. Depends on nothing else in bin/.
 
 # Shared a-dot banner rule for every Cawldron-lock banner. Consumed by the

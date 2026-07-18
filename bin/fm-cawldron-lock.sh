@@ -7,8 +7,10 @@
 # the only writer; Cawldron itself stays dumb about firstmate and never reads or
 # writes this marker (docs/cawldron-integration.md owns the wider design). The
 # marker exists so bin/fm-spawn.sh can refuse to launch a background ship/scout
-# crew into a project the captain is actively hand-editing through Cawldron,
-# preventing an unlanded live edit from colliding with a crew's commits.
+# crew into a project the captain is actively hand-editing through Cawldron, and
+# bin/fm-promote.sh can refuse a scout-to-ship promotion there for the same
+# reason, preventing an unlanded live edit from colliding with a crew's commits.
+# Both refusals are overridable with --force-locked or FM_SPAWN_FORCE_LOCKED=1.
 #
 # Usage:
 #   fm-cawldron-lock.sh <project> [--note "<text>"]

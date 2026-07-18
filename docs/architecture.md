@@ -106,6 +106,11 @@ Only a named non-default branch checked out in `FM_ROOT` is a worktree tangle.
 If another live session holds the fleet lock, both surfaces keep the alarm but switch to read-only wording with no repair command.
 Ship briefs also tell the crewmate to verify `pwd -P` and `git rev-parse --show-toplevel` before creating `fm/<id>`, then stop with a blocked status if it landed in the primary checkout.
 
+Worktree isolation protects crewmates from each other, but not from a human editing a project clone in place.
+The Cawldron coordination lock covers that case: `bin/fm-cawldron-lock.sh` sets a per-project advisory marker at `state/cawldron-lock-<project>` while the captain is live in a Cawldron session, and `fm-spawn.sh` (ship/scout spawns) and `fm-promote.sh` (scout-to-ship promotion) share one gate that refuses with a loud banner unless `--force-locked` or `FM_SPAWN_FORCE_LOCKED=1` overrides it.
+A marker that exists but cannot be parsed still gates rather than silently disarming, and session start reports every active lock as a `CAWLDRON_LOCK:` line.
+The lock is home-scoped and never propagates into secondmate homes; [`cawldron-integration.md`](cawldron-integration.md) owns the wider design.
+
 ## No-mistakes gate authority boundary
 
 Firstmate's own no-mistakes gate runs agents inside a checkout that also contains the fleet-captain identity in `AGENTS.md`, so gate execution needs an authority boundary separate from ordinary crewmate worktree isolation.

@@ -40,9 +40,11 @@ The reconciliation is a captain/crewmate authoring discipline, not a firstmate f
 ## The coordination lock: the one runtime coupling
 
 The single point where firstmate and Cawldron actually touch at runtime is the coordination lock (`bin/fm-cawldron-lock.sh`, `docs/cawldron-integration.md` you are reading now, `AGENTS.md` section 7).
-Firstmate marks a project as live-in-Cawldron so its own ship/scout crews refuse to spawn into that project's working tree while the captain may have unlanded, uncommitted edits sitting there - the same class of collision the worktree-isolation assertion in `bin/fm-spawn.sh` already guards against for firstmate's own crews, extended to cover a human editing session too.
+Firstmate marks a project as live-in-Cawldron so its own ship/scout crews refuse to spawn into that project's working tree - and a scout already there refuses to be promoted to ship, through the same shared gate - while the captain may have unlanded, uncommitted edits sitting there - the same class of collision the worktree-isolation assertion in `bin/fm-spawn.sh` already guards against for firstmate's own crews, extended to cover a human editing session too.
 Cawldron itself is not a party to this: it never reads or writes the lock, and does not know firstmate exists.
 Firstmate sets and clears the lock explicitly (there is no auto-detection of a live Cawldron session); see `bin/fm-cawldron-lock.sh --help` for the exact marker format and commands.
+The refusal is overridable with `--force-locked` or `FM_SPAWN_FORCE_LOCKED=1` when the captain deliberately wants a crew there anyway, and session start surfaces every active lock as a `CAWLDRON_LOCK:` line.
+The lock is scoped to the home that holds it: it gates only crews dispatched from that home, and does not propagate into secondmate homes.
 
 ## Code-vs-vault caveats
 
