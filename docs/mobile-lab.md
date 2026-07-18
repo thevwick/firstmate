@@ -84,12 +84,14 @@ On Apple Silicon an arm64 simulator build therefore cannot link it, so `--sim` f
 
 ### Streaming progress, logfile, and status file
 
-While the wrapped command runs, the lab streams its output to the terminal and appends the full output to `state/build-<slot>.log`, so a wedged build is always diagnosable after the fact.
+While the wrapped command runs, the lab streams its output to the terminal and appends the full output to the lab's own private state dir (`<lab home>/state/build-<slot>.log`, `~/.fm-mobile-lab/state` by default), so a wedged build is always diagnosable after the fact.
 It prints a phase banner (with a `[index/total]` marker) at each inferred transition and a heartbeat line (`... still <phase> (Ns elapsed)`) on long phases, so slow is distinguishable from wedged.
 
-It also writes a machine-readable status file at `state/lab-build-<slot>.json`, atomically (temp file then `mv`), on every phase transition and at least every 10 seconds.
-The file follows the contract in `data/mobile-lab-status-contract.md`: phase, phase index/total, an honest percent (`null` when genuinely unknown; never a fake smooth bar; refined within `compile` only when the CLI emits a parseable `X/Y` count), status (`running`/`success`/`failed`), timestamps, the resolved target, the wrapped `run_command`, the logfile path, and, on failure, a specific `error` string.
-A separate console reads this file to render a live Mobile Lab view; the lab is the sole writer of the contract.
+It also writes a machine-readable status file at `state/lab-build-<slot>.json` under **firstmate's own** state dir (`$FM_HOME/state`, resolved the same way every other `bin/` script resolves it: `FM_STATE_OVERRIDE`, else `$FM_HOME/state`), not the lab's private home, because that is what the console's `readLabBuildStatuses` scans.
+The file is written atomically (temp file then `mv`) on every phase transition and at least every 10 seconds.
+The file follows the contract in `data/mobile-lab-status-contract.md`: phase, phase index/total, an honest percent (`null` when genuinely unknown; never a fake smooth bar; refined within `compile` only when the CLI emits a parseable `X/Y` count), status (`running`/`success`/`failed`), timestamps, the resolved target, the wrapped `run_command`, and, on failure, a specific `error` string.
+The `logfile` field is an absolute path to the build log under the lab's own private state dir, since that log does not live alongside the status file: an absolute path is what lets the console (or a captain) actually open it regardless of which state dir they are reading from.
+A separate console reads the status file to render a live Mobile Lab view; the lab is the sole writer of the contract.
 
 ### Per-slot build lock
 

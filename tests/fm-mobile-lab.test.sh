@@ -366,8 +366,9 @@ test_target_platform_token() {
 # --- build-status file emission (the console contract) ----------------------
 
 test_status_file_is_contract_shaped() {
-  local labhome="$TMP_ROOT/lab-status"
+  local labhome="$TMP_ROOT/lab-status" fmhome="$TMP_ROOT/fm-home-status"
   STATE_DIR="$labhome/state"; mkdir -p "$STATE_DIR"
+  FM_STATE_DIR="$fmhome/state"; mkdir -p "$FM_STATE_DIR"
   # Set the status globals as run_build would, then emit a phase. These are
   # consumed by the sourced engine's status_write, not visibly in this file.
   # shellcheck disable=SC2034
@@ -376,12 +377,14 @@ test_status_file_is_contract_shaped() {
     ST_PLATFORM="device" ST_TARGET="Thev's iPhone (iOS 26.5)"
     ST_RUN_COMMAND="react-native run-ios --scheme 'Dashpivot Dev'"
     ST_PORT=8111 ST_STATUS="running" ST_ERROR="null" ST_STARTED=1784300000
-    ST_PERCENT="null" ST_LOGFILE="state/build-dashpivot-mobile-0.log" ST_PHASE_TOTAL=7
+    ST_PERCENT="null" ST_LOGFILE="$STATE_DIR/build-dashpivot-mobile-0.log" ST_PHASE_TOTAL=7
   }
   status_phase compile 5 "Compiling React-Core"
 
-  local f; f="$STATE_DIR/lab-build-dashpivot-mobile-0.json"
-  [ -f "$f" ] || fail "status file was not written to $f"
+  local f; f="$FM_STATE_DIR/lab-build-dashpivot-mobile-0.json"
+  [ -f "$f" ] || fail "status file was not written to firstmate's state dir ($f)"
+  [ ! -f "$STATE_DIR/lab-build-dashpivot-mobile-0.json" ] \
+    || fail "status file must NOT be written to the lab's private STATE_DIR (the console cannot see it there)"
   jq -e . "$f" >/dev/null || fail "status file must be valid JSON"
   # Every contract field must be present and correctly typed.
   [ "$(jq -r '.schema' "$f")" = "1" ] || fail "schema must be 1"
@@ -398,33 +401,62 @@ test_status_file_is_contract_shaped() {
   # percent must be a REAL null (honest unknown), not the string "null".
   [ "$(jq -r '.percent | type' "$f")" = "null" ] || fail "percent must be JSON null when unknown, never a fake bar"
   [ "$(jq -r '.error | type' "$f")" = "null" ] || fail "error must be JSON null while running"
-  [ "$(jq -r '.logfile' "$f")" = "state/build-dashpivot-mobile-0.log" ] || fail "logfile"
+  [ "$(jq -r '.logfile' "$f")" = "$STATE_DIR/build-dashpivot-mobile-0.log" ] || fail "logfile must be an absolute path the console/captain can actually open"
   [ "$(jq -r '.started_epoch' "$f")" = "1784300000" ] || fail "started_epoch"
   [ "$(jq -r '.updated_epoch | type' "$f")" = "number" ] || fail "updated_epoch is a number"
   [ "$(jq -r '.phase_started_epoch | type' "$f")" = "number" ] || fail "phase_started_epoch is a number"
-  pass "status_write emits a contract-shaped JSON with correct types and a real null percent"
+  pass "status_write emits a contract-shaped JSON with correct types, a real null percent, and lands under firstmate's state dir with an absolute logfile"
+}
+
+test_status_file_path_uses_fm_state_dir_not_lab_home() {
+  # The console (bin/fm-console/src/io.js readLabBuildStatuses) scans FM_HOME's
+  # own state/ dir, never LAB_HOME. status_file_path must resolve there.
+  local labhome="$TMP_ROOT/lab-path" fmhome="$TMP_ROOT/fm-home-path"
+  STATE_DIR="$labhome/state"
+  FM_STATE_DIR="$fmhome/state"
+  local got; got=$(status_file_path "dashpivot-mobile-0")
+  [ "$got" = "$FM_STATE_DIR/lab-build-dashpivot-mobile-0.json" ] \
+    || fail "status_file_path should resolve under FM_STATE_DIR, got: $got"
+  case "$got" in
+    "$LAB_HOME"/*) fail "status_file_path must never resolve under LAB_HOME ($LAB_HOME): got $got" ;;
+  esac
+  pass "status_file_path resolves the console-facing status file under firstmate's state dir, not LAB_HOME"
+}
+
+test_fm_state_dir_respects_fm_state_override() {
+  # FM_STATE_DIR must resolve the same way every other bin/ script resolves
+  # firstmate's state dir: FM_STATE_OVERRIDE wins, else FM_HOME/state.
+  local out
+  out=$(FM_STATE_OVERRIDE="$TMP_ROOT/custom-fm-state" FM_MOBILE_LAB_LIB=1 bash -c '
+    . "'"$ENGINE"'"
+    printf "%s\n" "$FM_STATE_DIR"
+  ')
+  [ "$out" = "$TMP_ROOT/custom-fm-state" ] || fail "FM_STATE_OVERRIDE should win, got: $out"
+  pass "FM_STATE_DIR honors FM_STATE_OVERRIDE exactly like other bin/ scripts"
 }
 
 test_status_fail_sets_error_string() {
-  local labhome="$TMP_ROOT/lab-status-fail"
+  local labhome="$TMP_ROOT/lab-status-fail" fmhome="$TMP_ROOT/fm-home-status-fail"
   STATE_DIR="$labhome/state"; mkdir -p "$STATE_DIR"
+  FM_STATE_DIR="$fmhome/state"; mkdir -p "$FM_STATE_DIR"
   # shellcheck disable=SC2034
   {
     ST_SLOT="s0" ST_REPO="r" ST_BRANCH="b" ST_PLATFORM="sim" ST_TARGET="t"
     ST_RUN_COMMAND="c" ST_PORT=8100 ST_STATUS="running" ST_ERROR="null"
-    ST_STARTED=1 ST_PERCENT="null" ST_LOGFILE="state/build-s0.log" ST_PHASE_TOTAL=7
+    ST_STARTED=1 ST_PERCENT="null" ST_LOGFILE="$STATE_DIR/build-s0.log" ST_PHASE_TOTAL=7
     ST_PHASE="preflight" ST_PHASE_INDEX=1
   }
   status_fail "libavcodec has no arm64-simulator slice; use --device"
-  local f; f="$STATE_DIR/lab-build-s0.json"
+  local f; f="$FM_STATE_DIR/lab-build-s0.json"
   [ "$(jq -r '.status' "$f")" = "failed" ] || fail "status must be failed"
   [ "$(jq -r '.error' "$f")" = "libavcodec has no arm64-simulator slice; use --device" ] || fail "error string must be the specific reason"
-  pass "status_fail records failed status with a specific error string"
+  pass "status_fail records failed status with a specific error string under firstmate's state dir"
 }
 
 test_status_message_refines_compile_percent() {
-  local labhome="$TMP_ROOT/lab-status-pct"
+  local labhome="$TMP_ROOT/lab-status-pct" fmhome="$TMP_ROOT/fm-home-status-pct"
   STATE_DIR="$labhome/state"; mkdir -p "$STATE_DIR"
+  FM_STATE_DIR="$fmhome/state"; mkdir -p "$FM_STATE_DIR"
   # shellcheck disable=SC2034
   {
     ST_SLOT="s0" ST_REPO="r" ST_BRANCH="b" ST_PLATFORM="sim" ST_TARGET="t"
@@ -436,7 +468,7 @@ test_status_message_refines_compile_percent() {
   local pct; pct=$(parse_compile_count "Compiling React-Core (1050/2100)")
   [ "$pct" = "50" ] || fail "parse_compile_count should read 1050/2100 as 50, got: $pct"
   status_message "Compiling React-Core (1050/2100)" "$pct"
-  local f; f="$STATE_DIR/lab-build-s0.json"
+  local f; f="$FM_STATE_DIR/lab-build-s0.json"
   [ "$(jq -r '.percent' "$f")" = "50" ] || fail "a parsed compile count must set a real integer percent"
   pass "parse_compile_count + status_message set an honest integer percent from a real X/Y count"
 }
@@ -636,6 +668,64 @@ JSON
   pass "a build for a repo without run_command errors clearly, pointing at config"
 }
 
+# --- wrapped run_command invocation resolves a repo-local CLI ---------------
+#
+# react-native (and, post-Expo, `npx expo`) lives at <slot>/node_modules/.bin,
+# never on the global PATH. run_wrapped_build must resolve it generically (no
+# per-CLI special-casing), which is what lets a config-only Expo switch keep
+# working. Exercised by stubbing a fake CLI at node_modules/.bin and driving
+# run_wrapped_build directly (no real xcodebuild/pods involved).
+
+test_run_wrapped_build_resolves_repo_local_binary() {
+  local labhome="$TMP_ROOT/lab-invoke" slot="$TMP_ROOT/invoke-slot"
+  STATE_DIR="$labhome/state"; mkdir -p "$STATE_DIR"
+  mkdir -p "$slot/node_modules/.bin"
+  # A fake CLI that only a repo-local PATH lookup can find (NOT installed
+  # anywhere else on PATH); it just proves it was invoked and exits 0.
+  cat > "$slot/node_modules/.bin/react-native" <<'SH'
+#!/usr/bin/env bash
+echo "FAKE_REACT_NATIVE_RAN: $*"
+SH
+  chmod +x "$slot/node_modules/.bin/react-native"
+  # shellcheck disable=SC2034
+  {
+    ST_SLOT="s0" ST_REPO="r" ST_BRANCH="b" ST_PLATFORM="device" ST_TARGET="t"
+    ST_PHASE_TOTAL=7
+  }
+  local out rc
+  # A PATH deliberately WITHOUT the fake CLI anywhere except via the slot's
+  # own node_modules/.bin, so a bare `command not found` would surface here
+  # exactly as it did in the real dashpivot-mobile build.
+  out=$(PATH="/usr/bin:/bin" run_wrapped_build "s0" "$slot" "react-native run-ios --scheme 'Dashpivot Dev'" --udid ABC123 8111 2>&1); rc=$?
+  expect_code 0 "$rc" "wrapped build should succeed once the repo-local binary resolves"
+  assert_contains "$out" "FAKE_REACT_NATIVE_RAN" "the repo-local react-native binary must actually run"
+  assert_not_contains "$out" "command not found" "must never hit the bare-PATH command-not-found failure"
+  pass "run_wrapped_build resolves a repo-local CLI via node_modules/.bin, no bare PATH lookup"
+}
+
+test_run_wrapped_build_resolves_any_configured_cli_generically() {
+  # Same proof, but for a DIFFERENT CLI name (standing in for `npx expo` after
+  # the Expo migration), to confirm nothing here special-cases react-native.
+  local labhome="$TMP_ROOT/lab-invoke-expo" slot="$TMP_ROOT/invoke-slot-expo"
+  STATE_DIR="$labhome/state"; mkdir -p "$STATE_DIR"
+  mkdir -p "$slot/node_modules/.bin"
+  cat > "$slot/node_modules/.bin/some-other-cli" <<'SH'
+#!/usr/bin/env bash
+echo "FAKE_OTHER_CLI_RAN: $*"
+SH
+  chmod +x "$slot/node_modules/.bin/some-other-cli"
+  # shellcheck disable=SC2034
+  {
+    ST_SLOT="s1" ST_REPO="r" ST_BRANCH="b" ST_PLATFORM="device" ST_TARGET="t"
+    ST_PHASE_TOTAL=7
+  }
+  local out rc
+  out=$(PATH="/usr/bin:/bin" run_wrapped_build "s1" "$slot" "some-other-cli run:ios" --udid XYZ 8112 2>&1); rc=$?
+  expect_code 0 "$rc" "any configured run_command's repo-local CLI should resolve"
+  assert_contains "$out" "FAKE_OTHER_CLI_RAN" "a non-react-native CLI must resolve the same generic way"
+  pass "run_wrapped_build's repo-local resolution is command-agnostic (works for the coming Expo switch too)"
+}
+
 # --- run all ----------------------------------------------------------------
 
 test_detect_pkgmgr
@@ -660,6 +750,8 @@ test_slice_gate_no_frameworks_passes
 test_slice_gate_allows_when_lipo_absent
 test_target_platform_token
 test_status_file_is_contract_shaped
+test_status_file_path_uses_fm_state_dir_not_lab_home
+test_fm_state_dir_respects_fm_state_override
 test_status_fail_sets_error_string
 test_status_message_refines_compile_percent
 test_no_fake_percent_without_count
@@ -675,5 +767,7 @@ test_no_config_guidance_and_nonzero
 test_platform_required
 test_unknown_repo_errors
 test_missing_run_command_errors
+test_run_wrapped_build_resolves_repo_local_binary
+test_run_wrapped_build_resolves_any_configured_cli_generically
 
 pass "all fm-mobile-lab tests passed"
