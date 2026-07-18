@@ -251,10 +251,34 @@ test_corrupt_marker_surfaces_and_still_gates() {
   pass "an unreadable marker is surfaced by --list and still gates spawns"
 }
 
+# A since= value that is present but not an epoch integer is corrupt too: it must
+# take the same unreadable path rather than reaching shell arithmetic, which
+# would emit a raw error and render a blank age (or evaluate the value).
+test_non_numeric_since_is_corrupt() {
+  local home out status err
+  home=$(new_home)
+  mkdir -p "$home/projects/badsince-proj"
+  printf 'since=abc\n' > "$home/state/cawldron-lock-badsince-proj"
+
+  err="$home/list.err"
+  out=$(run_lock "$home" --list 2>"$err")
+  assert_contains "$out" "unreadable" "a non-numeric since= must be flagged unreadable"
+  assert_not_contains "$out" "locked  ago" "a non-numeric since= must not render a blank age"
+  [ ! -s "$err" ] || fail "a non-numeric since= leaked a shell error: $(cat "$err")"
+
+  out=$(run_spawn "$home" nope-badsince-z7 projects/badsince-proj)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn into a project with a non-numeric since= should be refused"
+  assert_contains "$out" "CAWLDRON LOCK ACTIVE - badsince-proj" "spawn gate failed open on a non-numeric since="
+
+  pass "a non-numeric since= is treated as an unreadable marker, not a bogus age"
+}
+
 test_set_clear_list_roundtrip
 test_clear_when_not_locked
 test_empty_project_rejected
 test_corrupt_marker_surfaces_and_still_gates
+test_non_numeric_since_is_corrupt
 test_unknown_project_warns_but_allows
 test_known_project_via_projects_dir_no_warning
 test_known_project_via_registry_no_warning

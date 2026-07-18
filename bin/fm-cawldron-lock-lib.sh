@@ -8,9 +8,10 @@
 # fm-spawn.sh (spawn gate reader), and fm-bootstrap.sh (session-start detect
 # line reader) cannot drift on either the file format or the wording.
 #
-# A marker that exists but carries no since= value is CORRUPT, not absent: a
-# truncated or interrupted write must never silently disarm the spawn gate, so
-# readers surface it and treat it as locked.
+# A marker that exists but carries no usable since= value - absent, empty, or
+# not a non-negative integer - is CORRUPT, not absent: a truncated, interrupted,
+# or garbled write must never silently disarm the spawn gate, so readers surface
+# it and treat it as locked.
 #
 # Sourced by the three callers above. No side effects on source. set -u / set -e
 # safe. Depends on nothing else in bin/.
@@ -28,12 +29,16 @@ fm_cawldron_lock_path() {
 
 # fm_cawldron_lock_read <marker-path>: populates FM_CAWL_SINCE / FM_CAWL_NOTE
 # (FM_CAWL_NOTE empty if the marker carries no note) and returns
-#   0 - the marker exists and carries a since= value (locked)
+#   0 - the marker exists and carries a usable since= epoch (locked)
 #   1 - no marker at all (unlocked)
-#   2 - the marker exists but carries no since= value (CORRUPT; still locked)
-# Callers must distinguish 1 from 2: only 1 means "not locked". A note value may
-# itself contain '=' - the read below assigns every character after the first
-# '=' to the value, so that is preserved intact.
+#   2 - the marker exists but its since= value is missing or not a non-negative
+#       integer (CORRUPT; still locked)
+# Callers must distinguish 1 from 2: only 1 means "not locked". The digit check
+# matters beyond diagnostics: fm_cawldron_lock_age_human feeds since= to shell
+# arithmetic, which would otherwise dereference (and for a value like
+# 'x[$(cmd)]' evaluate) a non-numeric value instead of rendering an age. A note
+# value may itself contain '=' - the read below assigns every character after
+# the first '=' to the value, so that is preserved intact.
 fm_cawldron_lock_read() {
   local path=$1 key value
   FM_CAWL_SINCE=
@@ -45,7 +50,9 @@ fm_cawldron_lock_read() {
       note) FM_CAWL_NOTE=$value ;;
     esac
   done < "$path"
-  [ -n "$FM_CAWL_SINCE" ] || return 2
+  case "$FM_CAWL_SINCE" in
+    '' | *[!0-9]*) return 2 ;;
+  esac
   return 0
 }
 
@@ -54,20 +61,27 @@ fm_cawldron_lock_read() {
 # Writes to a temp sibling and renames, so an interrupted or out-of-space write
 # can never leave a truncated marker in place of a good one. The temp is also
 # removed on INT/TERM/HUP, so an interrupt between the redirect and the rename
-# leaves no stray temp behind either.
+# leaves no stray temp behind either. Any INT/TERM/HUP handler the caller had
+# installed is saved and restored rather than reset to the default, so this
+# helper never silently disarms a caller's own cleanup.
 fm_cawldron_lock_write() {
-  local path=$1 since=$2 note=${3:-} tmp
+  local path=$1 since=$2 note=${3:-} tmp prior rc=0
   # Dot-prefixed so the in-flight temp never matches fm_cawldron_lock_list's
   # cawldron-lock-* glob.
   tmp="$(dirname "$path")/.cawldron-lock-tmp.$$"
+  prior=$(trap -p INT TERM HUP)
+  # printf %q so a state-dir path containing quotes or spaces still yields a
+  # well-formed trap command.
   # shellcheck disable=SC2064
-  trap "rm -f '$tmp'" INT TERM HUP
+  trap "rm -f $(printf '%q' "$tmp")" INT TERM HUP
   {
     printf 'since=%s\n' "$since"
     [ -z "$note" ] || printf 'note=%s\n' "$note"
-  } > "$tmp" || { trap - INT TERM HUP; rm -f "$tmp"; return 1; }
-  mv -f "$tmp" "$path" || { trap - INT TERM HUP; rm -f "$tmp"; return 1; }
+  } > "$tmp" && mv -f "$tmp" "$path" || rc=1
   trap - INT TERM HUP
+  [ -z "$prior" ] || eval "$prior"
+  [ "$rc" -eq 0 ] || rm -f "$tmp"
+  return "$rc"
 }
 
 # fm_cawldron_lock_age_human <since-epoch> [<now-epoch>]: print a short
@@ -100,7 +114,7 @@ fm_cawldron_lock_age_human() {
 fm_cawldron_lock_detail() {
   local status=$1 since=$2 note=${3:-} now=${4:-} age
   if [ "$status" = corrupt ]; then
-    printf 'LOCKED but the marker is unreadable (no since= value; truncated or corrupt write) - treat as locked and re-set or clear it with bin/fm-cawldron-lock.sh'
+    printf 'LOCKED but the marker is unreadable (missing or invalid since= value; truncated or corrupt write) - treat as locked and re-set or clear it with bin/fm-cawldron-lock.sh'
     return 0
   fi
   if [ -n "$now" ]; then
