@@ -48,23 +48,15 @@ The lock is scoped to the home that holds it: it gates only crews dispatched fro
 
 ## Code-vs-vault caveats
 
-Two specific claims below were verified by reading the Cawldron repo directly (read-only; nothing there was changed), at commit `4b6b664` (2026-06-24).
-Source paths below are repo-relative to that checkout.
+Two conclusions below came from reading the Cawldron repo directly (read-only; nothing there was changed) rather than assuming, but are recorded here only at the level firstmate's own design needs - not as a public audit of a separate, captain-owned project's internals.
 
-**(a) Cawldron is claude-only in fact, though its agent registry is adapter-shaped for other CLIs.**
-`packages/engine/src/agents.ts` documents itself as a v1, claude-only spike: its `AGENTS` registry (an array of `{id, bin, ...}` entries) has exactly one entry, `{id: "claude", bin: "claude"}`, with a trailing comment marking where `codex` / `opencode` / other CLIs would land.
-But the actual invocation in `packages/engine/src/runAgent.ts` hardcodes `spawn("claude", args, ...)` directly - it does not look up `bin` from the registry at all.
-So the registry's shape invites other adapters, but nothing today reads it generically; only `claude` runs.
+**(a) Cawldron is claude-only in practice today, even though its design leaves room for other coding CLIs.**
+This is why "Cawldron is not a firstmate harness" above holds cleanly: there is exactly one underlying CLI in the loop right now, and it is the same one firstmate already drives directly.
 
-**(b) The `runScopedEdit`-as-a-governance-action and the `{slug}` catalog promote/archive path are declared but not wired.**
-`apps/desktop/src/main/services/contract-service.ts` defines an `EXECUTABLE` set of primitives the runner actually performs (`runCommand`, `commit`, `tag`, `branch`, `push`, `pull`, `revert`, `merge`, `move`, `copy`, `delete`, `fork`) - these do real git/fs work via `runShell`/`host.spawn`.
-A separate `NOT_WIRED` map stubs `runScopedEdit` and `runAgentTask` with the placeholder reason `"Edit from the prompt box"`: they are named in the contract vocabulary but excluded from `EXECUTABLE`, so `blockedReason()` refuses them before anything runs.
-Separately, `move`/`fork` steps that still contain an unfilled `{slug}` placeholder (the promote/archive catalog path in the example manifests) are blocked by the same function with `"Select a flow first — the catalog lands next"` - the primitives themselves are executable, but no catalog-selection UI exists yet to fill `{slug}`, so that path is unreachable end-to-end today.
-Contrast this with gate-run and the rest of the git primitives, which do execute for real.
+**(b) A couple of contract actions are named in Cawldron's vocabulary but not reachable end-to-end yet.**
+Its scoped-edit governance action and a catalog-based promote/archive flow are declared in the contract but not wired to real execution - a detail worth knowing if a future integration were ever tempted to depend on either, since neither actually runs today.
 
-Also confirmed while reading: `apps/desktop` is a plain Electron app (`electron-vite dev`, `electron` as a direct dependency, the classic `main`/`preload`/`renderer` process split) with no headless or server entrypoint - reinforcing "Cawldron is not a firstmate backend" above.
-
-These are point-in-time facts about an actively developed project; re-verify against the current Cawldron source before relying on them for anything beyond this document's own reasoning.
+These are point-in-time facts about an actively developed, captain-owned project; re-verify directly and privately against the current Cawldron source rather than treating this summary as a durable spec of its internals.
 
 ## One firstmate per project vs. a generic Cawldron
 
@@ -72,6 +64,6 @@ Firstmate is one fleet supervising a bounded set of registered projects; Cawldro
 The repo is the join key between them: a project's `cawldron.yml` is committed *in that project's own repo*, not in firstmate's.
 Firstmate is the discoverer, not the owner, of that contract - it reads a project's `cawldron.yml` (when reconciling gates/protected paths per the table above) the same way it reads any other committed project convention, never authoring or shipping one itself.
 
-This is a separate relationship from the fact that Cawldron's own source happens to be cloned inside a firstmate home (the same commit `4b6b664` checkout read for this document).
+This is a separate relationship from the fact that Cawldron's own source happens to be cloned inside a firstmate home.
 That clone means a firstmate instance *builds Cawldron* the same way it would build any other registered project - ordinary project-delivery work, unrelated to whether Cawldron is being used to *drive* some other product repo.
 A firstmate developing Cawldron and a firstmate coordinating with a captain's live Cawldron session on an unrelated product repo are two independent relationships that happen to involve the same tool name.

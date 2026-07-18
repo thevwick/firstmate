@@ -135,7 +135,11 @@ fm_cawldron_lock_detail() {
 # ship-crew refusal gate. <project> may be a bare name or an absolute project
 # path (it is basenamed). <action> is a short context phrase - "spawn",
 # "promote" - naming what is being gated, and appears in the banner, the
-# override warning, and the refusal message. Returns
+# override warning, and the refusal message. Also sets FM_CAWLDRON_OVERRODE to
+# 1 when a lock was actually bypassed via <force-flag> (0 otherwise: not locked,
+# or locked and refused), so a caller that records durable state (fm-spawn.sh's
+# state/<id>.meta) can persist the override for a later collision investigation.
+# Returns
 #   0 - not locked, or locked but <force-flag> is non-zero (warning emitted)
 #   1 - locked and not overridden; the bordered banner and refusal line are
 #       already on stderr, so the caller only has to stop
@@ -146,6 +150,7 @@ fm_cawldron_lock_detail() {
 # locked/unlocked test or the wording.
 fm_cawldron_gate() {
   local state=$1 proj_name marker rc detail force=$3 action=$4
+  FM_CAWLDRON_OVERRODE=0
   proj_name=$(basename "$2")
   marker=$(fm_cawldron_lock_path "$state" "$proj_name")
   rc=0
@@ -157,9 +162,11 @@ fm_cawldron_gate() {
     detail=$(fm_cawldron_lock_detail corrupt '' '')
   fi
   # An override is the one case a later collision with the captain's unlanded
-  # live edits most needs a trace, and nothing is recorded in state/<id>.meta -
-  # so say so on the way past.
+  # live edits most needs a trace. The stderr warning alone is not durable, so
+  # FM_CAWLDRON_OVERRODE=1 lets a caller that records state (fm-spawn.sh's
+  # state/<id>.meta) persist that this launch bypassed an active lock.
   if [ "$force" -ne 0 ]; then
+    FM_CAWLDRON_OVERRODE=1
     echo "warning: $proj_name is Cawldron-locked ($detail); continuing this $action anyway per --force-locked" >&2
     return 0
   fi

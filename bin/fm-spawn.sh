@@ -634,6 +634,7 @@ fi
 fm_cawldron_spawn_gate() {
   fm_cawldron_gate "$STATE" "$1" "$FORCE_LOCKED_EFFECTIVE" spawn
 }
+CAWLDRON_FORCE_LOCKED_USED=0
 
 if [ "$KIND" = secondmate ]; then
   [ -n "$FIRSTMATE_HOME" ] || { echo "error: no firstmate home supplied or registered for $ID" >&2; exit 1; }
@@ -673,6 +674,10 @@ else
   WT=""
   BRIEF="$DATA/$ID/brief.md"
   fm_cawldron_spawn_gate "$PROJ_ABS" || exit 1
+  # FM_CAWLDRON_OVERRODE is set by fm_cawldron_gate; captured here into a var
+  # that survives to the meta write below, so an override that bypassed an
+  # active lock leaves a durable trace, not just the stderr warning.
+  CAWLDRON_FORCE_LOCKED_USED=$FM_CAWLDRON_OVERRODE
 fi
 [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
 
@@ -1059,6 +1064,11 @@ META_WINDOW=$T
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
   fi
+  # Durable trace for a --force-locked/FM_SPAWN_FORCE_LOCKED=1 override that
+  # actually bypassed an active Cawldron lock (fm_cawldron_gate's
+  # FM_CAWLDRON_OVERRODE), so a later collision investigation is not limited to
+  # the stderr warning already printed at spawn time. Absent means no override.
+  [ "$CAWLDRON_FORCE_LOCKED_USED" -eq 0 ] || echo "cawldron_force_locked=1"
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
