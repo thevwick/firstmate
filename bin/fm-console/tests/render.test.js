@@ -940,3 +940,161 @@ test('FIRSTMATE ACTIVITY still shows in-flight cards alongside a compact activit
     }
   }
 });
+
+// MOBILE LAB section: reads state/lab-build-*.json per
+// data/mobile-lab-status-contract.md v1 on the console's normal refresh
+// cadence. Writes a fixture file directly into the temp home's state/ dir
+// (makeHome already creates it) rather than stubbing a script, since this is
+// a plain file read, not a shell-out.
+async function writeLabBuildFixture(home, slot, raw) {
+  await writeFile(path.join(home, 'state', `lab-build-${slot}.json`), JSON.stringify(raw));
+}
+
+test('MOBILE LAB section is absent entirely when no lab-build files exist', async () => {
+  const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+  const { lastFrame, stdout, unmount } = render(React.createElement(App, { bin, home }));
+  setTestRows(stdout, 45);
+  const frame = await waitForFrame(lastFrame, /FIRSTMATE ACTIVITY/);
+  assert.doesNotMatch(frame, /MOBILE LAB/);
+  unmount();
+});
+
+test('MOBILE LAB section renders a running build with a known percent: phase tracker, filled meter, timers', async () => {
+  const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+  await writeLabBuildFixture(home, 'dashpivot-mobile-0', {
+    schema: 1,
+    slot: 'dashpivot-mobile-0',
+    repo: 'dashpivot-mobile',
+    branch: 'release/26.9',
+    platform: 'device',
+    target: "Thev's iPhone (iOS 26.5)",
+    phase: 'compile',
+    phase_index: 5,
+    phase_total: 7,
+    percent: 62,
+    status: 'running',
+    started_epoch: Math.floor(Date.now() / 1000) - 120,
+    updated_epoch: Math.floor(Date.now() / 1000),
+    phase_started_epoch: Math.floor(Date.now() / 1000) - 20,
+    message: 'Compiling React-Core (1240/2100)',
+    logfile: 'state/build-dashpivot-mobile-0.log',
+    error: null,
+  });
+  const { lastFrame, stdout, unmount } = render(React.createElement(App, { bin, home }));
+  setTestRows(stdout, 45);
+  const frame = await waitForFrame(lastFrame, /MOBILE LAB/);
+  assert.match(frame, /MOBILE LAB/);
+  assert.match(frame, /dashpivot-mobile/);
+  assert.match(frame, /release\/26\.9/);
+  assert.match(frame, /Thev's iPhone/);
+  assert.match(frame, /62%/);
+  assert.match(frame, /compile/);
+  unmount();
+});
+
+test('MOBILE LAB section renders an indeterminate meter (never a fake bar) when percent is null', async () => {
+  const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+  await writeLabBuildFixture(home, 'dashpivot-mobile-0', {
+    schema: 1,
+    slot: 'dashpivot-mobile-0',
+    repo: 'dashpivot-mobile',
+    branch: 'main',
+    platform: 'device',
+    target: "Thev's iPhone (iOS 26.5)",
+    phase: 'pods',
+    phase_index: 3,
+    phase_total: 7,
+    percent: null,
+    status: 'running',
+    started_epoch: Math.floor(Date.now() / 1000) - 20,
+    updated_epoch: Math.floor(Date.now() / 1000),
+    phase_started_epoch: Math.floor(Date.now() / 1000) - 5,
+    message: 'pod install...',
+    logfile: 'state/build-dashpivot-mobile-0.log',
+    error: null,
+  });
+  const { lastFrame, stdout, unmount } = render(React.createElement(App, { bin, home }));
+  setTestRows(stdout, 45);
+  const frame = await waitForFrame(lastFrame, /MOBILE LAB/);
+  assert.match(frame, /progress unknown/);
+  // The build meter's own line must never show a fake percent - scope the
+  // check to the meter line itself (rather than the whole frame) since the
+  // status strip's unrelated disk-usage percent ("94%") is expected elsewhere.
+  const meterLine = frame.split('\n').find((l) => l.includes('progress unknown'));
+  assert.doesNotMatch(meterLine, /\d+%/);
+  unmount();
+});
+
+test('MOBILE LAB section shows a clear failure display: error string + logfile path', async () => {
+  const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+  await writeLabBuildFixture(home, 'dashpivot-mobile-1', {
+    schema: 1,
+    slot: 'dashpivot-mobile-1',
+    repo: 'dashpivot-mobile',
+    branch: 'main',
+    platform: 'sim',
+    target: 'iPhone 17 Pro (iOS 26.5)',
+    phase: 'link',
+    phase_index: 6,
+    phase_total: 7,
+    percent: 91,
+    status: 'failed',
+    started_epoch: Math.floor(Date.now() / 1000) - 600,
+    updated_epoch: Math.floor(Date.now() / 1000) - 300,
+    phase_started_epoch: Math.floor(Date.now() / 1000) - 400,
+    message: 'linking...',
+    logfile: 'state/build-dashpivot-mobile-1.log',
+    error: 'libavcodec has no arm64-simulator slice; use --device',
+  });
+  const { lastFrame, stdout, unmount } = render(React.createElement(App, { bin, home }));
+  setTestRows(stdout, 45);
+  setTestCols(stdout, 160);
+  const frame = await waitForFrame(lastFrame, /MOBILE LAB/);
+  assert.match(frame, /libavcodec has no arm64-simulator slice/);
+  assert.match(frame, /build-dashpivot-mobile-1\.log/);
+  unmount();
+});
+
+test('MOBILE LAB section shows a terminal success build with a full meter and no error', async () => {
+  const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+  await writeLabBuildFixture(home, 'dashpivot-mobile-0', {
+    schema: 1,
+    slot: 'dashpivot-mobile-0',
+    repo: 'dashpivot-mobile',
+    branch: 'release/26.9',
+    platform: 'device',
+    target: "Thev's iPhone (iOS 26.5)",
+    phase: 'install',
+    phase_index: 7,
+    phase_total: 7,
+    percent: 100,
+    status: 'success',
+    started_epoch: Math.floor(Date.now() / 1000) - 300,
+    updated_epoch: Math.floor(Date.now() / 1000) - 5,
+    phase_started_epoch: Math.floor(Date.now() / 1000) - 20,
+    message: 'Launched Dashpivot on device',
+    logfile: 'state/build-dashpivot-mobile-0.log',
+    error: null,
+  });
+  const { lastFrame, stdout, unmount } = render(React.createElement(App, { bin, home }));
+  setTestRows(stdout, 45);
+  const frame = await waitForFrame(lastFrame, /MOBILE LAB/);
+  assert.match(frame, /100%/);
+  assert.match(frame, /Launched Dashpivot on device/);
+  unmount();
+});
+
+test('MOBILE LAB section degrades a malformed status file to a compact idle row, never crashing the board', async () => {
+  const { home, bin } = await makeHome({ schema: 'fm-fleet-snapshot.v1', tasks: [], backlog: { records: [] } });
+  await writeFile(path.join(home, 'state', 'lab-build-broken-slot.json'), 'not valid json {{{');
+  const { lastFrame, stdout, unmount } = render(React.createElement(App, { bin, home }));
+  setTestRows(stdout, 45);
+  const frame = await waitForFrame(lastFrame, /MOBILE LAB/);
+  assert.match(frame, /MOBILE LAB/);
+  assert.match(frame, /broken-slot/);
+  // The rest of the board must still be intact - a malformed lab file never
+  // takes down the whole console.
+  assert.match(frame, /QUEUED/);
+  assert.match(frame, /RECENT DONE/);
+  unmount();
+});
