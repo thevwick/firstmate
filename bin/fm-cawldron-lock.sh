@@ -148,7 +148,10 @@ if [ "${#live_crew_ids[@]}" -gt 0 ]; then
 fi
 
 SINCE=$(date +%s)
-fm_cawldron_lock_write "$MARKER" "$SINCE" "$NOTE"
+if ! fm_cawldron_lock_write "$MARKER" "$SINCE" "$NOTE"; then
+  echo "error: failed to write $MARKER; the lock for $PROJECT is NOT set" >&2
+  exit 1
+fi
 if [ -n "$NOTE" ]; then
   echo "cawldron lock set: $PROJECT (note: $NOTE)"
 else

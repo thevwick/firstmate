@@ -27,6 +27,16 @@ run_lock() {
     "$LOCK" "$@" 2>&1
 }
 
+# Same as run_lock but leaves stderr alone, so a caller can redirect it
+# separately and assert that the script kept its own stderr clean.
+run_lock_split() {
+  local home=$1
+  shift
+  FM_ROOT_OVERRIDE='' FM_STATE_OVERRIDE='' FM_DATA_OVERRIDE='' FM_PROJECTS_OVERRIDE='' FM_CONFIG_OVERRIDE='' \
+    FM_HOME="$home" \
+    "$LOCK" "$@"
+}
+
 run_spawn() {
   local home=$1
   shift
@@ -261,7 +271,7 @@ test_non_numeric_since_is_corrupt() {
   printf 'since=abc\n' > "$home/state/cawldron-lock-badsince-proj"
 
   err="$home/list.err"
-  out=$(run_lock "$home" --list 2>"$err")
+  out=$(run_lock_split "$home" --list 2>"$err")
   assert_contains "$out" "unreadable" "a non-numeric since= must be flagged unreadable"
   assert_not_contains "$out" "locked  ago" "a non-numeric since= must not render a blank age"
   [ ! -s "$err" ] || fail "a non-numeric since= leaked a shell error: $(cat "$err")"
@@ -272,6 +282,38 @@ test_non_numeric_since_is_corrupt() {
   assert_contains "$out" "CAWLDRON LOCK ACTIVE - badsince-proj" "spawn gate failed open on a non-numeric since="
 
   pass "a non-numeric since= is treated as an unreadable marker, not a bogus age"
+}
+
+# Batch id=repo dispatch: a locked pair without the override is reported and
+# skipped, while the rest of the batch still launches (i.e. the batch loop keeps
+# going past the refusal instead of aborting on it).
+test_batch_skips_locked_pair_and_continues() {
+  local home out
+  home=$(new_home)
+  mkdir -p "$home/projects/batch-locked" "$home/projects/batch-free"
+  run_lock "$home" batch-locked >/dev/null
+
+  out=$(run_spawn "$home" batch-a=projects/batch-locked batch-b=projects/batch-free)
+  assert_contains "$out" "CAWLDRON LOCK ACTIVE - batch-locked" "batch dispatch did not gate the locked pair"
+  assert_contains "$out" "batch: FAILED to spawn batch-a" "batch dispatch did not report the skipped locked pair"
+  assert_contains "$out" "error: no brief at" "the unlocked pair should still have been attempted"
+  assert_not_contains "$out" "CAWLDRON LOCK ACTIVE - batch-free" "the unlocked pair must not trip the lock banner"
+  pass "batch dispatch skips a locked pair and still launches the rest"
+}
+
+# The session-start CAWLDRON_LOCK line is pure read-only detection, so it must
+# also appear in the detect-only (lock-refused/read-only) bootstrap path.
+test_bootstrap_reports_lock_in_detect_only() {
+  local home out
+  home=$(new_home)
+  mkdir -p "$home/projects/boot-proj"
+  run_lock "$home" boot-proj --note "captain live" >/dev/null
+
+  out=$(FM_ROOT_OVERRIDE="$home" FM_STATE_OVERRIDE='' FM_DATA_OVERRIDE='' FM_PROJECTS_OVERRIDE='' FM_CONFIG_OVERRIDE='' \
+    FM_HOME="$home" FM_BOOTSTRAP_DETECT_ONLY=1 "$ROOT/bin/fm-bootstrap.sh" 2>&1 || true)
+  assert_contains "$out" "CAWLDRON_LOCK: boot-proj - locked" "detect-only bootstrap dropped the active-lock line"
+  assert_contains "$out" "note: captain live" "detect-only bootstrap dropped the lock note"
+  pass "the bootstrap CAWLDRON_LOCK line survives the detect-only path"
 }
 
 test_set_clear_list_roundtrip
@@ -288,3 +330,5 @@ test_spawn_gate_silent_when_unlocked
 test_spawn_gate_force_locked_flag_overrides
 test_spawn_gate_force_locked_env_overrides
 test_multiline_note_rejected
+test_batch_skips_locked_pair_and_continues
+test_bootstrap_reports_lock_in_detect_only
