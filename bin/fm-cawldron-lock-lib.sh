@@ -3,10 +3,12 @@
 # lock (bin/fm-cawldron-lock.sh).
 #
 # ONE owner for the marker path, its "since=<epoch>[, note=<text>]" format, age
-# formatting, and the human rendering of a lock (banner rule plus the shared
-# "locked <age> ago[ (note: <text>)]" detail), so fm-cawldron-lock.sh (writer),
-# fm-spawn.sh (spawn gate reader), and fm-bootstrap.sh (session-start detect
-# line reader) cannot drift on either the file format or the wording.
+# formatting, the human rendering of a lock (banner rule plus the shared
+# "locked <age> ago[ (note: <text>)]" detail), and the ship-crew refusal gate
+# itself (fm_cawldron_gate), so fm-cawldron-lock.sh (writer), fm-spawn.sh and
+# fm-promote.sh (gate callers), and fm-bootstrap.sh (session-start detect line
+# reader) cannot drift on the file format, the locked/unlocked test, or the
+# wording.
 #
 # A marker that exists but carries no usable since= value - absent, empty, or
 # not a non-negative integer - is CORRUPT, not absent: a truncated, interrupted,
@@ -127,6 +129,50 @@ fm_cawldron_lock_detail() {
   else
     printf 'locked %s ago' "$age"
   fi
+}
+
+# fm_cawldron_gate <state-dir> <project> <force-flag> <action>: the shared
+# ship-crew refusal gate. <project> may be a bare name or an absolute project
+# path (it is basenamed). <action> is a short context phrase - "spawn",
+# "promote" - naming what is being gated, and appears in the banner, the
+# override warning, and the refusal message. Returns
+#   0 - not locked, or locked but <force-flag> is non-zero (warning emitted)
+#   1 - locked and not overridden; the bordered banner and refusal line are
+#       already on stderr, so the caller only has to stop
+# Only a missing marker (rc 1 from fm_cawldron_lock_read) means unlocked: an
+# unreadable marker (rc 2 - truncated or corrupt write) is still a lock, because
+# a damaged state file must never silently disarm this gate. This lives here, in
+# the marker's one owner, so fm-spawn.sh and fm-promote.sh cannot drift on the
+# locked/unlocked test or the wording.
+fm_cawldron_gate() {
+  local state=$1 proj_name marker rc detail force=$3 action=$4
+  proj_name=$(basename "$2")
+  marker=$(fm_cawldron_lock_path "$state" "$proj_name")
+  rc=0
+  fm_cawldron_lock_read "$marker" || rc=$?
+  [ "$rc" -ne 1 ] || return 0
+  if [ "$rc" -eq 0 ]; then
+    detail=$(fm_cawldron_lock_detail ok "$FM_CAWL_SINCE" "$FM_CAWL_NOTE")
+  else
+    detail=$(fm_cawldron_lock_detail corrupt '' '')
+  fi
+  # An override is the one case a later collision with the captain's unlanded
+  # live edits most needs a trace, and nothing is recorded in state/<id>.meta -
+  # so say so on the way past.
+  if [ "$force" -ne 0 ]; then
+    echo "warning: $proj_name is Cawldron-locked ($detail); continuing this $action anyway per --force-locked" >&2
+    return 0
+  fi
+  {
+    printf '●%s\n' "$FM_CAWLDRON_RULE"
+    printf '●  CAWLDRON LOCK ACTIVE - %s\n' "$proj_name"
+    printf '●  %s\n' "$detail"
+    printf "●  This %s may collide with the captain's unlanded live Cawldron edits.\n" "$action"
+    printf '●  Pass --force-locked (or set FM_SPAWN_FORCE_LOCKED=1) to continue anyway.\n'
+    printf '●%s\n' "$FM_CAWLDRON_RULE"
+  } >&2
+  echo "error: $action refused: $proj_name is Cawldron-locked ($detail); pass --force-locked to override" >&2
+  return 1
 }
 
 # fm_cawldron_lock_list <state-dir>: print one

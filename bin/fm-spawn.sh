@@ -628,42 +628,13 @@ fi
 # Cawldron coordination lock gate (ship/scout only; --secondmate is exempt -
 # see the else branch below): refuse to spawn into a project the captain is
 # actively hand-editing through a live Cawldron session, unless overridden.
-# bin/fm-cawldron-lock-lib.sh owns the marker format; bin/fm-cawldron-lock.sh is
-# the only writer. Informational-only in the batch loop above: this function
+# bin/fm-cawldron-lock-lib.sh owns the marker format and the gate itself (shared
+# with bin/fm-promote.sh); bin/fm-cawldron-lock.sh is the only writer.
+# Informational-only in the batch loop above: this function
 # exits 1, which the batch loop already reports as "FAILED to spawn" and skips,
 # continuing the rest of the pairs - no separate per-pair check needed there.
 fm_cawldron_spawn_gate() {
-  local proj_abs=$1 proj_name marker rc detail
-  proj_name=$(basename "$proj_abs")
-  marker=$(fm_cawldron_lock_path "$STATE" "$proj_name")
-  rc=0
-  fm_cawldron_lock_read "$marker" || rc=$?
-  # Only a missing marker (rc 1) means unlocked. An unreadable marker (rc 2 -
-  # truncated or corrupt write) is still a lock: a damaged state file must never
-  # silently disarm this gate.
-  [ "$rc" -ne 1 ] || return 0
-  if [ "$rc" -eq 0 ]; then
-    detail=$(fm_cawldron_lock_detail ok "$FM_CAWL_SINCE" "$FM_CAWL_NOTE")
-  else
-    detail=$(fm_cawldron_lock_detail corrupt '' '')
-  fi
-  # An override is the one case a later collision with the captain's unlanded
-  # live edits most needs a trace, and nothing is recorded in state/<id>.meta -
-  # so say so on the way past.
-  if [ "$FORCE_LOCKED_EFFECTIVE" -ne 0 ]; then
-    echo "warning: $proj_name is Cawldron-locked ($detail); spawning anyway per --force-locked" >&2
-    return 0
-  fi
-  {
-    printf '●%s\n' "$FM_CAWLDRON_RULE"
-    printf '●  CAWLDRON LOCK ACTIVE - %s\n' "$proj_name"
-    printf '●  %s\n' "$detail"
-    printf "●  A background crew may collide with the captain's unlanded live Cawldron edits.\n"
-    printf '●  Pass --force-locked (or set FM_SPAWN_FORCE_LOCKED=1) to spawn anyway.\n'
-    printf '●%s\n' "$FM_CAWLDRON_RULE"
-  } >&2
-  echo "error: spawn refused: $proj_name is Cawldron-locked ($detail); pass --force-locked to override" >&2
-  return 1
+  fm_cawldron_gate "$STATE" "$1" "$FORCE_LOCKED_EFFECTIVE" spawn
 }
 
 if [ "$KIND" = secondmate ]; then

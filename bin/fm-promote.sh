@@ -24,13 +24,21 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 FORCE_LOCKED=0
 POS=()
+USAGE='usage: fm-promote.sh <task-id> [--force-locked]'
 for a in "$@"; do
   case "$a" in
     --force-locked) FORCE_LOCKED=1 ;;
-    *) POS+=("$a") ;;
+    # A misspelled flag or a stray extra positional must not be silently
+    # swallowed: "--forc-locked" would otherwise be dropped and the promote
+    # would quietly refuse under a lock the captain meant to override.
+    -*) echo "error: unknown argument: $a" >&2; echo "$USAGE" >&2; exit 1 ;;
+    *)
+      [ "${#POS[@]}" -eq 0 ] || { echo "error: unexpected extra argument: $a" >&2; echo "$USAGE" >&2; exit 1; }
+      POS+=("$a")
+      ;;
   esac
 done
-ID=${POS[0]:?usage: fm-promote.sh <task-id> [--force-locked]}
+ID=${POS[0]:?$USAGE}
 FORCE_LOCKED_EFFECTIVE=0
 [ "$FORCE_LOCKED" -eq 0 ] || FORCE_LOCKED_EFFECTIVE=1
 [ "${FM_SPAWN_FORCE_LOCKED:-0}" != 1 ] || FORCE_LOCKED_EFFECTIVE=1
@@ -39,36 +47,12 @@ META="$STATE/$ID.meta"
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
 grep -qx 'kind=scout' "$META" || { echo "error: task $ID is not a scout task (kind=scout not in meta)" >&2; exit 1; }
 
-# Cawldron coordination lock gate, mirroring bin/fm-spawn.sh's ship/scout check
-# (see its fm_cawldron_spawn_gate for the shared rationale): a corrupt marker
-# (rc 2) still gates, only a missing marker (rc 1) means unlocked.
+# Cawldron coordination lock gate. The same shared helper bin/fm-spawn.sh's
+# ship/scout check uses, so the locked/unlocked test and the refusal wording have
+# exactly one owner (bin/fm-cawldron-lock-lib.sh); only the action phrase differs.
 proj_field=$(grep '^project=' "$META" | head -1 | cut -d= -f2- || true)
 if [ -n "$proj_field" ]; then
-  proj_name=$(basename "$proj_field")
-  marker=$(fm_cawldron_lock_path "$STATE" "$proj_name")
-  rc=0
-  fm_cawldron_lock_read "$marker" || rc=$?
-  if [ "$rc" -ne 1 ]; then
-    if [ "$rc" -eq 0 ]; then
-      detail=$(fm_cawldron_lock_detail ok "$FM_CAWL_SINCE" "$FM_CAWL_NOTE")
-    else
-      detail=$(fm_cawldron_lock_detail corrupt '' '')
-    fi
-    if [ "$FORCE_LOCKED_EFFECTIVE" -ne 0 ]; then
-      echo "warning: $proj_name is Cawldron-locked ($detail); promoting anyway per --force-locked" >&2
-    else
-      {
-        printf '●%s\n' "$FM_CAWLDRON_RULE"
-        printf '●  CAWLDRON LOCK ACTIVE - %s\n' "$proj_name"
-        printf '●  %s\n' "$detail"
-        printf "●  Promoting %s to ship may collide with the captain's unlanded live Cawldron edits.\n" "$ID"
-        printf '●  Pass --force-locked (or set FM_SPAWN_FORCE_LOCKED=1) to promote anyway.\n'
-        printf '●%s\n' "$FM_CAWLDRON_RULE"
-      } >&2
-      echo "error: promote refused: $proj_name is Cawldron-locked ($detail); pass --force-locked to override" >&2
-      exit 1
-    fi
-  fi
+  fm_cawldron_gate "$STATE" "$proj_field" "$FORCE_LOCKED_EFFECTIVE" promote || exit 1
 fi
 
 TMP="$META.tmp"
