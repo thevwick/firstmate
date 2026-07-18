@@ -122,6 +122,70 @@ test_node_version_matches() {
   pass "node_version_matches accepts a requested prefix of the actual version"
 }
 
+# fm_fake_fnm_downgrade <dir>: a fake fnm+node modelling THE SMM BUG. `fnm env`
+# switches the shell to fnm's DEFAULT node (v20.18.3) by exporting a marker; the
+# fake node reports v20.18.3 once that marker is set, else the ambient v24.16.0.
+# `fnm use <v>` ALWAYS fails (fnm has no node installed here), exactly like a
+# machine where node 24 was installed via nvm, not fnm. So the ONLY way to keep
+# node at the ambient v24.16.0 is to never eval fnm env - which is precisely what
+# switch_node must do when the ambient node already satisfies the request.
+fm_fake_fnm_downgrade() {
+  local dir=$1 fakebin
+  fakebin=$(fm_fakebin "$dir")
+  cat > "$fakebin/fnm" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  env) printf 'export FM_TEST_FNM_DOWNGRADED=1\n' ;;   # env drops us to fnm default
+  use) echo "error: Requested version is not currently installed" >&2; exit 1 ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/fnm"
+  cat > "$fakebin/node" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then
+  if [ "${FM_TEST_FNM_DOWNGRADED:-0}" = 1 ]; then printf 'v20.18.3\n'; else printf 'v24.16.0\n'; fi
+  exit 0
+fi
+exit 1
+SH
+  chmod +x "$fakebin/node"
+  printf '%s\n' "$fakebin"
+}
+
+test_switch_node_keeps_ambient_node_when_it_already_satisfies() {
+  # THE SMM DEPS FIX: when the ambient node already satisfies the requested
+  # version, switch_node must NOT touch fnm at all - because `fnm env` would drop
+  # the shell to fnm's default (older) node and break an engine-strict package
+  # manager (pnpm needs node >= 22.13). Here the ambient node is v24.16.0, the
+  # request is node 24, and fnm has no node 24: the only correct behavior is to
+  # keep v24.16.0.
+  local d="$TMP_ROOT/switch-keep-ambient" out
+  mkdir -p "$d"
+  unset FM_TEST_FNM_DOWNGRADED
+  PATH="$(fm_fake_fnm_downgrade "$d"):$PATH"
+  out=$(switch_node "24.16.0" 2>&1)
+  [ "$(node --version)" = "v24.16.0" ] || fail "switch_node must keep the ambient node 24 (not downgrade to fnm's default 20)"
+  assert_not_contains "$out" "WARNING" "keeping an already-satisfying ambient node must not warn"
+  pass "switch_node keeps the ambient node when it already satisfies the request (the SMM deps fix: no fnm-env downgrade)"
+}
+
+test_switch_node_restores_ambient_when_fnm_cannot_provide() {
+  # When the ambient node does NOT satisfy the request AND fnm cannot provide the
+  # version, switch_node must fall back to the ambient node, never leave the shell
+  # on fnm's (worse) default. Ambient here is v24.16.0; request node 25 (fnm
+  # lacks it). Result: still on v24.16.0, with a loud warning.
+  local d="$TMP_ROOT/switch-restore-ambient" out
+  mkdir -p "$d"
+  unset FM_TEST_FNM_DOWNGRADED
+  PATH="$(fm_fake_fnm_downgrade "$d"):$PATH"
+  out=$(switch_node "25.0.0" 2>&1)
+  [ "$(node --version)" = "v24.16.0" ] || fail "a failed fnm switch must restore the ambient node, not leave fnm's default 20"
+  assert_contains "$out" "WARNING" "a version fnm cannot provide must warn"
+  assert_contains "$out" "25" "the warning should name the requested version"
+  pass "switch_node restores the ambient node (not fnm's default) when fnm cannot provide the requested version"
+}
+
 test_switch_node_evals_fnm_env_before_use() {
   local d="$TMP_ROOT/switch-ok" out
   mkdir -p "$d"
@@ -363,6 +427,138 @@ test_target_platform_token() {
   pass "target_platform_token maps platforms to Mach-O build tokens"
 }
 
+# --- simulator arch resolution: native arm64 vs x86_64+Rosetta --------------
+#
+# resolve_sim_arch decides the --sim build arch from the app's slices plus
+# Rosetta availability. These tests pin the host to arm64 (the Apple-Silicon
+# case the fix targets) by overriding host_arch, and stub Rosetta with
+# FM_MOBILE_LAB_FORCE_ROSETTA, so they are deterministic on any CI host.
+
+# with_arm64_host: run a command with host_arch forced to arm64 (restored after).
+# host_arch is invoked indirectly by the command run through "$@" (resolve_sim_arch
+# reads it), which shellcheck cannot see, hence the SC2329 suppression.
+with_arm64_host() {
+  local saved; saved=$(declare -f host_arch)
+  # shellcheck disable=SC2329  # invoked indirectly by "$@" (resolve_sim_arch calls it)
+  host_arch() { printf 'arm64\n'; }
+  "$@"; local rc=$?
+  eval "$saved"
+  return $rc
+}
+
+test_resolve_sim_arch_native_arm64() {
+  # A framework WITH an arm64-simulator slice -> native arm64 sim build, no
+  # Rosetta needed. arch field is arm64.
+  local d="$TMP_ROOT/simarch-native"
+  mkdir -p "$d/ios"
+  fm_make_fixture_fw "$d" libgood "x86_64 arm64" \
+    "vtool:x86_64:IOSSIMULATOR" "vtool:arm64:IOSSIMULATOR"
+  local out rc arch
+  out=$(PATH="$(fm_slice_fakebin "$d"):$PATH" FM_MOBILE_LAB_FORCE_ROSETTA=1 \
+        with_arm64_host resolve_sim_arch "$d"); rc=$?
+  expect_code 0 "$rc" "an arm64-simulator-capable app resolves a viable sim arch"
+  arch=${out%%$'\t'*}
+  [ "$arch" = "arm64" ] || fail "native arm64-sim app must resolve arch arm64, got: $arch"
+  assert_contains "$out" "native" "the reason should note the native path"
+  pass "resolve_sim_arch picks native arm64 when an arm64-simulator slice exists"
+}
+
+test_resolve_sim_arch_x86_rosetta() {
+  # The FFmpeg case: x86_64-sim + arm64-device slices, NO arm64-sim. With Rosetta
+  # available, resolve_sim_arch must choose x86_64 (the Rosetta path), NOT block.
+  local d="$TMP_ROOT/simarch-rosetta"
+  mkdir -p "$d/ios"
+  fm_make_fixture_fw "$d" libavcodec "x86_64 arm64" \
+    "vtool:x86_64:IOSSIMULATOR" "vtool:arm64:IOS"
+  local out rc arch
+  out=$(PATH="$(fm_slice_fakebin "$d"):$PATH" FM_MOBILE_LAB_FORCE_ROSETTA=1 \
+        with_arm64_host resolve_sim_arch "$d"); rc=$?
+  expect_code 0 "$rc" "an x86_64-sim FFmpeg app with Rosetta must be viable on --sim"
+  arch=${out%%$'\t'*}
+  [ "$arch" = "x86_64" ] || fail "FFmpeg sim app with Rosetta must resolve arch x86_64, got: $arch"
+  assert_contains "$out" "Rosetta" "the reason should note the Rosetta path"
+  pass "resolve_sim_arch picks x86_64 via Rosetta for an FFmpeg app (no arm64-sim slice) when Rosetta is available"
+}
+
+test_resolve_sim_arch_x86_no_rosetta_fails() {
+  # SAME FFmpeg app, but Rosetta NOT available: no viable sim arch -> return 1,
+  # empty arch field, and a reason that names Rosetta and steers to --device.
+  local d="$TMP_ROOT/simarch-norosetta"
+  mkdir -p "$d/ios"
+  fm_make_fixture_fw "$d" libavcodec "x86_64 arm64" \
+    "vtool:x86_64:IOSSIMULATOR" "vtool:arm64:IOS"
+  local out rc arch reason
+  out=$(PATH="$(fm_slice_fakebin "$d"):$PATH" FM_MOBILE_LAB_FORCE_ROSETTA=0 \
+        with_arm64_host resolve_sim_arch "$d"); rc=$?
+  expect_code 1 "$rc" "an x86_64-only sim app with no Rosetta has no viable sim arch"
+  arch=${out%%$'\t'*}
+  [ -z "$arch" ] || fail "a non-viable sim resolution must leave the arch field empty, got: $arch"
+  reason=${out#*$'\t'}
+  assert_contains "$reason" "Rosetta" "the reason must explain Rosetta is unavailable"
+  assert_contains "$reason" "--device" "the reason must steer to --device"
+  pass "resolve_sim_arch fails (no viable arch) for an x86_64-only sim app when Rosetta is unavailable, steering to --device"
+}
+
+test_resolve_sim_arch_no_sim_slice_fails() {
+  # An app whose only slice is arm64-device (no sim slice at all) has no viable
+  # sim arch regardless of Rosetta.
+  local d="$TMP_ROOT/simarch-nosim"
+  mkdir -p "$d/ios"
+  fm_make_fixture_fw "$d" libonlydev "arm64" "vtool:arm64:IOS"
+  local out rc arch
+  out=$(PATH="$(fm_slice_fakebin "$d"):$PATH" FM_MOBILE_LAB_FORCE_ROSETTA=1 \
+        with_arm64_host resolve_sim_arch "$d"); rc=$?
+  expect_code 1 "$rc" "a device-only app has no viable sim arch even with Rosetta"
+  arch=${out%%$'\t'*}
+  [ -z "$arch" ] || fail "no-sim-slice app must leave the arch field empty, got: $arch"
+  pass "resolve_sim_arch fails for an app with no simulator slice at all"
+}
+
+test_sim_arch_extra_args() {
+  # x86_64 forces ARCHS=x86_64 via --extra-params; arm64 (native) forces nothing.
+  local x86 arm
+  x86=$(sim_arch_extra_args x86_64)
+  assert_contains "$x86" "--extra-params" "x86_64 must pass extra-params to xcodebuild"
+  assert_contains "$x86" "ARCHS=x86_64" "x86_64 must force ARCHS=x86_64"
+  assert_contains "$x86" "ONLY_ACTIVE_ARCH=NO" "x86_64 must disable ONLY_ACTIVE_ARCH so pods build x86_64 too"
+  arm=$(sim_arch_extra_args arm64)
+  [ -z "$arm" ] || fail "a native arm64 sim build must add no arch-forcing args, got: $arm"
+  pass "sim_arch_extra_args forces ARCHS=x86_64 for the Rosetta path and nothing for native arm64"
+}
+
+test_build_run_command_appends_extra_args() {
+  # The Rosetta path's extra args must be appended verbatim after the port, so
+  # the produced command forces x86_64 while staying command-agnostic.
+  local got exp
+  got=$(build_run_command "react-native run-ios --scheme 'Dashpivot Dev'" \
+        --udid ABC123 8113 "--extra-params 'ARCHS=x86_64 ONLY_ACTIVE_ARCH=NO'")
+  exp="react-native run-ios --scheme 'Dashpivot Dev' --udid 'ABC123' --port 8113 --extra-params 'ARCHS=x86_64 ONLY_ACTIVE_ARCH=NO'"
+  [ "$got" = "$exp" ] || fail "extra-args must be appended after the port:\n  got: $got\n  exp: $exp"
+  # And the whole x86_64 assembly straight from sim_arch_extra_args must round-trip.
+  local got2
+  got2=$(build_run_command "react-native run-ios" --udid U 8113 "$(sim_arch_extra_args x86_64)")
+  assert_contains "$got2" "ARCHS=x86_64" "the x86_64 sim command must carry ARCHS=x86_64"
+  pass "build_run_command appends the arch-forcing extra args for the Rosetta sim path"
+}
+
+test_sim_runtime_runs_x86() {
+  # iOS <= 18 runs x86_64 under Rosetta; iOS 26+ does not (Apple dropped it).
+  sim_runtime_runs_x86 "18.5" || fail "iOS 18.5 must be x86-capable"
+  sim_runtime_runs_x86 "16.0" || fail "iOS 16.0 must be x86-capable"
+  sim_runtime_runs_x86 "18" || fail "bare major 18 must be x86-capable"
+  sim_runtime_runs_x86 "26.4" && fail "iOS 26.4 must NOT be x86-capable"
+  sim_runtime_runs_x86 "26.5" && fail "iOS 26.5 must NOT be x86-capable"
+  sim_runtime_runs_x86 "" && fail "an empty/garbage version must not be treated as x86-capable"
+  pass "sim_runtime_runs_x86 treats iOS <= 18 as x86-capable and iOS 26+ (and blanks) as not"
+}
+
+test_rosetta_available_override() {
+  # The test override must be honoured so the probe is deterministic in CI.
+  FM_MOBILE_LAB_FORCE_ROSETTA=1 rosetta_available || fail "FORCE_ROSETTA=1 must report available"
+  FM_MOBILE_LAB_FORCE_ROSETTA=0 rosetta_available && fail "FORCE_ROSETTA=0 must report unavailable"
+  pass "rosetta_available honours the FM_MOBILE_LAB_FORCE_ROSETTA test override"
+}
+
 # --- build-status file emission (the console contract) ----------------------
 
 test_status_file_is_contract_shaped() {
@@ -405,7 +601,9 @@ test_status_file_is_contract_shaped() {
   [ "$(jq -r '.started_epoch' "$f")" = "1784300000" ] || fail "started_epoch"
   [ "$(jq -r '.updated_epoch | type' "$f")" = "number" ] || fail "updated_epoch is a number"
   [ "$(jq -r '.phase_started_epoch | type' "$f")" = "number" ] || fail "phase_started_epoch is a number"
-  pass "status_write emits a contract-shaped JSON with correct types, a real null percent, and lands under firstmate's state dir with an absolute logfile"
+  # metro_running is a real JSON boolean (this port is not bound in the test, so false).
+  [ "$(jq -r '.metro_running | type' "$f")" = "boolean" ] || fail "metro_running must be a JSON boolean"
+  pass "status_write emits a contract-shaped JSON with correct types, a real null percent, a boolean metro_running, and lands under firstmate's state dir with an absolute logfile"
 }
 
 test_status_file_path_uses_fm_state_dir_not_lab_home() {
@@ -748,6 +946,46 @@ test_status_file_carries_pid() {
   pass "status_write records the owning build pid in the contract file"
 }
 
+test_status_file_emits_metro_running() {
+  # The console contract includes a metro_running boolean, refreshed from a real
+  # liveness probe of the slot's port on every write. A fake curl stands in for
+  # Metro answering on the port so the probe is deterministic in CI.
+  local labhome="$TMP_ROOT/lab-metro" fmhome="$TMP_ROOT/fm-home-metro" fakebin
+  STATE_DIR="$labhome/state"; mkdir -p "$STATE_DIR"
+  FM_STATE_DIR="$fmhome/state"; mkdir -p "$FM_STATE_DIR"
+  fakebin=$(fm_fakebin "$labhome")
+  # Fake curl: answers packager-status:running ONLY for port 8299, so the same
+  # metro_running() logic is exercised for both the up and down cases by port.
+  cat > "$fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in *localhost:8299/status*) echo "packager-status:running"; exit 0 ;; esac; done
+exit 7
+SH
+  chmod +x "$fakebin/curl"
+  # shellcheck disable=SC2034
+  {
+    ST_SLOT="m0" ST_REPO="r" ST_BRANCH="b" ST_PLATFORM="sim" ST_TARGET="t"
+    ST_RUN_COMMAND="c" ST_STATUS="running" ST_ERROR="null"
+    ST_STARTED=1 ST_PERCENT="null" ST_LOGFILE="l" ST_PHASE_TOTAL=7
+    ST_PHASE="compile" ST_PHASE_INDEX=5 ST_PID=1
+  }
+  local f="$FM_STATE_DIR/lab-build-m0.json"
+  # Metro UP: port 8299 answers -> metro_running true (a real JSON boolean).
+  # ST_PORT is read by the sourced status_write (curl-probed), which shellcheck
+  # cannot see, hence the SC2034 suppression on these assignments.
+  # shellcheck disable=SC2034
+  ST_PORT=8299
+  PATH="$fakebin:$PATH" status_write
+  [ "$(jq -r '.metro_running' "$f")" = "true" ] || fail "metro_running must be true when Metro answers on the port"
+  [ "$(jq -r '.metro_running | type' "$f")" = "boolean" ] || fail "metro_running must be a JSON boolean, not a string"
+  # Metro DOWN: a different port does not answer -> metro_running false.
+  # shellcheck disable=SC2034
+  ST_PORT=8300
+  PATH="$fakebin:$PATH" status_write
+  [ "$(jq -r '.metro_running' "$f")" = "false" ] || fail "metro_running must be false when nothing answers on the port"
+  pass "status_write emits a real metro_running boolean refreshed from a live port probe"
+}
+
 test_stale_running_with_dead_pid_is_reaped() {
   # A non-terminal "running" file whose recorded pid is no longer alive is a
   # zombie: status_stale_if_running must rewrite it failed so a new build never
@@ -1086,6 +1324,8 @@ test_detect_pkgmgr
 test_pnpm_wins_over_npm
 test_detect_node_version
 test_node_version_matches
+test_switch_node_keeps_ambient_node_when_it_already_satisfies
+test_switch_node_restores_ambient_when_fnm_cannot_provide
 test_switch_node_evals_fnm_env_before_use
 test_switch_node_warns_loudly_on_failed_switch
 test_switch_node_noop_without_fnm
@@ -1103,6 +1343,14 @@ test_slice_gate_allows_universal_sim
 test_slice_gate_no_frameworks_passes
 test_slice_gate_allows_when_lipo_absent
 test_target_platform_token
+test_resolve_sim_arch_native_arm64
+test_resolve_sim_arch_x86_rosetta
+test_resolve_sim_arch_x86_no_rosetta_fails
+test_resolve_sim_arch_no_sim_slice_fails
+test_sim_arch_extra_args
+test_build_run_command_appends_extra_args
+test_sim_runtime_runs_x86
+test_rosetta_available_override
 test_status_file_is_contract_shaped
 test_status_file_path_uses_fm_state_dir_not_lab_home
 test_fm_state_dir_respects_fm_state_override
@@ -1124,6 +1372,7 @@ test_missing_run_command_errors
 test_run_wrapped_build_resolves_repo_local_binary
 test_run_wrapped_build_resolves_any_configured_cli_generically
 test_status_file_carries_pid
+test_status_file_emits_metro_running
 test_stale_running_with_dead_pid_is_reaped
 test_stale_running_with_live_pid_is_left
 test_stale_terminal_file_is_left
