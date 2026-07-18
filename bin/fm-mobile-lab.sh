@@ -31,8 +31,15 @@
 #   slots/<repo>-<N>/                              git worktree of the projects/ clone (warm)
 #   state/slots.json                               slot -> repo+branch, Metro port, last-used
 #   state/build-<slot>.log                         full streamed build output (tee'd)
-#   state/lab-build-<slot>.json                    machine-readable build status (the contract)
 #   state/<slot>.build.lock/                       per-slot build lock (mkdir-based)
+#
+# The ONE exception to "everything lives under ~/.fm-mobile-lab": the
+# console-facing build-status file, state/lab-build-<slot>.json (the
+# contract), is written under FIRSTMATE'S OWN state dir ($FM_HOME/state, via
+# FM_STATE_OVERRIDE like every other bin/ script), never the lab's private
+# home, because that is what bin/fm-console/src/io.js's readLabBuildStatuses
+# scans. Its logfile field is an absolute path into the lab's own state dir,
+# since the actual build log does not live alongside it.
 #
 # There is NO app/native-artifact cache. The audit proved a fingerprint-keyed
 # `.app` cache can serve a wrong-arch binary (it cached an x86_64 sim build and
@@ -62,6 +69,16 @@ CACHE_DIR="$LAB_HOME/cache"
 SLOTS_DIR="$LAB_HOME/slots"
 STATE_DIR="$LAB_HOME/state"
 SLOTS_STATE="$STATE_DIR/slots.json"
+
+# FM_STATE_DIR is firstmate's OWN state dir, resolved the same way every other
+# bin/ script resolves it (FM_STATE_OVERRIDE, else $FM_HOME/state). This is
+# NOT the lab's private LAB_HOME/state: it is where the console-facing
+# build-status contract file (state/lab-build-<slot>.json) must be written,
+# because bin/fm-console/src/io.js's readLabBuildStatuses scans FM_HOME's own
+# state/ dir, and data/mobile-lab-status-contract.md specifies that path. The
+# lab's OTHER artifacts (slots.json, the build lock, metro logs, the build
+# log) stay private under STATE_DIR; only the contract file crosses over.
+FM_STATE_DIR="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 # Minimum free disk (GiB) required before a multi-GB clone/install. The machine
 # this ships to can sit near-full; refuse rather than fill the disk. Override
@@ -474,7 +491,7 @@ slice_gate() {
 # --- state (slots.json) ------------------------------------------------------
 
 ensure_dirs() {
-  mkdir -p "$CACHE_DIR/node_modules" "$SLOTS_DIR" "$STATE_DIR"
+  mkdir -p "$CACHE_DIR/node_modules" "$SLOTS_DIR" "$STATE_DIR" "$FM_STATE_DIR"
   [ -f "$SLOTS_STATE" ] || printf '{"slots":{}}\n' > "$SLOTS_STATE"
 }
 
@@ -595,7 +612,9 @@ release_build_lock() {
 
 # --- build-status file (the console contract) -------------------------------
 #
-# state/lab-build-<slot>.json per data/mobile-lab-status-contract.md. Written
+# FM_STATE_DIR/lab-build-<slot>.json per data/mobile-lab-status-contract.md:
+# firstmate's OWN state dir, not the lab's private STATE_DIR, because that is
+# what bin/fm-console/src/io.js's readLabBuildStatuses scans. Written
 # atomically (temp + mv) on every phase transition and at least every
 # BUILD_HEARTBEAT_SECS during a long phase. The console reads it; do not deviate
 # from the contract shape.
@@ -609,9 +628,11 @@ ST_RUN_COMMAND='' ST_PORT=0 ST_PHASE='' ST_PHASE_INDEX=0 ST_PHASE_TOTAL=7
 ST_PERCENT='null' ST_STATUS='running' ST_STARTED=0 ST_PHASE_STARTED=0
 ST_MESSAGE='' ST_LOGFILE='' ST_ERROR='null'
 
-# status_file_path <slot-name>: the status file path for a slot.
+# status_file_path <slot-name>: the console-facing status file path for a slot,
+# under firstmate's OWN state dir (see FM_STATE_DIR above), not the lab's
+# private STATE_DIR.
 status_file_path() {
-  printf '%s/lab-build-%s.json\n' "$STATE_DIR" "$1"
+  printf '%s/lab-build-%s.json\n' "$FM_STATE_DIR" "$1"
 }
 
 # status_write: write the current status globals to the slot's status file
@@ -623,7 +644,8 @@ status_write() {
   local out tmp now
   out=$(status_file_path "$ST_SLOT")
   now=$(date +%s)
-  tmp=$(mktemp "$STATE_DIR/lab-build-$ST_SLOT.json.XXXXXX")
+  mkdir -p "$FM_STATE_DIR"
+  tmp=$(mktemp "$FM_STATE_DIR/lab-build-$ST_SLOT.json.XXXXXX")
   if jq -n \
     --argjson schema 1 \
     --arg slot "$ST_SLOT" \
@@ -892,7 +914,12 @@ run_build() {
   ST_SLOT=$name ST_REPO=$repo ST_BRANCH=$branch ST_PLATFORM=$platform
   ST_RUN_COMMAND=$run_cmd ST_PORT=$port ST_STATUS='running' ST_ERROR='null'
   ST_STARTED=$now ST_PERCENT='null' ST_TARGET='(resolving)'
-  ST_LOGFILE="state/build-$name.log"
+  # Absolute path: the log itself stays under the lab's own private STATE_DIR
+  # (LAB_HOME/state), but the status file it is NAMED FROM now lives under
+  # firstmate's state dir, so a bare relative "state/build-<slot>.log" would
+  # resolve wrong from there. An absolute path is unambiguous for both the
+  # console and a captain opening it directly.
+  ST_LOGFILE="$STATE_DIR/build-$name.log"
   ST_PHASE_TOTAL=7
 
   # Take the per-slot build lock around the whole pods+build+install sequence.
@@ -1145,18 +1172,25 @@ run_wrapped_build() {
 
   status_phase pods 4 "starting wrapped build: $full"
   info "running: $full"
-  info "log: state/build-$name.log"
+  info "log: $logfile"
 
   # Pipe the wrapped command's combined stdout+stderr through the reader. The
   # fixed Metro port is baked into the environment (RCT_METRO_PORT) so the built
   # binary asks this slot's port for its bundle. PIPESTATUS[0] captures the
   # build's own exit code independent of the reader.
-  ( cd "$slot" && RCT_METRO_PORT="$port" exec bash -c "$full" ) 2>&1 \
+  #
+  # run_command's own CLI (react-native, and npx expo after the Expo switch) is
+  # a repo-local binary at <slot>/node_modules/.bin, NOT on the global PATH.
+  # Prepending it here resolves ANY configured run_command generically, with
+  # zero special-casing per CLI, and inherits the current shell's PATH so the
+  # fnm-switched node from switch_node (called earlier in run_build) is what
+  # actually runs the command, not a stale ambient node.
+  ( cd "$slot" && PATH="$slot/node_modules/.bin:$PATH" RCT_METRO_PORT="$port" exec bash -c "$full" ) 2>&1 \
     | stream_build_output "$logfile"
   rc=${PIPESTATUS[0]}
 
   if [ "$rc" -ne 0 ]; then
-    status_fail "wrapped run_command failed (exit $rc): $full - see log at state/build-$name.log"
+    status_fail "wrapped run_command failed (exit $rc): $full - see log at $logfile"
     err "build failed (exit $rc). Full log: $logfile"
     die "wrapped run_command exited $rc; see $logfile"
   fi
