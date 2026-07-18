@@ -5,7 +5,7 @@
 // fm-send.sh for the command bridge (see bridge.js).
 
 import { execFile } from 'node:child_process';
-import { stat } from 'node:fs/promises';
+import { stat, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 // Promisified execFile with a bounded timeout so a slow child never wedges the
@@ -138,6 +138,52 @@ export async function readWorktreeSize(worktreePath) {
   }
 }
 
+// Default TTL for WorktreeSizeCache: a multi-GB worktree does not change size
+// meaningfully within a du cadence's few passes, so a fresh du -sk walk per
+// worktree is only actually needed this often.
+export const WORKTREE_SIZE_TTL_MS = 60000;
+
+// Per-worktree du -sk cache with a global in-flight guard, the fix for the
+// du-drain bug: app.js used to fire an unguarded du per worktree on every
+// DU_INTERVAL_MS tick with no protection against a slow/huge (multi-GB)
+// worktree still being walked when the next tick landed, so passes overlapped
+// and stacked - confirmed to starve an xcodebuild link step
+// (data/mobile-lab-audit-a7/report.md, "du drain"). This cache fixes both
+// halves of that: a TTL means most ticks reuse a cached size instead of
+// walking at all, and the in-flight flag means even a cache-miss walk that
+// outlives one interval is never joined by a second overlapping walk for the
+// same (or any other) worktree - get() just returns the still-fresh-enough
+// cached value (or null) while one is in flight, rather than queuing more du
+// processes on top of a system that is already behind.
+export function createWorktreeSizeCache({ ttlMs = WORKTREE_SIZE_TTL_MS, measure = readWorktreeSize } = {}) {
+  const cache = new Map(); // worktreePath -> { bytes, atMs }
+  let inFlight = false;
+
+  return {
+    // Resolve a worktree's size. Never overlaps with another in-flight du
+    // call from this cache (returns the last cached value, or null, instead
+    // of starting a second walk); reuses a cached value within ttlMs instead
+    // of re-walking. Pass nowMs for deterministic tests.
+    async get(worktreePath, nowMs = Date.now()) {
+      if (!worktreePath) return null;
+      const cached = cache.get(worktreePath);
+      if (cached && nowMs - cached.atMs < ttlMs) return cached.bytes;
+      if (inFlight) return cached ? cached.bytes : null;
+      inFlight = true;
+      try {
+        const bytes = await measure(worktreePath);
+        cache.set(worktreePath, { bytes, atMs: nowMs });
+        return bytes;
+      } finally {
+        inFlight = false;
+      }
+    },
+    // Test/inspection hooks only - not used by app.js's normal path.
+    isInFlight: () => inFlight,
+    peek: (worktreePath) => cache.get(worktreePath)?.bytes ?? null,
+  };
+}
+
 // Parse a full https://github.com/<owner>/<repo>/pull/<n> URL into its parts,
 // mirroring bin/fm-pr-merge.sh's parse_pr_url. gh-axi's `pr checks` takes a PR
 // NUMBER plus --repo <owner>/<repo>, not a URL - passing a URL fails with
@@ -213,6 +259,43 @@ export async function readFirstmateActivity(bin, home, target, lines) {
   } catch (e) {
     return { text: null, error: e.message };
   }
+}
+
+// Read every fm-mobile-lab build-status file (state/lab-build-<slot>.json,
+// per data/mobile-lab-status-contract.md v1) in the home's state/ dir. The lab
+// writes these atomically (temp file + mv), but the console must still treat
+// each read defensively: a slot with no file simply is not returned (idle),
+// and a present-but-malformed/partial file returns a raw-text entry with
+// parseError set instead of throwing, so one bad file never blanks the whole
+// section. Returns an array of { slot, raw, parseError } - state.js turns
+// each into a card, defaulting missing fields there rather than here, so this
+// function stays a thin, defensive read and nothing more.
+export async function readLabBuildStatuses(home) {
+  const dir = path.join(home, 'state');
+  let entries;
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return [];
+  }
+  const files = entries.filter((f) => /^lab-build-.+\.json$/.test(f));
+  const results = [];
+  for (const file of files) {
+    const slotMatch = file.match(/^lab-build-(.+)\.json$/);
+    const slot = slotMatch ? slotMatch[1] : file;
+    try {
+      const text = await readFile(path.join(dir, file), 'utf8');
+      try {
+        const raw = JSON.parse(text);
+        results.push({ slot, raw, parseError: null });
+      } catch (e) {
+        results.push({ slot, raw: null, parseError: e.message });
+      }
+    } catch (e) {
+      results.push({ slot, raw: null, parseError: e.message });
+    }
+  }
+  return results;
 }
 
 export { run };

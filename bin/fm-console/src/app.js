@@ -48,6 +48,8 @@ import {
   OTHER_HARNESS_ACCENT,
   CLAUDE_MARK,
   OTHER_HARNESS_MARK,
+  LAB_PHASES,
+  LAB_PHASE_LABELS,
 } from './constants.js';
 import {
   buildCard,
@@ -58,6 +60,7 @@ import {
   computeRowBudget,
   inFlightContentRowCount,
   firstmateActivityLines,
+  buildLabBuildCards,
 } from './state.js';
 import {
   QUICK_ACTIONS,
@@ -70,11 +73,12 @@ import { humanBytes, humanDuration, truncate } from './format.js';
 import {
   readSnapshot,
   readDisk,
-  readWorktreeSize,
   readPrChecks,
   readFirstmateActivity,
   fileMtimeSecs,
   fileExists,
+  createWorktreeSizeCache,
+  readLabBuildStatuses,
 } from './io.js';
 import { resolveSupervisor, sendCommand } from './bridge.js';
 
@@ -522,6 +526,191 @@ function InFlightSection({ grouped, selectedId, width, flexGrow, height, maxRows
   });
 }
 
+// Terminal rows one active/recent MOBILE LAB build card draws: header (repo
+// branch + target/platform), phase tracker, build meter, and a
+// timers+message+heartbeat row. Mirrors the CARD_ROW_HEIGHT discipline
+// elsewhere in this file - Ink has no scrolling, so this must match
+// MobileLabCard's actual row count exactly or capRows' row-budget accounting
+// silently drifts from what gets drawn.
+const LAB_CARD_ROW_HEIGHT = 4;
+
+// Compact terminal color per state.js's buildLabBuildCard heartbeat field.
+const LAB_HEARTBEAT_COLORS = { green: 'greenBright', amber: 'yellowBright', red: 'redBright' };
+
+// Phase tracker: the 7 canonical phases as a compact stepper, current phase
+// highlighted, completed phases checked. A phase name outside the known set
+// (a forward-incompatible lab build) renders its raw string in place of the
+// tracker rather than silently dropping it - the console degrades gracefully
+// per the contract's hard rule, it does not hide unrecognized-but-present data.
+function PhaseTracker({ card, width }) {
+  if (!card.phaseKnown) {
+    const label = card.phase ? `phase: ${card.phase}` : 'phase: unknown';
+    const suffix = card.phaseIndex && card.phaseTotal ? ` (${card.phaseIndex}/${card.phaseTotal})` : '';
+    return h(Text, { dimColor: true, wrap: 'truncate-end' }, truncate(`${label}${suffix}`, width));
+  }
+  const currentIdx = LAB_PHASES.indexOf(card.phase);
+  const nodes = LAB_PHASES.flatMap((p, i) => {
+    const label = LAB_PHASE_LABELS[p] || p;
+    const isCurrent = i === currentIdx;
+    const isDone = currentIdx >= 0 && i < currentIdx;
+    const icon = isDone ? figures.tick : isCurrent ? figures.pointer : figures.circleDotted;
+    const color = isDone ? 'greenBright' : isCurrent ? 'cyanBright' : 'gray';
+    const seg = h(
+      Text,
+      { key: p, color, bold: isCurrent, wrap: 'truncate-end' },
+      `${icon} ${label}`
+    );
+    return i < LAB_PHASES.length - 1 ? [seg, h(Text, { key: `${p}-sep`, dimColor: true }, '  ')] : [seg];
+  });
+  const totalSuffix =
+    card.phaseIndex != null && card.phaseTotal != null ? ` (${card.phaseIndex}/${card.phaseTotal})` : '';
+  return h(
+    Box,
+    { flexWrap: 'nowrap' },
+    h(Box, { flexWrap: 'nowrap' }, ...nodes),
+    totalSuffix ? h(Text, { dimColor: true, wrap: 'truncate-end' }, totalSuffix) : null
+  );
+}
+
+// Build meter: a filled bar proportional to `percent`, or an indeterminate
+// pulsing meter (an animated spinner, never a fake fixed bar) when percent is
+// null - the contract's hard rule the captain specifically asked for: no fake
+// progress signals when progress is honestly unknown.
+function BuildMeter({ card, width }) {
+  const barWidth = Math.max(8, Math.min(30, width - 8));
+  if (card.percentUnknown) {
+    return h(
+      Box,
+      { flexWrap: 'nowrap' },
+      h(Text, { color: 'cyan', wrap: 'truncate-end' }, h(Spinner, { type: 'dots' })),
+      h(Text, { dimColor: true, wrap: 'truncate-end' }, ' progress unknown')
+    );
+  }
+  const filled = Math.round((barWidth * (card.percent || 0)) / 100);
+  const bar = `${'█'.repeat(filled)}${'░'.repeat(Math.max(0, barWidth - filled))}`;
+  const color = card.status === 'failed' ? 'redBright' : card.status === 'success' ? 'greenBright' : 'cyanBright';
+  return h(
+    Box,
+    { flexWrap: 'nowrap' },
+    h(Text, { color, wrap: 'truncate-end' }, bar),
+    h(Text, { dimColor: true, wrap: 'truncate-end' }, ` ${card.percent}%`)
+  );
+}
+
+// One MOBILE LAB build card: header (repo+branch, target+platform), phase
+// tracker, build meter, and a timers/message/heartbeat row. On failure the
+// heartbeat row is replaced with the error string + logfile path so the
+// captain can inspect immediately - this is the "clear failure display" the
+// captain specifically asked for, the opposite of the opaque hang the audit
+// (data/mobile-lab-audit-a7/report.md) found.
+function MobileLabCard({ card, width }) {
+  const contentWidth = Math.max(6, width - 2);
+  const heartbeatColor = LAB_HEARTBEAT_COLORS[card.heartbeat] || 'gray';
+  const heartbeatIcon =
+    card.status === 'success'
+      ? figures.tick
+      : card.status === 'failed'
+        ? figures.cross
+        : figures.circleFilled;
+
+  const headerText = [card.repo, card.branch ? `@ ${card.branch}` : null].filter(Boolean).join(' ');
+  const targetText = [card.target, card.platform ? `[${card.platform}]` : null].filter(Boolean).join(' ');
+  const header = h(
+    Box,
+    { flexWrap: 'nowrap' },
+    h(Text, { bold: true, color: 'whiteBright', wrap: 'truncate-end' }, ` ${truncate(headerText || card.slot, Math.floor(contentWidth * 0.55))} `),
+    targetText ? h(Text, { color: 'blueBright', wrap: 'truncate-end' }, `${figures.arrowRight} ${truncate(targetText, Math.floor(contentWidth * 0.4))}`) : null
+  );
+
+  const phaseTracker = h(PhaseTracker, { card, width: contentWidth });
+  const meter = h(BuildMeter, { card, width: contentWidth });
+
+  // Exactly ONE line regardless of status - this card is a fixed
+  // LAB_CARD_ROW_HEIGHT rows (see the constant's comment), so a failure's
+  // error+logfile detail is joined onto the same single truncated line
+  // rather than a second row, matching every other card's row-count
+  // discipline in this file (Card, BacklogRow) instead of silently growing
+  // past its budgeted height.
+  let statusLine;
+  if (card.status === 'failed') {
+    const errText = card.error || 'build failed';
+    const detail = card.logfile ? `${errText}  (log: ${card.logfile})` : errText;
+    statusLine = h(
+      Text,
+      { color: 'redBright', bold: true, wrap: 'truncate-end' },
+      `${figures.cross} ${truncate(detail, Math.max(6, contentWidth - 2))}`
+    );
+  } else {
+    const totalElapsed = card.totalElapsedSecs != null ? humanDuration(card.totalElapsedSecs) : '…';
+    const phaseElapsed = card.phaseElapsedSecs != null ? humanDuration(card.phaseElapsedSecs) : '…';
+    const timers = `elapsed ${totalElapsed} (phase ${phaseElapsed})`;
+    const msg = card.message ? ` ${figures.pointerSmall} ${card.message}` : '';
+    statusLine = h(
+      Box,
+      { flexWrap: 'nowrap' },
+      h(Text, { bold: true, color: heartbeatColor, wrap: 'truncate-end' }, heartbeatIcon),
+      h(Text, { dimColor: true, wrap: 'truncate-end' }, ` ${truncate(`${timers}${msg}`, Math.max(6, contentWidth - 2))}`)
+    );
+  }
+
+  return h(
+    Box,
+    {
+      flexDirection: 'column',
+      borderStyle: 'round',
+      borderTop: false,
+      borderBottom: false,
+      borderRight: false,
+      borderLeft: true,
+      borderLeftColor: heartbeatColor,
+    },
+    header,
+    phaseTracker,
+    meter,
+    statusLine
+  );
+}
+
+// A slot with no build file, or a stale terminal one, shows a single compact
+// idle row rather than the full 4-row card - keeps the section clean when
+// most slots are not actively building.
+function MobileLabIdleRow({ card, width }) {
+  const text = card.error ? `${card.slot}: ${card.error}` : `${card.slot}: idle`;
+  return h(
+    Box,
+    { flexWrap: 'nowrap' },
+    h(Text, { dimColor: true, wrap: 'truncate-end' }, ` ${figures.bullet} `),
+    h(Text, { dimColor: true, wrap: 'truncate-end' }, truncate(text, Math.max(4, width - 4)))
+  );
+}
+
+// MOBILE LAB: live build monitoring for fm-mobile-lab, reading
+// state/lab-build-*.json per data/mobile-lab-status-contract.md. This is the
+// section that fixes the opacity the captain called out - phase, percent (or
+// an honest indeterminate meter), timers, and a clear failure display,
+// instead of a silent hang. Absent entirely when there are no lab-build files
+// at all (never an empty box competing for board space); a slot whose file is
+// present renders as a full card when actively building/recently terminal,
+// or a compact idle row when defensive-checked as unavailable/malformed.
+function MobileLabSection({ cards, width, flexGrow, height, maxRows }) {
+  if (!cards.length) return null;
+  const rows = cards.map((c) =>
+    c.available
+      ? { node: h(MobileLabCard, { key: c.slot, card: c, width }), height: LAB_CARD_ROW_HEIGHT }
+      : h(MobileLabIdleRow, { key: c.slot, card: c, width })
+  );
+  return h(Section, {
+    title: 'MOBILE LAB',
+    icon: figures.squareSmallFilled,
+    color: 'magentaBright',
+    flexGrow,
+    height,
+    maxRows,
+    rows,
+    emptyText: 'No active builds.',
+  });
+}
+
 function QueuedSection({ records, blockedCount, width, flexGrow, maxRows }) {
   const rows = records.map((r, i) => h(BacklogRow, { key: r.id || `q${i}`, record: r, width }));
   const title = blockedCount ? `QUEUED (${records.length}, ${blockedCount} blocked)` : 'QUEUED';
@@ -636,6 +825,7 @@ export default function App({ bin, home }) {
   const [activityText, setActivityText] = useState(null);
   const [activityError, setActivityError] = useState(null);
   const [activityExpanded, setActivityExpanded] = useState(false);
+  const [labBuildEntries, setLabBuildEntries] = useState([]);
 
   // inputRef mirrors `input` so doSend/handleInput can read the CURRENT value
   // without closing over the `input` state itself. Closing over `input`
@@ -662,13 +852,26 @@ export default function App({ bin, home }) {
   const mounted = useRef(true);
   useEffect(() => () => { mounted.current = false; }, []);
 
-  // Fast board refresh: snapshot + disk + watcher beacon + afk flag.
+  // One du -sk cache for the life of the app (the du-drain fix): a stable
+  // ref, not state, since it owns its own in-flight flag and TTL cache
+  // internally and never needs to trigger a re-render itself - only the sizes
+  // it resolves, landed via setDuById below, do that.
+  const duCacheRef = useRef(null);
+  if (duCacheRef.current == null) duCacheRef.current = createWorktreeSizeCache();
+
+  // Fast board refresh: snapshot + disk + watcher beacon + afk flag + mobile
+  // lab build statuses. Lab-build files are small JSON (no du-style tree
+  // walk), so they ride this same fast cadence rather than the slower
+  // DU_INTERVAL_MS one - readLabBuildStatuses is itself defensive (a missing
+  // state/ dir or an unreadable file never throws), so a bad read here
+  // degrades to an empty list, not a crashed board.
   const refresh = useCallback(async () => {
-    const [{ snapshot: snap, error }, d, beat, afkPresent] = await Promise.all([
+    const [{ snapshot: snap, error }, d, beat, afkPresent, labEntries] = await Promise.all([
       readSnapshot(bin, home),
       readDisk(DATA_VOLUME),
       fileMtimeSecs(`${home}/state/.last-watcher-beat`),
       fileExists(`${home}/state/.afk`),
+      readLabBuildStatuses(home),
     ]);
     if (!mounted.current) return;
     // Keep the last good snapshot on screen if this read failed (a timed-out
@@ -680,6 +883,7 @@ export default function App({ bin, home }) {
     setDisk(d);
     setWatcherBeat(beat);
     setAfk(afkPresent);
+    setLabBuildEntries(labEntries);
   }, [bin, home]);
 
   useEffect(() => {
@@ -758,24 +962,39 @@ export default function App({ bin, home }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mtimeTaskKey]);
 
-  // Slower, non-blocking du + PR-checks pass over the current tasks.
+  // Slower, non-blocking du + PR-checks pass over the current tasks. The
+  // du-drain fix (data/mobile-lab-audit-a7/report.md, "du drain"): a pass
+  // over several multi-GB worktrees can easily outlive DU_INTERVAL_MS, and
+  // the old code had no guard against the next tick starting a second,
+  // overlapping pass on top of it - confirmed to starve an xcodebuild link
+  // step. passInFlightRef gates the PASS itself (never start a new measure()
+  // while one is still running its loop), and duCacheRef gates each
+  // individual du -sk call with its own TTL cache, so most ticks resolve a
+  // worktree's size from cache without shelling out to du at all.
+  const passInFlightRef = useRef(false);
   const taskKey = tasks.map((t) => `${t.id}:${t.paths?.worktree?.path || ''}:${t.pr?.url || ''}`).join('|');
   useEffect(() => {
     let cancelled = false;
     async function measure() {
-      for (const t of tasks) {
-        const wt = t.paths?.worktree?.path;
-        if (wt) {
-          const size = await readWorktreeSize(wt);
-          if (cancelled || !mounted.current) return;
-          if (size != null) setDuById((prev) => ({ ...prev, [t.id]: size }));
+      if (passInFlightRef.current) return;
+      passInFlightRef.current = true;
+      try {
+        for (const t of tasks) {
+          const wt = t.paths?.worktree?.path;
+          if (wt) {
+            const size = await duCacheRef.current.get(wt);
+            if (cancelled || !mounted.current) return;
+            if (size != null) setDuById((prev) => ({ ...prev, [t.id]: size }));
+          }
+          const prUrl = t.pr?.url;
+          if (prUrl) {
+            const checks = await readPrChecks(prUrl);
+            if (cancelled || !mounted.current) return;
+            if (checks != null) setPrById((prev) => ({ ...prev, [t.id]: checks }));
+          }
         }
-        const prUrl = t.pr?.url;
-        if (prUrl) {
-          const checks = await readPrChecks(prUrl);
-          if (cancelled || !mounted.current) return;
-          if (checks != null) setPrById((prev) => ({ ...prev, [t.id]: checks }));
-        }
+      } finally {
+        passInFlightRef.current = false;
       }
     }
     measure();
@@ -798,6 +1017,7 @@ export default function App({ bin, home }) {
   const { inFlight, inFlightGrouped, done } = boardSections(cards);
   const queuedRecords = queuedBacklogRecords(snapshot);
   const doneRecords = recentDoneBacklogRecords(snapshot, RECENT_DONE_LIMIT);
+  const labBuildCards = buildLabBuildCards(labBuildEntries, nowForCards);
   const orderedIds = GROUP_ORDER.flatMap((g) => (inFlightGrouped.get(g) || []).map((c) => c.id));
 
   // orderedIds is a fresh array every render (recomputed from the polled
@@ -1013,6 +1233,18 @@ export default function App({ bin, home }) {
   const activityStripFits = height >= MIN_ROWS_FOR_FULL_LAYOUT + activityStripHeight;
   const showActivityStrip = !activityIdle && activityStripFits;
 
+  // MOBILE LAB: a fixed-height strip, same discipline as the activity strip
+  // above - absent entirely (0 rows claimed) when there are no lab-build
+  // files at all, capped to a sane number of card-rows otherwise so a large
+  // number of slots does not blow the board's row budget, and dropped on a
+  // cramped terminal rather than squeezing the fleet board unreadable.
+  const LAB_STRIP_MAX_ROWS = 3 * LAB_CARD_ROW_HEIGHT;
+  const labContentRows = labBuildCards.reduce((sum, c) => sum + (c.available ? LAB_CARD_ROW_HEIGHT : 1), 0);
+  const labStripRows = Math.min(LAB_STRIP_MAX_ROWS, Math.max(1, labContentRows));
+  const labStripHeight = SECTION_ROW_CHROME + labStripRows;
+  const labStripFits = height >= MIN_ROWS_FOR_FULL_LAYOUT + labStripHeight;
+  const showLabStrip = labBuildCards.length > 0 && labStripFits;
+
   // Row budget: Ink has no scrolling, and handing a fixed-height flex tree
   // more rows than it has space for can corrupt the render rather than clip
   // it cleanly (see the Card/capRows comments above) - it silently loses
@@ -1031,7 +1263,7 @@ export default function App({ bin, home }) {
   // would hand out rows the strip has already claimed and the board would
   // overflow its allotted height.
   const { inFlightRows, queuedRows, doneRows } = computeRowBudget({
-    height: height - (showActivityStrip ? activityStripHeight : 0),
+    height: height - (showActivityStrip ? activityStripHeight : 0) - (showLabStrip ? labStripHeight : 0),
     hasFooter: footerLines > 0,
     hasInFlight: inFlight.length > 0,
     inFlightContentRows: inFlight.length ? inFlightContentRows : null,
@@ -1105,11 +1337,21 @@ export default function App({ bin, home }) {
       })
     : null;
 
+  const labStrip = showLabStrip
+    ? h(MobileLabSection, {
+        cards: labBuildCards,
+        width: fullContentWidth,
+        height: labStripHeight,
+        maxRows: labStripRows,
+      })
+    : null;
+
   const boardRow = compact
     ? h(
         Box,
         { flexDirection: 'column', flexGrow: 1 },
         activityStrip,
+        labStrip,
         inFlightOrActivity,
         h(QueuedSection, {
           records: queuedRecords,
@@ -1124,6 +1366,7 @@ export default function App({ bin, home }) {
         Box,
         { flexDirection: 'column', flexGrow: 1 },
         activityStrip,
+        labStrip,
         inFlightOrActivity,
         h(
           Box,
