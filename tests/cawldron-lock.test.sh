@@ -147,7 +147,8 @@ test_known_project_via_registry_no_warning() {
 
 # Setting a lock while a crew is already recorded on that project (via
 # state/*.meta project=) prints the loud live-crew warning but still sets the
-# lock - it is informational only.
+# lock, and the banner is honest that a later respawn of one of those crews is
+# still gated.
 test_live_crew_warning_on_set() {
   local home out
   home=$(new_home)
@@ -158,6 +159,7 @@ test_live_crew_warning_on_set() {
   expect_code 0 "$?" "set should still succeed despite a live crew"
   assert_contains "$out" "CAWLDRON LOCK SET WHILE A CREW IS ALREADY ON busy" "live-crew banner missing"
   assert_contains "$out" "existing-task-z1" "live-crew banner did not name the task id"
+  assert_contains "$out" "needs --force-locked" "live-crew banner did not state that a later respawn is still gated"
   assert_present "$home/state/cawldron-lock-busy" "lock was not set despite the live-crew warning"
   pass "setting a lock while a crew is live on the project warns but still sets"
 }

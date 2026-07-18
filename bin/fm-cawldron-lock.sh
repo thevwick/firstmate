@@ -34,18 +34,10 @@
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fm-cawldron-lock-lib.sh
+. "$SCRIPT_DIR/fm-cawldron-lock-lib.sh"
 
-usage() {
-  # Print the whole comment header, stopping at the first real code line, so the
-  # help text can never silently truncate as the header grows. A blank line
-  # inside the header is a paragraph break, not the end of the header.
-  awk '
-    NR == 1 { next }
-    /^[[:space:]]*$/ { print ""; next }
-    /^#/ { sub(/^# ?/, ""); print; next }
-    { exit }
-  ' "$0"
-}
+usage() { fm_cawldron_usage_header "$0"; }
 
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
@@ -56,8 +48,6 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
-# shellcheck source=bin/fm-cawldron-lock-lib.sh
-. "$SCRIPT_DIR/fm-cawldron-lock-lib.sh"
 
 list_locks() {
   local project status since note printed
@@ -150,7 +140,9 @@ if [ "${#live_crew_ids[@]}" -gt 0 ]; then
     printf '●%s\n' "$FM_CAWLDRON_RULE"
     printf '●  CAWLDRON LOCK SET WHILE A CREW IS ALREADY ON %s\n' "$PROJECT"
     printf '●  Live crew(s) already recorded on this project: %s\n' "${live_crew_ids[*]}"
-    printf '●  The lock is informational only - it does not stop or notify those crews.\n'
+    printf '●  The lock does not stop or notify a crew already running. It DOES gate a\n'
+    printf '●  later relaunch: recovering or respawning one of those crews through\n'
+    printf '●  fm-spawn.sh is refused while the lock is set, and needs --force-locked.\n'
     printf '●%s\n' "$FM_CAWLDRON_RULE"
   } >&2
 fi

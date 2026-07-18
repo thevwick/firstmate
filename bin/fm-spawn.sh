@@ -90,18 +90,10 @@
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fm-cawldron-lock-lib.sh
+. "$SCRIPT_DIR/fm-cawldron-lock-lib.sh"
 
-usage() {
-  # Print the whole comment header, stopping at the first real code line, so the
-  # help text can never silently truncate as the header grows. A blank line
-  # inside the header is a paragraph break, not the end of the header.
-  awk '
-    NR == 1 { next }
-    /^[[:space:]]*$/ { print ""; next }
-    /^#/ { sub(/^# ?/, ""); print; next }
-    { exit }
-  ' "$0"
-}
+usage() { fm_cawldron_usage_header "$0"; }
 
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
@@ -124,8 +116,6 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
-# shellcheck source=bin/fm-cawldron-lock-lib.sh
-. "$SCRIPT_DIR/fm-cawldron-lock-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent

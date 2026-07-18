@@ -244,6 +244,7 @@ A persistent secondmate is recorded in the secondmate registry and runtime state
 
 Never dispatch a ship or scout crew, or promote a scout to ship, on a project Cawldron-locked (`bin/fm-cawldron-lock.sh --list`) without the captain's explicit go (`fm-spawn.sh --force-locked` or `fm-promote.sh --force-locked`); a locked project's working tree may hold the captain's uncommitted live Cawldron edits to reconcile against a crew's PR before landing either.
 Set or clear that lock with `bin/fm-cawldron-lock.sh` yourself whenever the captain goes live in, or leaves, a Cawldron session on a project.
+The lock is scoped to the home that holds it: it gates crews dispatched from that home only, and does not currently propagate into secondmate homes, so work routed to a secondmate is not gated by a lock set in the main home.
 
 Steer a worker with short single-line messages through fail-closed `fm-send`; put long instructions in a file.
 A secondmate's routed reply returns through status or a document pointer, not by firstmate peeking into its chat.
