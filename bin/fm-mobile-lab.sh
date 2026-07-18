@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
-# fm-mobile-lab.sh - a reusable mobile build/test lab for React Native repos.
+# fm-mobile-lab.sh - a thin, transparent build/test lab for React Native repos.
 #
-# Purpose: let the captain quickly try out different code branches on iOS
-# simulators AND physical devices, with an intelligent cache that only rebuilds
-# what the branch actually changed. JS-only branch changes become a checkout +
-# Metro reload with NO reinstall and NO native rebuild; dependency changes are a
-# restore-or-install; native changes rebuild once and are then cached.
+# Purpose: let the captain quickly try a code branch on an iOS simulator or a
+# physical device. The lab is a THIN WRAPPER around each repo's own configured
+# run command (react-native run-ios today, `npx expo run:ios` after the Expo
+# migration, with ZERO lab code change). It does NOT reimplement xcodebuild: the
+# RN/Expo CLI owns build + pods + install + launch, which it gets right for free
+# (workspace-vs-scheme, deterministic destination, install/launch). The lab owns
+# only the genuinely lab-specific parts: warm git-worktree slots, per-slot Metro
+# ports, a node_modules deps cache, a pre-flight framework-slice compatibility
+# gate, streaming progress + a build logfile, a machine-readable build-status
+# file, and a per-slot build lock.
+#
+# See data/mobile-lab-audit-a7/report.md for why the previous xcodebuild
+# reimplementation was rebuilt into this wrapper, and
+# data/mobile-lab-status-contract.md for the build-status file contract this
+# script emits (a separate console reader renders it).
 #
 # Design (approved): a GENERIC, repo-agnostic ENGINE (this script, shared and
 # committed to every firstmate home) plus a per-fleet gitignored CONFIG
@@ -15,21 +25,19 @@
 # at docs/examples/mobile-lab.json; usage and verification evidence live in
 # docs/mobile-lab.md.
 #
-# Core model: a small pool of WARM git-worktree slots + a fingerprint-keyed
-# native cache, all under ~/.fm-mobile-lab (or $FM_MOBILE_LAB_HOME):
+# Core model: a small pool of WARM git-worktree slots + a node_modules deps
+# cache, all under ~/.fm-mobile-lab (or $FM_MOBILE_LAB_HOME):
 #   cache/node_modules/<pkgmgr>-<lockfile-hash>/   built once per lockfile, APFS-clone source
-#   cache/pods/<podfile-lock-hash>/                built once per Podfile.lock
-#   cache/app/<fingerprint>-<platform>/            prebuilt binary, the slow-case cache
 #   slots/<repo>-<N>/                              git worktree of the projects/ clone (warm)
-#   state/slots.json                               slot -> repo+branch, Metro port, fingerprint, last-used
+#   state/slots.json                               slot -> repo+branch, Metro port, last-used
+#   state/build-<slot>.log                         full streamed build output (tee'd)
+#   state/lab-build-<slot>.json                    machine-readable build status (the contract)
+#   state/<slot>.build.lock/                       per-slot build lock (mkdir-based)
 #
-# Slots are git WORKTREES of the real clone under projects/. The clone itself is
-# NEVER modified (worktree only). Each slot owns a FIXED Metro port (base + slot
-# index) baked into that slot's build via RCT_METRO_PORT at build time, so a
-# port mismatch ("No script URL"/red screen) is structurally impossible.
-# node_modules restore is an APFS clone (cp -c) from the lockfile-hash cache:
-# copy-on-write, near-instant, near-zero extra disk, so N slots do NOT cost
-# N x the full node_modules size and node-linker=hoisted is left untouched.
+# There is NO app/native-artifact cache. The audit proved a fingerprint-keyed
+# `.app` cache can serve a wrong-arch binary (it cached an x86_64 sim build and
+# later tried to install it on an arm64 sim). The RN/Expo CLI does its own
+# incremental build; the deps cache stays because it is cheap and correct.
 #
 # The one command:
 #   fm-mobile-lab <repo> <branch> --sim|--device [--slot N]
@@ -41,17 +49,6 @@
 #
 # Exact flags/paths are documented here and in --help; usage narrative lives in
 # docs/mobile-lab.md, not in AGENTS.md.
-#
-# See data/mobile-lab-smoketest-s4/report.md for the de-risking evidence: the
-# APFS clonefile CoW mechanic and the RCT_METRO_PORT compile-time bake were both
-# proven GREEN before this engine was built. Caveats carried in from the report:
-#  - clone time scales with FILE COUNT, not byte count (~71s for 188k files).
-#  - a port change requires a real React-Core recompile, not an incremental
-#    build, or the OLD port stays baked in (the engine forces a clean rebuild on
-#    a port change).
-#  - the first real end-to-end iOS build is the captain's rollout smoke-check,
-#    not a blocker for landing the engine; doctor gates the device-dependent
-#    parts.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,6 +71,11 @@ MIN_FREE_GB="${FM_MOBILE_LAB_MIN_FREE_GB:-15}"
 # gc keeps cache layers referenced by a live slot, or newer than this many days.
 GC_MAX_AGE_DAYS="${FM_MOBILE_LAB_GC_DAYS:-14}"
 
+# Heartbeat cadence (seconds) for a long build phase: how often the lab prints a
+# "still <phase> (Nm elapsed)" line and re-writes the status file during a phase
+# with no transition. The contract asks for at least every 10s.
+BUILD_HEARTBEAT_SECS="${FM_MOBILE_LAB_HEARTBEAT_SECS:-10}"
+
 # --- output helpers ---------------------------------------------------------
 
 log()  { printf '%s\n' "$*"; }
@@ -81,6 +83,12 @@ info() { printf '  %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 err()  { printf 'ERROR: %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
+
+# banner <phase> <index> <total> <message>: a phase start banner with timing.
+banner() {
+  local phase=$1 idx=$2 total=$3 msg=$4
+  printf '\n=== [%s/%s] %s: %s ===\n' "$idx" "$total" "$phase" "$msg"
+}
 
 # --- config -----------------------------------------------------------------
 
@@ -105,7 +113,7 @@ and edit it for your fleet:
     cp "$FM_ROOT/docs/examples/mobile-lab.json" "$CONFIG"
 
 Then edit it to list your repos, their clone directory names under projects/,
-Metro port ranges, iOS scheme names, and default simulator device names.
+Metro port ranges, and per-repo run_command (e.g. react-native run-ios).
 See docs/mobile-lab.md for the field reference.
 EOF
   exit 1
@@ -188,11 +196,11 @@ detect_node_version() {
   printf '%s\n' "$v"
 }
 
-# --- pure logic: hashing & fingerprint --------------------------------------
+# --- pure logic: hashing ----------------------------------------------------
 
 # sha_file <path>: sha256 hex of a file, or the literal "absent" when missing.
 # Deterministic: the same bytes always hash the same, a missing file is always
-# "absent". Used so a fingerprint is stable across runs and machines.
+# "absent". Used so a deps-cache key is stable across runs and machines.
 sha_file() {
   local f=$1
   if [ -f "$f" ]; then
@@ -211,54 +219,6 @@ hash_lockfile() {
   sha_file "$dir/$lf" | cut -c1-16
 }
 
-# native_fingerprint <checkout-dir> <platform>: a SELF-COMPUTED sha256 over the
-# inputs that actually affect a native build, so a JS-only change does NOT
-# invalidate the native cache but a pod/native-dep/patch change does. Inputs:
-#   ios/Podfile, ios/Podfile.lock, the native-relevant dependency set (deps
-#   whose name matches react-native / expo / a native pod convention, taken from
-#   package.json so a bumped native dep changes the key), patches/ contents, and
-#   the platform. Does NOT depend on Expo's fingerprint tool (the real target
-#   repos are bare RN and do not ship it). Prints "<hash16>".
-native_fingerprint() {
-  local dir=$1 platform=$2
-  {
-    printf 'platform=%s\n' "$platform"
-    printf 'podfile=%s\n'      "$(sha_file "$dir/ios/Podfile")"
-    printf 'podfile-lock=%s\n' "$(sha_file "$dir/ios/Podfile.lock")"
-    # Native-relevant dependency set: react-native itself plus any dependency
-    # whose name looks native (react-native-*, @react-native*, expo*, or a name
-    # ending in a common native marker). Sorted for determinism. A pure-JS dep
-    # bump does not appear here, so it will not bust the native cache.
-    if [ -f "$dir/package.json" ]; then
-      jq -r '
-        (.dependencies // {}) + (.devDependencies // {})
-        | to_entries
-        | map(select(
-            (.key | test("^react-native$"))
-            or (.key | test("react-native"))
-            or (.key | test("^@react-native"))
-            or (.key | test("^expo"))
-          ))
-        | sort_by(.key)
-        | .[] | "\(.key)@\(.value)"
-      ' "$dir/package.json" 2>/dev/null || printf 'pkgjson-unreadable\n'
-    else
-      printf 'pkgjson-absent\n'
-    fi
-    # patches/ contents (patch-package style native patches change the build).
-    if [ -d "$dir/patches" ]; then
-      # Hash each patch file; sort for determinism.
-      find "$dir/patches" -type f -print0 2>/dev/null \
-        | LC_ALL=C sort -z \
-        | while IFS= read -r -d '' p; do
-            printf 'patch:%s=%s\n' "${p#"$dir"/}" "$(sha_file "$p")"
-          done
-    else
-      printf 'patches=none\n'
-    fi
-  } | sha256sum | awk '{print $1}' | cut -c1-16
-}
-
 # --- pure logic: slot & port assignment -------------------------------------
 
 # metro_port <base-port> <slot-index>: the fixed Metro port for a slot. base +
@@ -273,11 +233,248 @@ slot_name() {
   printf '%s-%s\n' "$1" "$2"
 }
 
+# --- pure logic: run-command assembly ---------------------------------------
+#
+# The lab wraps the repo's configured run_command, appending the concrete
+# target/port flags it resolved. build_run_command keeps this assembly pure and
+# testable: given a base command and resolved (platform, target-flag, port), it
+# prints the exact command string the lab will execute. The lab does NOT
+# hard-bake `react-native run-ios`; it comes entirely from config, so the Expo
+# switch (`npx expo run:ios`) is a config edit with no code change.
+
+# shell_quote <str>: single-quote a string safely for the printed/executed
+# command. A literal single quote inside a single-quoted string is written as
+# the POSIX idiom '\'' (close-quote, escaped-quote, reopen-quote). Using a
+# single-quoted replacement literal keeps the backslash handling unambiguous.
+shell_quote() {
+  local s=$1 q
+  # q is the 4-character POSIX escape sequence  '\''  built with printf so the
+  # literal stays unambiguous to both bash and shellcheck.
+  q=$(printf "%s" "'\\''")
+  printf "'%s'" "${s//\'/$q}"
+}
+
+# build_run_command <base-cmd> <target-flag> <target-value> <port>: append the
+# resolved concrete target and Metro port to the repo's base run_command.
+# <target-flag> is one of --udid / --simulator / --device (RN 0.80 run-ios
+# supports all three; Expo run:ios accepts --device and a udid via --device).
+# An empty target-flag appends nothing for the target (target already implied).
+# Prints the full command string. Deterministic and pure: no environment reads.
+build_run_command() {
+  local base=$1 target_flag=$2 target_value=$3 port=$4
+  local out=$base
+  if [ -n "$target_flag" ]; then
+    out="$out $target_flag $(shell_quote "$target_value")"
+  fi
+  if [ -n "$port" ]; then
+    out="$out --port $port"
+  fi
+  printf '%s\n' "$out"
+}
+
+# --- pure logic: framework-slice compatibility gate -------------------------
+#
+# The one genuinely lab-specific safety check. Before a build, enumerate the
+# app's vendored *.framework/<binary> and *.a static libraries under ios/, and
+# confirm at least one carries a slice for the concrete target platform+arch.
+# The FFmpeg case (dashpivot's libavcodec has only x86_64-IOSSIMULATOR +
+# arm64-IOS(device) slices, no arm64-simulator) makes an arm64-sim build
+# impossible; this gate turns a 10-minute link-time death into a one-line
+# pre-flight error steering to --device.
+
+# target_platform_token <platform>: the Mach-O build platform token vtool prints
+# for a given lab platform. sim -> IOSSIMULATOR, device -> IOS.
+target_platform_token() {
+  case "$1" in
+    sim)    printf 'IOSSIMULATOR\n' ;;
+    device) printf 'IOS\n' ;;
+    *)      return 1 ;;
+  esac
+}
+
+# A vendored binary can be packaged two ways, and they need different checks:
+#
+#  1. A modern *.xcframework is a self-describing multi-platform container: its
+#     Info.plist AvailableLibraries lists every slice by platform, variant
+#     (simulator vs device), and arch. Apple's CORRECT packaging. It must be
+#     checked as a UNIT against that manifest; its inner per-slice *.framework
+#     dirs are legitimately single-platform and must NOT be inspected on their
+#     own (an ios-*-simulator inner dir having no device slice is expected, not a
+#     block). Distinguishing this from case 2 is what keeps the gate from
+#     false-blocking a well-packaged xcframework.
+#  2. A plain *.framework or *.a NOT inside any xcframework is a single fat/thin
+#     Mach-O. This is the FFmpeg case: one fat binary with an x86_64-SIMULATOR
+#     slice and an arm64-DEVICE slice but no arm64-SIMULATOR slice. Checked with
+#     lipo (arch presence) + vtool (that arch's build platform).
+
+# xcframework_supports <xcframework-dir> <platform> <arch>: 0 if the xcframework's
+# Info.plist declares a slice for the target platform (ios) with the requested
+# variant (simulator for sim, device/none for device) that includes <arch>. Uses
+# plutil to read the plist; when plutil is unavailable or the plist is
+# unreadable, returns 0 (cannot check this container -> do not block).
+xcframework_supports() {
+  local xc=$1 platform=$2 arch=$3 want_variant plist libs
+  case "$platform" in
+    sim)    want_variant='simulator' ;;
+    device) want_variant='device' ;;
+    *) return 0 ;;
+  esac
+  plist="$xc/Info.plist"
+  [ -f "$plist" ] || return 0
+  command -v plutil >/dev/null 2>&1 || return 0
+  libs=$(plutil -extract AvailableLibraries json -o - "$plist" 2>/dev/null) || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  # A device slice has no SupportedPlatformVariant key (null); a simulator slice
+  # has variant "simulator". Match platform ios, the right variant, and arch.
+  local n
+  n=$(printf '%s' "$libs" | jq -r --arg v "$want_variant" --arg a "$arch" '
+        [ .[]
+          | select(.SupportedPlatform == "ios")
+          | select( ($v == "device" and (has("SupportedPlatformVariant") | not))
+                    or (.SupportedPlatformVariant == $v) )
+          | select( .SupportedArchitectures | index($a) ) ] | length' 2>/dev/null)
+  [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null
+}
+
+# plain_binary_has_slice <binary> <arch> <platform-token>: 0 if the fat/thin
+# Mach-O <binary> carries a slice for <arch> whose build platform is
+# <platform-token>. lipo confirms the arch is present; vtool confirms that arch's
+# slice targets the right platform. A binary lipo cannot read is treated as "no
+# matching slice", never a hard error.
+plain_binary_has_slice() {
+  local bin=$1 arch=$2 want_platform=$3 archs
+  command -v lipo >/dev/null 2>&1 || return 0   # no lipo: cannot gate, allow.
+  archs=$(lipo -archs "$bin" 2>/dev/null) || return 1
+  case " $archs " in
+    *" $arch "*) : ;;
+    *) return 1 ;;   # arch not present at all.
+  esac
+  if command -v vtool >/dev/null 2>&1; then
+    vtool -arch "$arch" -show-build "$bin" 2>/dev/null \
+      | grep -qiE "platform[[:space:]]+$want_platform([[:space:]]|\$)" && return 0
+    return 1
+  fi
+  return 0   # no vtool: arch-presence only (weaker, never a false block).
+}
+
+# is_gateable_path <path>: 1 (false) if a framework/xcframework path is one the
+# gate must ignore, 0 (true) if it should be inspected. Ignored paths:
+#  - anything inside an *.xcframework (its inner per-slice frameworks are handled
+#    via the container's manifest, not on their own);
+#  - build/derivedData output trees (ios/build, DerivedData, a pod's own build),
+#    which hold single-platform BUILD PRODUCTS, not vendored source inputs;
+#  - non-iOS platform slice directories (macosx/tvos/watchos/xros/maccatalyst),
+#    which are never linked into the iOS app and would false-block otherwise.
+is_gateable_path() {
+  case "$1" in
+    *.xcframework/*) return 1 ;;
+    */build/*|*/DerivedData/*|*/.build/*) return 1 ;;
+    */macos/*|*/macosx/*|*/tvos/*|*/watchos/*|*/xros/*|*/maccatalyst/*) return 1 ;;
+    *-maccatalyst/*|*-maccatalyst.framework/*) return 1 ;;
+  esac
+  return 0
+}
+
+# enumerate_plain_binaries <checkout-dir>: print every PLAIN vendored Mach-O
+# under ios/ that is NOT inside an *.xcframework and NOT a build product: each
+# gateable top-level *.framework's own dylib and every gateable *.a. This is the
+# FFmpeg surface (plain fat frameworks vendored directly under ios/).
+enumerate_plain_binaries() {
+  local dir=$1 fw
+  [ -d "$dir/ios" ] || return 0
+  while IFS= read -r -d '' fw; do
+    is_gateable_path "$fw" || continue
+    local base bin
+    base=$(basename "$fw" .framework)
+    bin="$fw/$base"
+    [ -f "$bin" ] && printf '%s\n' "$bin"
+  done < <(find "$dir/ios" -type d -name '*.framework' -print0 2>/dev/null)
+  while IFS= read -r -d '' a; do
+    is_gateable_path "$a" || continue
+    printf '%s\n' "$a"
+  done < <(find "$dir/ios" -type f -name '*.a' -print0 2>/dev/null)
+}
+
+# enumerate_xcframeworks <checkout-dir>: print every gateable *.xcframework
+# directory under ios/ (not nested in another xcframework, not under a build
+# tree), one per line.
+enumerate_xcframeworks() {
+  local dir=$1 xc
+  [ -d "$dir/ios" ] || return 0
+  while IFS= read -r -d '' xc; do
+    case "${xc%/*}" in *.xcframework) continue ;; esac   # skip nested (rare).
+    case "$xc" in */build/*|*/DerivedData/*|*/.build/*) continue ;; esac
+    printf '%s\n' "$xc"
+  done < <(find "$dir/ios" -type d -name '*.xcframework' -print0 2>/dev/null)
+}
+
+# slice_gate <checkout-dir> <platform> <arch>: the pre-flight compatibility gate.
+# Checks each xcframework against its Info.plist manifest and each plain
+# framework/static-lib against its Mach-O slices. Returns 0 (compatible) when
+# every vendored binary that matters supports the target platform+arch. Returns 1
+# (incompatible) and prints a single specific one-line reason naming the
+# framework, the missing slice, and the viable alternative, on the first blocker.
+# When lipo is unavailable it cannot inspect plain binaries and returns 0 (allow)
+# with nothing printed, so a machine without the Mach-O tools never false-blocks.
+slice_gate() {
+  local dir=$1 platform=$2 arch=$3 token first_block=''
+  token=$(target_platform_token "$platform") || return 0
+  command -v lipo >/dev/null 2>&1 || return 0
+
+  # 1. xcframeworks (checked against their manifest).
+  local xc base
+  while IFS= read -r xc; do
+    [ -n "$xc" ] || continue
+    if xcframework_supports "$xc" "$platform" "$arch"; then
+      continue
+    fi
+    base=$(basename "$xc")
+    if [ "$platform" = "sim" ]; then
+      first_block="$base has no $arch-simulator slice; this app can only run on a physical device: re-run with --device"
+    else
+      first_block="$base has no $arch-device slice; this app cannot build for a physical $arch device"
+    fi
+    break
+  done < <(enumerate_xcframeworks "$dir")
+
+  # 2. plain frameworks/static libs (the FFmpeg case), only if nothing blocked yet.
+  local bin archs
+  if [ -z "$first_block" ]; then
+    while IFS= read -r bin; do
+      [ -n "$bin" ] || continue
+      archs=$(lipo -archs "$bin" 2>/dev/null) || continue
+      if plain_binary_has_slice "$bin" "$arch" "$token"; then
+        continue
+      fi
+      base=$(basename "$bin")
+      local archs_1line; archs_1line=$(printf '%s' "$archs" | tr '\n' ' ' | sed -E 's/ +/ /g; s/ *$//')
+      case " $archs " in
+        *" $arch "*)
+          if [ "$platform" = "sim" ]; then
+            first_block="$base has no $arch-simulator slice (present: $archs_1line, built for device); this app can only run on a physical device: re-run with --device"
+          else
+            first_block="$base has no $arch-device slice (present: $archs_1line); this app cannot build for a physical $arch device"
+          fi
+          ;;
+        *)
+          first_block="$base has no $arch slice at all (present: $archs_1line); this app cannot build for $arch on $platform"
+          ;;
+      esac
+      break
+    done < <(enumerate_plain_binaries "$dir")
+  fi
+
+  if [ -n "$first_block" ]; then
+    printf '%s\n' "$first_block"
+    return 1
+  fi
+  return 0
+}
+
 # --- state (slots.json) ------------------------------------------------------
 
 ensure_dirs() {
-  mkdir -p "$CACHE_DIR/node_modules" "$CACHE_DIR/pods" "$CACHE_DIR/app" \
-           "$SLOTS_DIR" "$STATE_DIR"
+  mkdir -p "$CACHE_DIR/node_modules" "$SLOTS_DIR" "$STATE_DIR"
   [ -f "$SLOTS_STATE" ] || printf '{"slots":{}}\n' > "$SLOTS_STATE"
 }
 
@@ -286,14 +483,14 @@ state_get_slot() {
   jq -c --arg s "$1" '.slots[$s] // empty' "$SLOTS_STATE" 2>/dev/null
 }
 
-# state_set_slot <slot-name> <repo> <branch> <port> <fingerprint> <epoch>:
-# upsert a slot record. last_used is the epoch so LRU can order slots.
+# state_set_slot <slot-name> <repo> <branch> <port> <epoch>: upsert a slot
+# record. last_used is the epoch so LRU can order slots.
 state_set_slot() {
-  local s=$1 repo=$2 branch=$3 port=$4 fp=$5 now=$6 tmp
+  local s=$1 repo=$2 branch=$3 port=$4 now=$5 tmp
   tmp=$(mktemp "$STATE_DIR/slots.json.XXXXXX")
   jq --arg s "$s" --arg repo "$repo" --arg branch "$branch" \
-     --argjson port "$port" --arg fp "$fp" --argjson now "$now" \
-     '.slots[$s] = {repo:$repo, branch:$branch, port:$port, fingerprint:$fp, last_used:$now}' \
+     --argjson port "$port" --argjson now "$now" \
+     '.slots[$s] = {repo:$repo, branch:$branch, port:$port, last_used:$now}' \
      "$SLOTS_STATE" > "$tmp" && mv "$tmp" "$SLOTS_STATE"
 }
 
@@ -344,11 +541,157 @@ pick_slot() {
   printf '%s\n' "$lru_idx"
 }
 
+# --- per-slot build lock -----------------------------------------------------
+#
+# An exclusive per-slot lock around the pods+build+install sequence so two
+# builds into the same slot (same worktree, same derivedData) cannot collide
+# (the audit's build-DB-lock failure). mkdir is atomic on macOS/HFS+/APFS and
+# does not need flock (which macOS lacks). The lock dir records the holder PID so
+# a stale lock left by a dead process is detected and cleared.
+
+# build_lock_dir <slot-name>: the lock directory path for a slot.
+build_lock_dir() {
+  printf '%s/%s.build.lock\n' "$STATE_DIR" "$1"
+}
+
+# acquire_build_lock <slot-name>: take the exclusive lock. On contention, if the
+# recorded holder PID is dead, clear the stale lock and take it; otherwise fail
+# non-zero. On success, records our PID and prints nothing. FM_MOBILE_LAB_LOCK_WAIT
+# (seconds, default 0) makes it retry rather than fail immediately.
+acquire_build_lock() {
+  local s=$1 dir waited=0 wait_max holder
+  dir=$(build_lock_dir "$s")
+  wait_max="${FM_MOBILE_LAB_LOCK_WAIT:-0}"
+  while :; do
+    if mkdir "$dir" 2>/dev/null; then
+      printf '%s\n' "$$" > "$dir/pid"
+      return 0
+    fi
+    holder=$(cat "$dir/pid" 2>/dev/null || echo)
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      # Stale lock: the recorded holder is dead. Clear and retry once.
+      warn "clearing stale build lock for slot $s (dead holder pid $holder)"
+      rm -rf "$dir"
+      continue
+    fi
+    if [ "$waited" -ge "$wait_max" ]; then
+      return 1
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+}
+
+# release_build_lock <slot-name>: release the lock IF we hold it (our PID). Safe
+# to call in a trap even if we never acquired it.
+release_build_lock() {
+  local s=$1 dir holder
+  dir=$(build_lock_dir "$s")
+  [ -d "$dir" ] || return 0
+  holder=$(cat "$dir/pid" 2>/dev/null || echo)
+  if [ "$holder" = "$$" ]; then
+    rm -rf "$dir"
+  fi
+}
+
+# --- build-status file (the console contract) -------------------------------
+#
+# state/lab-build-<slot>.json per data/mobile-lab-status-contract.md. Written
+# atomically (temp + mv) on every phase transition and at least every
+# BUILD_HEARTBEAT_SECS during a long phase. The console reads it; do not deviate
+# from the contract shape.
+#
+# Status state is carried in globals so the heartbeat and phase-transition
+# writers share one source of truth. percent is null unless a caller sets a
+# concrete integer (NEVER a fake smooth bar).
+
+ST_SLOT='' ST_REPO='' ST_BRANCH='' ST_PLATFORM='' ST_TARGET=''
+ST_RUN_COMMAND='' ST_PORT=0 ST_PHASE='' ST_PHASE_INDEX=0 ST_PHASE_TOTAL=7
+ST_PERCENT='null' ST_STATUS='running' ST_STARTED=0 ST_PHASE_STARTED=0
+ST_MESSAGE='' ST_LOGFILE='' ST_ERROR='null'
+
+# status_file_path <slot-name>: the status file path for a slot.
+status_file_path() {
+  printf '%s/lab-build-%s.json\n' "$STATE_DIR" "$1"
+}
+
+# status_write: write the current status globals to the slot's status file
+# atomically. percent and error are emitted raw (already valid JSON: an integer
+# or the literal null). Every string is JSON-encoded by jq so a quote/newline in
+# a message can never corrupt the file.
+status_write() {
+  [ -n "$ST_SLOT" ] || return 0
+  local out tmp now
+  out=$(status_file_path "$ST_SLOT")
+  now=$(date +%s)
+  tmp=$(mktemp "$STATE_DIR/lab-build-$ST_SLOT.json.XXXXXX")
+  if jq -n \
+    --argjson schema 1 \
+    --arg slot "$ST_SLOT" \
+    --arg repo "$ST_REPO" \
+    --arg branch "$ST_BRANCH" \
+    --arg platform "$ST_PLATFORM" \
+    --arg target "$ST_TARGET" \
+    --arg run_command "$ST_RUN_COMMAND" \
+    --argjson port "${ST_PORT:-0}" \
+    --arg phase "$ST_PHASE" \
+    --argjson phase_index "${ST_PHASE_INDEX:-0}" \
+    --argjson phase_total "${ST_PHASE_TOTAL:-7}" \
+    --argjson percent "${ST_PERCENT:-null}" \
+    --arg status "$ST_STATUS" \
+    --argjson started_epoch "${ST_STARTED:-0}" \
+    --argjson updated_epoch "$now" \
+    --argjson phase_started_epoch "${ST_PHASE_STARTED:-0}" \
+    --arg message "$ST_MESSAGE" \
+    --arg logfile "$ST_LOGFILE" \
+    --argjson error "${ST_ERROR:-null}" \
+    '{schema:$schema, slot:$slot, repo:$repo, branch:$branch, platform:$platform,
+      target:$target, run_command:$run_command, port:$port, phase:$phase,
+      phase_index:$phase_index, phase_total:$phase_total, percent:$percent,
+      status:$status, started_epoch:$started_epoch, updated_epoch:$updated_epoch,
+      phase_started_epoch:$phase_started_epoch, message:$message,
+      logfile:$logfile, error:$error}' \
+    > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$out"
+  else
+    rm -f "$tmp"; return 1
+  fi
+}
+
+# status_phase <phase> <index> <message> [percent]: advance to a phase and write.
+# percent defaults to null (honest: unknown). Sets phase_started to now.
+status_phase() {
+  ST_PHASE=$1; ST_PHASE_INDEX=$2; ST_MESSAGE=$3
+  ST_PERCENT=${4:-null}
+  ST_PHASE_STARTED=$(date +%s)
+  banner "$ST_PHASE" "$ST_PHASE_INDEX" "$ST_PHASE_TOTAL" "$ST_MESSAGE"
+  status_write
+}
+
+# status_message <message> [percent]: update the message (and optional percent)
+# without changing phase, then write. Used for intra-phase progress.
+status_message() {
+  ST_MESSAGE=$1
+  [ $# -ge 2 ] && ST_PERCENT=$2
+  status_write
+}
+
+# status_fail <error>: terminal failed state with a specific error string.
+status_fail() {
+  ST_STATUS='failed'
+  ST_ERROR=$(printf '%s' "$1" | jq -Rs .)
+  status_write
+}
+
+# status_success: terminal success state.
+status_success() {
+  ST_STATUS='success'; ST_ERROR='null'; ST_PERCENT=100
+  ST_MESSAGE='build complete'
+  status_write
+}
+
 # --- disk headroom -----------------------------------------------------------
 
-# existing_ancestor <path>: the nearest ancestor of <path> that exists. The lab
-# home may not exist yet (e.g. doctor before a first build), so df has a real
-# path to report on.
+# existing_ancestor <path>: the nearest ancestor of <path> that exists.
 existing_ancestor() {
   local path=$1 parent
   while [ -n "$path" ] && [ ! -e "$path" ]; do
@@ -370,15 +713,13 @@ df_fstype() {
 free_gb() {
   local path kb
   path=$(existing_ancestor "$1")
-  # df -k reports 1024-byte blocks; column 4 is available. Portable on macOS.
   kb=$(df -Pk "$path" 2>/dev/null | awk 'NR==2 {print $4}')
   [ -n "$kb" ] || { printf '0\n'; return 0; }
   printf '%s\n' "$((kb / 1024 / 1024))"
 }
 
 # assert_disk_headroom <label>: refuse a multi-GB operation when free disk is
-# below the floor. LOUD, never silent. Override the floor with
-# FM_MOBILE_LAB_MIN_FREE_GB.
+# below the floor. LOUD, never silent.
 assert_disk_headroom() {
   local label=$1 free
   free=$(free_gb "$LAB_HOME")
@@ -390,8 +731,7 @@ assert_disk_headroom() {
 # --- APFS clone helpers ------------------------------------------------------
 
 # apfs_clone <src> <dst>: copy-on-write clone a directory tree with cp -c. Falls
-# back LOUDLY to a real recursive copy if clonefile is unsupported (non-APFS),
-# so the result is always correct, just slower and full-cost on disk.
+# back LOUDLY to a real recursive copy if clonefile is unsupported (non-APFS).
 apfs_clone() {
   local src=$1 dst=$2
   if cp -c -R "$src" "$dst" 2>/dev/null; then
@@ -404,8 +744,7 @@ apfs_clone() {
 # --- deps restore/install ----------------------------------------------------
 
 # install_deps <checkout-dir> <pkgmgr>: run the package manager's install in the
-# checkout. Kept separate so tests can stub it. Not run in tests (needs network
-# and a real tree).
+# checkout. Kept separate so tests can stub it.
 install_deps() {
   local dir=$1 pkgmgr=$2
   ( cd "$dir" && case "$pkgmgr" in
@@ -418,9 +757,8 @@ install_deps() {
 
 # ensure_node_modules <checkout-dir> <pkgmgr>: restore node_modules from the
 # lockfile-hash cache via APFS clone, or install-then-snapshot on a miss.
-# Records a one-line summary of what happened into the global DEPS_LINE and
-# prints progress directly (NOT via command substitution) so an install failure
-# aborts loudly instead of being swallowed by a subshell. Disk-guarded.
+# Records a one-line summary into DEPS_LINE and returns 0 on a cache HIT, 1 on a
+# miss-then-install (so the caller can distinguish a skipped vs run deps phase).
 DEPS_LINE=''
 ensure_node_modules() {
   local dir=$1 pkgmgr=$2 hash cache
@@ -434,29 +772,90 @@ ensure_node_modules() {
     return 0
   fi
   assert_disk_headroom "node_modules install"
-  # Install must succeed; a failure here is loud and fatal, never silent-wrong.
   install_deps "$dir" "$pkgmgr" \
     || die "$pkgmgr install failed in $dir; not caching a broken node_modules. Fix the install and retry."
-  # A dependency-less project produces no node_modules; that is a valid success,
-  # so materialize an empty dir to cache rather than treating it as a failure.
   [ -d "$dir/node_modules" ] || mkdir -p "$dir/node_modules"
-  # Snapshot into the cache via clone so the next slot restores cheaply.
   rm -rf "$cache"
   apfs_clone "$dir/node_modules" "$cache"
   DEPS_LINE="deps: installed and cached ($pkgmgr-$hash)"
+  return 1
+}
+
+# --- target resolution -------------------------------------------------------
+#
+# The lab resolves a CONCRETE target (a specific booted sim udid or a specific
+# connected device), never a vague generic destination. The resolved target
+# feeds both the slice gate (which arch/platform to check) and the run_command
+# (--udid/--device). host_arch is the deterministic target arch on this host.
+
+# host_arch: the target CPU arch for this host. Apple Silicon builds arm64;
+# an Intel host builds x86_64. This is the arch a sim/device build must match.
+host_arch() { uname -m 2>/dev/null || printf 'arm64\n'; }
+
+# booted_sim_udid: the udid of a currently-booted simulator, or empty. Prefers
+# the first Booted device simctl reports.
+booted_sim_udid() {
+  command -v xcrun >/dev/null 2>&1 || return 0
+  xcrun simctl list devices booted 2>/dev/null \
+    | grep -oE '\([0-9A-Fa-f-]{36}\) \(Booted\)' \
+    | grep -oE '[0-9A-Fa-f-]{36}' | head -1
+}
+
+# booted_sim_name_os: a human "name (iOS X.Y)" label for the booted sim, or empty.
+booted_sim_name_os() {
+  command -v xcrun >/dev/null 2>&1 || return 0
+  xcrun simctl list devices booted 2>/dev/null \
+    | awk '/-- iOS /{os=$0; sub(/^-- iOS /,"",os); sub(/ --.*/,"",os)}
+           /\(Booted\)/{name=$0; sub(/^[[:space:]]+/,"",name); sub(/ \([0-9A-Fa-f-]{36}\).*/,"",name);
+                        printf "%s (iOS %s)\n", name, os; exit}'
+}
+
+# connected_device_udid: the udid of the first connected physical iOS device.
+connected_device_udid() {
+  command -v xcrun >/dev/null 2>&1 || return 0
+  xcrun xctrace list devices 2>/dev/null \
+    | awk '/^== Devices ==/{d=1;next} /^== /{d=0} d' \
+    | grep -E '\([0-9]+\.[0-9]+.*\) \([0-9A-Fa-f-]{8,}\)' \
+    | grep -oE '\([0-9A-Fa-f-]{8,}\)$' | tr -d '()' | head -1
+}
+
+# connected_device_label: "<name> (<version>)" for the first connected device.
+connected_device_label() {
+  command -v xcrun >/dev/null 2>&1 || return 0
+  xcrun xctrace list devices 2>/dev/null \
+    | awk '/^== Devices ==/{d=1;next} /^== /{d=0} d' \
+    | grep -E '\([0-9]+\.[0-9]+.*\) \([0-9A-Fa-f-]{8,}\)' \
+    | head -1 | sed -E 's/ \([0-9A-Fa-f-]{8,}\)[[:space:]]*$//' \
+    | sed -E 's/[[:space:]]+$//'
+}
+
+# resolve_target <platform>: resolve the concrete target for a platform. On
+# success prints three TAB-separated fields: <run-flag>\t<flag-value>\t<label>
+# where run-flag is --udid (both platforms resolve a concrete udid) and label is
+# a human string for the status file. Returns non-zero and prints a reason to
+# stderr when no concrete target is available.
+resolve_target() {
+  local platform=$1 udid label
+  case "$platform" in
+    sim)
+      udid=$(booted_sim_udid)
+      [ -n "$udid" ] || { err "no booted iOS simulator; boot one (Simulator.app or 'xcrun simctl boot <udid>') then retry"; return 1; }
+      label=$(booted_sim_name_os); [ -n "$label" ] || label="simulator $udid"
+      printf '%s\t%s\t%s\n' '--udid' "$udid" "$label"
+      ;;
+    device)
+      udid=$(connected_device_udid)
+      [ -n "$udid" ] || { err "no connected iOS device; connect and trust one then retry"; return 1; }
+      label=$(connected_device_label); [ -n "$label" ] || label="device $udid"
+      printf '%s\t%s\t%s\n' '--udid' "$udid" "$label"
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 # --- top-level run flow ------------------------------------------------------
-#
-# run_build wires the steps together. The device/simulator-dependent tail
-# (native build, boot/install) is gated behind doctor-style capability checks
-# and clearly reports what it would do when the environment cannot do it, so
-# the engine lands and is exercisable without a real sim/device. See the report
-# caveat: the first real end-to-end iOS build is the captain's rollout check.
 
-# clone_dir <repo>: absolute path to the repo's clone under projects/. Resolves
-# the config's "clone" field (the directory name under projects/), defaulting to
-# the repo key itself.
+# clone_dir <repo>: absolute path to the repo's clone under projects/.
 clone_dir() {
   local repo=$1 clone
   clone=$(config_repo_field "$repo" clone)
@@ -469,12 +868,13 @@ run_build() {
   require_config
   config_repo_exists "$repo" || die "repo '$repo' is not defined in $CONFIG (configured: $(config_repos | paste -sd, -))"
 
-  local clone base_port pool scheme
+  local clone base_port pool run_cmd
   clone=$(clone_dir "$repo")
   [ -d "$clone/.git" ] || die "clone for '$repo' not found at $clone (clone it under projects/ first; the lab never creates or modifies the clone)"
   base_port=$(config_int "$repo" metro_port_base 8081)
   pool=$(config_int "$repo" pool_size 3)
-  scheme=$(config_repo_field "$repo" ios_scheme)
+  run_cmd=$(config_repo_field "$repo" run_command)
+  [ -n "$run_cmd" ] || die "config for '$repo' has no run_command; add e.g. \"run_command\": \"react-native run-ios --scheme 'Your Scheme'\" (post-Expo: \"npx expo run:ios\"). See docs/mobile-lab.md."
 
   ensure_dirs
   local idx name slot port now
@@ -485,69 +885,104 @@ run_build() {
   now=$(date +%s)
 
   log "fm-mobile-lab: $repo @ $branch -> slot $idx (port $port, $platform)"
+  log "  run_command: $run_cmd"
 
-  # 1. Fetch the branch into the clone's object store WITHOUT touching the
-  #    clone's working tree or checked-out branch (fetch only, never checkout in
-  #    the clone). The worktree is what gets the branch.
+  # Initialize build-status globals up front so even an early failure emits a
+  # contract-shaped status file the console can render.
+  ST_SLOT=$name ST_REPO=$repo ST_BRANCH=$branch ST_PLATFORM=$platform
+  ST_RUN_COMMAND=$run_cmd ST_PORT=$port ST_STATUS='running' ST_ERROR='null'
+  ST_STARTED=$now ST_PERCENT='null' ST_TARGET='(resolving)'
+  ST_LOGFILE="state/build-$name.log"
+  ST_PHASE_TOTAL=7
+
+  # Take the per-slot build lock around the whole pods+build+install sequence.
+  # Metro and the worktree are shared-safe; the native build + install into the
+  # slot's derivedData is what must be serialized.
+  if ! acquire_build_lock "$name"; then
+    ST_PHASE='preflight' ST_PHASE_INDEX=1
+    status_fail "another build is already running for slot $name (held by pid $(cat "$(build_lock_dir "$name")/pid" 2>/dev/null || echo '?')); wait for it or run a different slot with --slot"
+    die "slot $name is locked by another build; wait for it or pick a different --slot"
+  fi
+  # Release the lock however we exit from here on.
+  # shellcheck disable=SC2064
+  trap "release_build_lock '$name'" EXIT
+
+  # PHASE 1: preflight - resolve the concrete target and run the slice gate.
+  status_phase preflight 1 "resolving target and checking framework slices"
+  local target_flag target_value target_label arch
+  arch=$(host_arch)
+  local resolved
+  if ! resolved=$(resolve_target "$platform"); then
+    status_fail "could not resolve a concrete $platform target (see terminal output)"
+    die "target resolution failed for --$platform"
+  fi
+  IFS=$'\t' read -r target_flag target_value target_label <<< "$resolved"
+  ST_TARGET=$target_label
+  info "target: $target_label ($arch)"
+  status_message "resolved target: $target_label ($arch)"
+  # The slice gate needs the checked-out ios/ tree, so it runs AFTER the worktree
+  # phase below (the frameworks live in the slot's checkout, not before it).
+
+  # PHASE 2: worktree - fetch and check out the branch in the slot worktree.
+  status_phase worktree 2 "checking out $branch"
   assert_disk_headroom "worktree setup"
   git -C "$clone" fetch --quiet origin "$branch" 2>/dev/null \
     || warn "could not fetch origin/$branch (offline, or branch is local-only); using whatever '$branch' already resolves to"
-
-  # 2/3. Create-or-reuse the slot worktree and check out the branch in it.
   ensure_slot_worktree "$clone" "$slot" "$branch"
 
-  # 4. Detect toolchain from the CHECKOUT.
+  # Now the slot is populated: run the slice gate against the real ios/ tree.
+  status_message "checking framework slices for $arch/$platform"
+  local gate_reason
+  if ! gate_reason=$(slice_gate "$slot" "$platform" "$arch"); then
+    status_fail "$gate_reason"
+    err "$gate_reason"
+    die "pre-flight slice check failed: $gate_reason"
+  fi
+  info "slice check: OK (a $arch/$platform slice is available for every vendored framework)"
+
+  # Detect toolchain from the CHECKOUT and switch node.
   local pkgmgr node_v
   pkgmgr=$(detect_pkgmgr "$slot") || die "no known lockfile in $slot; cannot determine package manager"
   node_v=$(detect_node_version "$slot")
   info "toolchain: $pkgmgr${node_v:+, node $node_v}"
   switch_node "$node_v"
 
-  # 5. Deps: restore-or-install. Sets DEPS_LINE; aborts loudly on install fail.
-  ensure_node_modules "$slot" "$pkgmgr"
+  # PHASE 3: deps - restore-or-install node_modules. A cache hit is still shown
+  # as the deps phase (a near-instant one), so the console's phase tracker stays
+  # aligned with the canonical 7-phase vocabulary.
+  status_phase deps 3 "restoring node_modules"
+  ensure_node_modules "$slot" "$pkgmgr" || true
   info "$DEPS_LINE"
+  status_message "$DEPS_LINE"
 
-  # 6. Native fingerprint -> cache hit restores .app + Pods, miss rebuilds.
-  local fp app_cache native_line
-  fp=$(native_fingerprint "$slot" "$platform")
-  app_cache="$CACHE_DIR/app/$fp-$platform"
-  if [ -d "$app_cache" ] && [ -n "$(ls -A "$app_cache" 2>/dev/null)" ]; then
-    native_line="native: cached ($fp-$platform)"
-  else
-    native_line="native: NEEDS REBUILD ($fp-$platform not cached)"
-  fi
-  info "$native_line"
-
-  # 7. Metro on the slot's FIXED port.
+  # Metro on the slot's fixed port (long-lived; NOT part of the build lock).
   ensure_metro "$slot" "$port" "$pkgmgr"
 
-  # 8/9. Launch + report. The launch tail is capability-gated (see below).
-  state_set_slot "$name" "$repo" "$branch" "$port" "$fp" "$now"
+  state_set_slot "$name" "$repo" "$branch" "$port" "$now"
 
-  launch_or_gate "$repo" "$branch" "$platform" "$slot" "$port" "$scheme" "$fp" \
-                 "$app_cache" "$DEPS_LINE" "$native_line"
+  # PHASES 4-7: pods, compile, link, install - all owned by the wrapped
+  # run_command. The lab streams+tees its output, infers phase transitions from
+  # the CLI's own markers, and emits the status file throughout.
+  run_wrapped_build "$name" "$slot" "$run_cmd" "$target_flag" "$target_value" "$port"
+
+  status_success
+  log ""
+  log "READY: $repo @ $branch on $target_label"
+  info "slot:       $slot"
+  info "metro port: $port"
+  info "$DEPS_LINE"
+  info "log:        $ST_LOGFILE"
 }
 
 # ensure_slot_worktree <clone> <slot-path> <branch>: create the git worktree if
-# missing, then check out the branch inside the worktree. NEVER checks out in
-# the clone. Uses a detached checkout of the fetched ref so a branch already
-# checked out in another worktree does not collide.
+# missing, then check out the branch inside the worktree (detached).
 ensure_slot_worktree() {
   local clone=$1 slot=$2 branch=$3
-  # Prune stale registrations first: a slot dir removed out from under git (an
-  # interrupted run, a manual rm) leaves a "missing but already registered"
-  # entry that would otherwise fail `worktree add`.
   git -C "$clone" worktree prune >/dev/null 2>&1 || true
-  # A git worktree marks its root with a .git FILE (a gitdir pointer), not a
-  # directory, so test -e, not -d. Reuse an existing worktree; create otherwise.
   if [ ! -e "$slot/.git" ]; then
-    # Force past any residual registration for this exact path.
     git -C "$clone" worktree add --detach --force "$slot" HEAD >/dev/null 2>&1 \
       || die "failed to create worktree at $slot"
   fi
-  # Resolve the branch to a concrete commit, preferring the just-fetched remote
-  # ref, then a local branch, then the raw name. Detached checkout avoids the
-  # "branch already checked out" error across slots.
   local ref
   if git -C "$slot" rev-parse --verify --quiet "origin/$branch^{commit}" >/dev/null 2>&1; then
     ref="origin/$branch"
@@ -561,12 +996,7 @@ ensure_slot_worktree() {
 }
 
 # switch_node <version>: switch node via fnm if available and a version is asked
-# for. Best-effort: a missing fnm or version is a warning, not a failure (the
-# ambient node may already be right). fnm's own "fnm use" needs its shell
-# environment set up first (eval "$(fnm env)"), or the switch silently fails
-# and the process stays on ambient node; do that before "fnm use", then verify
-# the switch actually took effect so a repo that needs an exact node (e.g.
-# engineStrict) never builds on the wrong one without a loud warning.
+# for. Best-effort; a missing fnm/version is a warning, not a failure.
 switch_node() {
   local v=$1
   [ -n "$v" ] || return 0
@@ -582,9 +1012,7 @@ switch_node() {
 }
 
 # node_version_matches <requested> <actual v-prefixed>: 0 if actual satisfies
-# the requested major[.minor[.patch]] prefix (e.g. requested "20" or "20.18"
-# both match actual "v20.18.3"). Used to confirm a "fnm use" switch really
-# landed, since a stale environment can report success while node is unchanged.
+# the requested major[.minor[.patch]] prefix.
 node_version_matches() {
   local requested=$1 actual=$2
   requested=${requested%.}
@@ -603,8 +1031,7 @@ metro_running() {
 }
 
 # ensure_metro <slot> <port> <pkgmgr>: start Metro on the slot's fixed port if
-# not already running there. Backgrounded and detached; the slot owns it for the
-# session. Metro is deliberately long-lived and is stopped via `stop`.
+# not already running there. Backgrounded and detached; the slot owns it.
 ensure_metro() {
   local slot=$1 port=$2 pkgmgr=$3
   if metro_running "$port"; then
@@ -621,156 +1048,138 @@ ensure_metro() {
   info "metro: started on $port (log: $logf)"
 }
 
-# launch_or_gate: the device/simulator tail. When the environment can build and
-# run (doctor-style checks pass), it would perform the native build (on a cache
-# miss) and install/boot. When it cannot (no sim runtime, no device, tight
-# disk), it reports exactly what remains, clearly, and exits 0 with the slot
-# warm and Metro up, so the JS-only and caching machinery is fully usable and
-# the device-dependent piece is a clean, gated follow-up.
-launch_or_gate() {
-  local repo=$1 branch=$2 platform=$3 slot=$4 port=$5 scheme=$6 fp=$7 \
-        app_cache=$8 deps_line=$9 native_line=${10}
+# --- wrapped-build execution -------------------------------------------------
+#
+# The heart of the wrapper. Runs the repo's configured run_command (with the
+# resolved target + port appended), streaming its output to the terminal AND
+# tee'ing the full output to state/build-<slot>.log, while a background monitor
+# infers phase transitions from the CLI's own markers, emits the status file on
+# every transition and at least every BUILD_HEARTBEAT_SECS, and prints a
+# heartbeat on long phases. Best-effort but honest: percent is null unless a
+# "Compiling X/Y" count is parsed.
 
-  log ""
-  log "READY:"
-  info "repo:        $repo"
-  info "branch:      $branch"
-  info "slot:        $slot"
-  info "metro port:  $port"
-  info "platform:    $platform"
-  info "$deps_line"
-  info "$native_line"
-
-  local can_build=1 reason=''
-  case "$platform" in
-    sim)
-      if ! have_ios_toolchain; then can_build=0; reason='no Xcode/xcodebuild'; fi
-      if ! have_booted_or_bootable_sim; then can_build=0; reason=${reason:-'no available iOS simulator runtime'}; fi
-      ;;
-    device)
-      if ! have_ios_toolchain; then can_build=0; reason='no Xcode/xcodebuild'; fi
-      if ! have_connected_device; then can_build=0; reason=${reason:-'no connected iOS device'}; fi
-      ;;
+# infer_phase_from_line <line>: map a line of RN/Expo CLI output to a phase name
+# from the contract vocabulary, or empty if the line is not a transition marker.
+# Best-effort pattern match against the CLI's actual output.
+infer_phase_from_line() {
+  local line=$1
+  case "$line" in
+    *"Installing "*" on "*|*"Installing app"*|*"Launching"*|*"Successfully launched"*|*"Installing and launching"*)
+      printf 'install\n' ;;
+    *"pod install"*|*"Installing CocoaPods"*|*"Analyzing dependencies"*|*"Installing "*" pod"*)
+      printf 'pods\n' ;;
+    *"Compiling"*|*"CompileC"*|*"CompileSwift"*|*"Building"*)
+      printf 'compile\n' ;;
+    *"Ld "*|*"Linking"*)
+      printf 'link\n' ;;
+    *) printf '' ;;
   esac
+}
 
-  if [ "$can_build" = "0" ]; then
-    log ""
-    warn "device/simulator launch is GATED: $reason."
-    log "The slot is warm (worktree checked out, deps ready, Metro on port $port)."
-    log "To finish on a real $platform, run 'fm-mobile-lab doctor' and resolve the"
-    log "reported gaps, then re-run this command. The native build + install step"
-    log "is intentionally gated behind these checks so a JS-only workflow never"
-    log "needs a device. See docs/mobile-lab.md 'Native build and device launch'."
-    return 0
+# parse_compile_count <line>: if the line carries a "Compiling X/Y"-style count,
+# print an integer percent (0-100); otherwise print nothing. Only used to refine
+# the compile phase; never fakes progress.
+parse_compile_count() {
+  local line=$1 x y
+  if [[ $line =~ \(([0-9]+)/([0-9]+)\) ]]; then
+    x=${BASH_REMATCH[1]}; y=${BASH_REMATCH[2]}
+    [ "$y" -gt 0 ] 2>/dev/null || return 0
+    printf '%s\n' "$(( x * 100 / y ))"
   fi
-
-  # Environment is capable. Perform the gated native build + launch.
-  native_build_and_launch "$repo" "$branch" "$platform" "$slot" "$port" \
-                          "$scheme" "$fp" "$app_cache"
 }
 
-# native_build_and_launch: the real iOS build + install/boot. This is the piece
-# the smoke-test could not run end to end (no sim runtime + tight disk), so it
-# is written to be correct and LOUD, and only runs when the doctor-style checks
-# above passed. It bakes the slot's fixed RCT_METRO_PORT and forces a clean
-# React-Core rebuild when the port changed (report caveat: an incremental build
-# keeps the OLD baked port).
-native_build_and_launch() {
-  local repo=$1 branch=$2 platform=$3 slot=$4 port=$5 scheme=$6 fp=$7 app_cache=$8
-  [ -n "$scheme" ] || die "config for '$repo' has no ios_scheme; cannot run xcodebuild"
+# stream_build_output <logfile>: read the wrapped build's combined output on
+# stdin, echo each line to the terminal, append it to <logfile>, and drive
+# phase/status transitions and heartbeats. Kept as its own function (not an
+# inline subshell) so `local` is valid and the loop is unit-testable in
+# isolation. Reads BUILD_HEARTBEAT_SECS and the ST_* status globals; writes the
+# status file via status_phase/status_message. The initial phase is `pods`
+# (index 4), the first of the wrapped CLI's phases.
+stream_build_output() {
+  local logfile=$1
+  local line last_beat now phase cur_phase='pods' cur_idx=4 pct el
+  last_beat=$(date +%s)
+  while IFS= read -r line; do
+    printf '%s\n' "$line"                 # terminal
+    printf '%s\n' "$line" >> "$logfile"   # logfile
+    phase=$(infer_phase_from_line "$line")
+    if [ -n "$phase" ] && [ "$phase" != "$cur_phase" ]; then
+      case "$phase" in
+        pods) cur_idx=4 ;;
+        compile) cur_idx=5 ;;
+        link) cur_idx=6 ;;
+        install) cur_idx=7 ;;
+      esac
+      cur_phase=$phase
+      status_phase "$cur_phase" "$cur_idx" "$line"
+      last_beat=$(date +%s)
+    else
+      pct=$(parse_compile_count "$line")
+      now=$(date +%s)
+      if [ -n "$pct" ] || [ $((now - last_beat)) -ge "$BUILD_HEARTBEAT_SECS" ]; then
+        if [ -n "$pct" ] && [ "$cur_phase" = "compile" ]; then
+          status_message "$line" "$pct"
+        else
+          el=$((now - ST_PHASE_STARTED))
+          printf '  ... still %s (%ss elapsed)\n' "$cur_phase" "$el"
+          status_message "$line"
+        fi
+        last_beat=$now
+      fi
+    fi
+  done
+}
 
-  assert_disk_headroom "native build"
+# run_wrapped_build <slot-name> <slot-dir> <base-cmd> <target-flag> <target-value> <port>:
+# assemble and run the wrapped run_command, streaming + tee'ing through
+# stream_build_output, inferring phase transitions, and emitting the status
+# file. Fails (non-zero, terminal status) with a specific error when the CLI
+# exits non-zero. The build's PIPESTATUS[0] is the authoritative exit code (tee
+# via the reader must not mask a non-zero build).
+run_wrapped_build() {
+  local name=$1 slot=$2 base=$3 tflag=$4 tval=$5 port=$6
+  local full logfile rc=0
+  full=$(build_run_command "$base" "$tflag" "$tval" "$port")
+  logfile="$STATE_DIR/build-$name.log"
+  : > "$logfile"
 
-  # Bake the fixed port so the compiled binary always asks this port for its
-  # bundle (report Mechanic 2). Written to ios/.xcode.env.local, which the RN
-  # build phase sources and which is gitignored in the target repos.
-  printf 'export RCT_METRO_PORT=%s\n' "$port" > "$slot/ios/.xcode.env.local"
+  status_phase pods 4 "starting wrapped build: $full"
+  info "running: $full"
+  info "log: state/build-$name.log"
 
-  if [ -d "$app_cache" ] && [ -n "$(ls -A "$app_cache" 2>/dev/null)" ]; then
-    info "native: using cached app for $fp-$platform"
-  else
-    info "native: pod install + build (fingerprint $fp-$platform not cached)"
-    ( cd "$slot/ios" && pod install )
-    # Force a clean build so the new RCT_METRO_PORT actually recompiles
-    # React-Core (report caveat: incremental builds keep the old baked port).
-    do_xcodebuild "$slot" "$scheme" "$platform"
-    snapshot_app "$slot" "$scheme" "$platform" "$app_cache"
+  # Pipe the wrapped command's combined stdout+stderr through the reader. The
+  # fixed Metro port is baked into the environment (RCT_METRO_PORT) so the built
+  # binary asks this slot's port for its bundle. PIPESTATUS[0] captures the
+  # build's own exit code independent of the reader.
+  ( cd "$slot" && RCT_METRO_PORT="$port" exec bash -c "$full" ) 2>&1 \
+    | stream_build_output "$logfile"
+  rc=${PIPESTATUS[0]}
+
+  if [ "$rc" -ne 0 ]; then
+    status_fail "wrapped run_command failed (exit $rc): $full - see log at state/build-$name.log"
+    err "build failed (exit $rc). Full log: $logfile"
+    die "wrapped run_command exited $rc; see $logfile"
   fi
-
-  install_and_boot "$slot" "$scheme" "$platform" "$app_cache" "$port"
-  log "launched on $platform, pointed at Metro port $port."
-}
-
-# The following are thin wrappers around the real toolchain. They are the parts
-# that genuinely need a sim/device and are only ever called after the capability
-# gate passed. Kept as small named functions so the flow reads clearly and so a
-# future change (or a test with fakes) can override them.
-
-do_xcodebuild() {
-  local slot=$1 scheme=$2 platform=$3 destination
-  case "$platform" in
-    sim)    destination='generic/platform=iOS Simulator' ;;
-    device) destination='generic/platform=iOS' ;;
-  esac
-  ( cd "$slot/ios" && xcodebuild \
-      -workspace "$scheme.xcworkspace" \
-      -scheme "$scheme" \
-      -configuration Debug \
-      -destination "$destination" \
-      -derivedDataPath build \
-      clean build )
-}
-
-snapshot_app() {
-  local slot=$1 scheme=$2 platform=$3 app_cache=$4 app
-  app=$(find "$slot/ios/build" -type d -name "$scheme.app" 2>/dev/null | head -1)
-  [ -n "$app" ] || { warn "could not locate built $scheme.app to cache; skipping snapshot"; return 0; }
-  rm -rf "$app_cache"; mkdir -p "$app_cache"
-  apfs_clone "$app" "$app_cache/$scheme.app"
-}
-
-install_and_boot() {
-  local slot=$1 scheme=$2 platform=$3 app_cache=$4 port=$5 app
-  app=$(find "$app_cache" -type d -name '*.app' 2>/dev/null | head -1)
-  [ -n "$app" ] || die "no .app found in cache $app_cache to install"
-  case "$platform" in
-    sim)
-      xcrun simctl boot booted 2>/dev/null || true
-      xcrun simctl install booted "$app"
-      ;;
-    device)
-      warn "device install requires a paired device and codesigning; ensure the target repo's signing is set up."
-      xcrun devicectl device install app --device "$(first_device_udid)" "$app" 2>/dev/null \
-        || die "device install failed (check pairing, trust, and signing)"
-      ;;
-  esac
+  # The reader ran in the pipe subshell, so its phase transitions did not
+  # propagate here. A completed wrapped build always ends at the install phase;
+  # reflect that in the parent so the terminal status_success write is accurate.
+  ST_PHASE='install' ST_PHASE_INDEX=7
 }
 
 # --- capability probes (also used by doctor) --------------------------------
 
 have_ios_toolchain() { command -v xcodebuild >/dev/null 2>&1; }
 
-# have_booted_or_bootable_sim: true if a simulator is booted OR at least one
-# available (runtime-backed) simulator device exists to boot.
 have_booted_or_bootable_sim() {
   command -v xcrun >/dev/null 2>&1 || return 1
   xcrun simctl list devices available 2>/dev/null | grep -qE '\([0-9A-Fa-f-]{36}\)'
 }
 
-# have_connected_device: true if xctrace lists at least one real device under
-# its "== Devices ==" section (excluding the "== Simulators ==" section and the
-# host Mac itself, which carries no (UDID) with an iOS-style identifier line).
-# A physical iOS device shows as "<name> (<version>) (<udid>)".
 have_connected_device() {
   command -v xcrun >/dev/null 2>&1 || return 1
   xcrun xctrace list devices 2>/dev/null \
     | awk '/^== Devices ==/{d=1;next} /^== /{d=0} d' \
     | grep -qE '\([0-9]+\.[0-9]+.*\) \([0-9A-Fa-f-]{8,}\)'
-}
-
-first_device_udid() {
-  xcrun xctrace list devices 2>/dev/null \
-    | grep -oE '\(([0-9A-Fa-f-]{25,})\)' | tr -d '()' | head -1
 }
 
 # --- subcommands -------------------------------------------------------------
@@ -800,8 +1209,6 @@ cmd_ls() {
   log "DISK:"
   info "slots dir: $(dir_size "$SLOTS_DIR")   cache: $(dir_size "$CACHE_DIR")   free: $(free_gb "$LAB_HOME")GiB"
   info "  node_modules cache: $(dir_size "$CACHE_DIR/node_modules")"
-  info "  pods cache:         $(dir_size "$CACHE_DIR/pods")"
-  info "  app cache:          $(dir_size "$CACHE_DIR/app")"
 }
 
 cmd_stop() {
@@ -823,7 +1230,7 @@ cmd_stop() {
 }
 
 # stop_slot <slot-name>: stop the slot's Metro and free the slot record. The
-# worktree is left in place (warm) unless it holds no record; Metro is killed.
+# worktree is left in place (warm); Metro is killed.
 stop_slot() {
   local s=$1 rec port pidf
   rec=$(state_get_slot "$s")
@@ -844,33 +1251,20 @@ stop_slot() {
   log "freed slot $s (worktree left warm at $SLOTS_DIR/$s)"
 }
 
-# cmd_gc: prune cache layers not referenced by any live slot AND older than
-# GC_MAX_AGE_DAYS. LOGS everything it drops; never silently truncates. A
-# referenced layer or a recent layer is kept regardless.
+# cmd_gc: prune node_modules cache layers older than GC_MAX_AGE_DAYS. There is
+# no app cache to prune anymore. LOGS everything it drops.
 cmd_gc() {
   require_config
   ensure_dirs
-  local referenced fp_ref
-  # Fingerprints referenced by live slots (native/app cache protection).
-  fp_ref=$(jq -r '.slots[].fingerprint // empty' "$SLOTS_STATE" 2>/dev/null | sort -u)
-  log "gc: pruning cache layers older than $GC_MAX_AGE_DAYS days and unreferenced by any slot."
-  local dropped=0 kept=0 layer base age_days now
+  log "gc: pruning node_modules cache layers older than $GC_MAX_AGE_DAYS days."
+  local dropped=0 kept=0 layer base age_days now name
   now=$(date +%s)
-  for base in "$CACHE_DIR/node_modules" "$CACHE_DIR/pods" "$CACHE_DIR/app"; do
-    [ -d "$base" ] || continue
+  base="$CACHE_DIR/node_modules"
+  if [ -d "$base" ]; then
     for layer in "$base"/*; do
       [ -e "$layer" ] || continue
-      local name; name=$(basename "$layer")
-      # app-cache layers are named <fp>-<platform>; protect referenced fingerprints.
-      referenced=0
-      if [ "$base" = "$CACHE_DIR/app" ]; then
-        local lfp; lfp=${name%-*}
-        if printf '%s\n' "$fp_ref" | grep -qxF "$lfp"; then referenced=1; fi
-      fi
+      name=$(basename "$layer")
       age_days=$(layer_age_days "$layer" "$now")
-      if [ "$referenced" = "1" ]; then
-        kept=$((kept+1)); continue
-      fi
       if [ "$age_days" -lt "$GC_MAX_AGE_DAYS" ]; then
         kept=$((kept+1)); continue
       fi
@@ -878,7 +1272,7 @@ cmd_gc() {
       rm -rf "$layer"
       dropped=$((dropped+1))
     done
-  done
+  fi
   log "gc: dropped $dropped layer(s), kept $kept."
 }
 
@@ -899,6 +1293,8 @@ cmd_doctor() {
   probe_line "fnm"         "$(command -v fnm || true)"        "$(fnm --version 2>/dev/null || true)"
   probe_line "xcodebuild"  "$(command -v xcodebuild || true)" "$(xcodebuild -version 2>/dev/null | head -1 || true)"
   probe_line "cocoapods"   "$(command -v pod || true)"        "$(pod --version 2>/dev/null || true)"
+  probe_line "lipo"        "$(command -v lipo || true)"
+  probe_line "vtool"       "$(command -v vtool || true)"
   probe_line "watchman"    "$(command -v watchman || true)"
   # Simulators
   if have_ios_toolchain && command -v xcrun >/dev/null 2>&1; then
@@ -917,6 +1313,14 @@ cmd_doctor() {
   else
     log "devices:     NONE connected -- connect and trust a device to build for --device"
   fi
+  # Per-repo platform viability: run the slice gate against each repo's slot
+  # worktree (if warm) or clone, so doctor reports which platforms are actually
+  # buildable per repo (the FFmpeg case surfaces here, not mid-build).
+  if config_present; then
+    log ""
+    log "per-repo platform viability (framework-slice check):"
+    doctor_repo_viability
+  fi
   # Disk
   local free; free=$(free_gb "$LAB_HOME")
   if [ "$free" -ge "$MIN_FREE_GB" ]; then
@@ -924,10 +1328,7 @@ cmd_doctor() {
   else
     log "disk:        LOW (${free}GiB free, need >= ${MIN_FREE_GB}GiB) -- clone/install will refuse; run 'fm-mobile-lab gc' or free space"
   fi
-  # Filesystem type of the volume that will hold the lab home. df -Y reports the
-  # fs type in column 2 for any path (macOS), resolving through mount points,
-  # which diskutil info does not do for a plain directory path. APFS is what
-  # makes clonefile dedup work; a non-APFS volume falls back to full copies.
+  # Filesystem type of the volume that will hold the lab home.
   local fstype
   fstype=$(df_fstype "$LAB_HOME")
   case "$fstype" in
@@ -935,6 +1336,32 @@ cmd_doctor() {
     '')   log "filesystem:  unknown (could not determine; clonefile may or may not be available)" ;;
     *)    log "filesystem:  $fstype at $LAB_HOME -- non-APFS, slots fall back to full copies (more disk, slower)" ;;
   esac
+}
+
+# doctor_repo_viability: for each configured repo, find an ios/ tree to inspect
+# (a warm slot worktree first, else the clone) and run the slice gate for both
+# platforms with the host arch, reporting which are viable. Reports "no ios/
+# tree found" when neither a slot nor the clone has one.
+doctor_repo_viability() {
+  local repo arch; arch=$(host_arch)
+  while IFS= read -r repo; do
+    [ -n "$repo" ] || continue
+    local dir='' clone slot0
+    clone=$(clone_dir "$repo")
+    slot0="$SLOTS_DIR/$(slot_name "$repo" 0)"
+    if [ -d "$slot0/ios" ]; then dir=$slot0
+    elif [ -d "$clone/ios" ]; then dir=$clone
+    fi
+    if [ -z "$dir" ]; then
+      info "$repo: no ios/ tree found (warm a slot or clone first to check slices)"
+      continue
+    fi
+    local sim_r dev_r sim_ok dev_ok
+    if sim_r=$(slice_gate "$dir" sim "$arch"); then sim_ok="viable"; else sim_ok="NO ($sim_r)"; fi
+    if dev_r=$(slice_gate "$dir" device "$arch"); then dev_ok="viable"; else dev_ok="NO ($dev_r)"; fi
+    info "$repo ($arch): --sim: $sim_ok"
+    info "$repo ($arch): --device: $dev_ok"
+  done <<< "$(config_repos)"
 }
 
 # --- small formatting helpers -----------------------------------------------
@@ -975,8 +1402,10 @@ fmt_epoch() {
 
 usage() {
   cat <<EOF
-fm-mobile-lab - build/test React Native branches on iOS sims and devices with a
-                fingerprint-keyed native cache and warm git-worktree slots.
+fm-mobile-lab - build/test React Native branches on iOS sims and devices by
+                wrapping each repo's own run command, with warm git-worktree
+                slots, per-slot Metro ports, a node_modules cache, a
+                framework-slice pre-flight gate, and streaming progress.
 
 USAGE:
   fm-mobile-lab <repo> <branch> --sim|--device [--slot N]
@@ -991,10 +1420,13 @@ PLATFORM IS EXPLICIT: you must pass --sim or --device (no default).
 <branch> the git branch to try; fetched into a worktree, never into the clone.
 --slot N pin to slot index N (0-based) instead of the LRU/auto choice.
 
-The common case (a JS-only branch change) is checkout + Metro reload: no
-reinstall, no native rebuild. Dependency changes restore-or-install; native
-changes rebuild once and are then cached. JS is never cached (always live from
-Metro).
+The lab wraps the repo's configured run_command (e.g. react-native run-ios;
+post-Expo, npx expo run:ios), appending the resolved concrete target (--udid)
+and this slot's Metro port. It does NOT reimplement xcodebuild. A pre-flight
+framework-slice check fails fast when the app cannot build for the target (e.g.
+an FFmpeg framework with no arm64-simulator slice -> "use --device"). Build
+progress streams to the terminal and to state/build-<slot>.log, and a
+machine-readable status file lands at state/lab-build-<slot>.json.
 
 Config lives at: $CONFIG
 Lab home:        $LAB_HOME
