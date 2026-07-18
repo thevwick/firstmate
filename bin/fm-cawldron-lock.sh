@@ -143,7 +143,7 @@ if [ "${#live_crew_ids[@]}" -gt 0 ]; then
   {
     printf '●%s\n' "$FM_CAWLDRON_RULE"
     printf '●  CAWLDRON LOCK SET WHILE A CREW IS ALREADY ON %s\n' "$PROJECT"
-    printf '●  Live crew(s) already recorded on this project: %s\n' "${live_crew_ids[*]}"
+    printf '●  Crew(s) recorded on this project: %s\n' "${live_crew_ids[*]}"
     printf '●  The lock does not stop or notify a crew already running. It DOES gate a\n'
     printf '●  later relaunch: recovering or respawning one of those crews through\n'
     printf '●  fm-spawn.sh is refused while the lock is set, and needs --force-locked.\n'

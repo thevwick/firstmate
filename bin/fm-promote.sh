@@ -54,15 +54,21 @@ grep -qx 'kind=scout' "$META" || { echo "error: task $ID is not a scout task (ki
 # ship/scout check uses, so the locked/unlocked test and the refusal wording have
 # exactly one owner (bin/fm-cawldron-lock-lib.sh); only the action phrase differs.
 proj_field=$(grep '^project=' "$META" | head -1 | cut -d= -f2- || true)
+CAWLDRON_FORCE_LOCKED_USED=0
 if [ -n "$proj_field" ]; then
   fm_cawldron_gate "$STATE" "$proj_field" "$FORCE_LOCKED_EFFECTIVE" promote || exit 1
+  # FM_CAWLDRON_OVERRODE is set by fm_cawldron_gate; captured here so a promote
+  # that actually bypassed an active lock leaves the same durable meta trace
+  # bin/fm-spawn.sh records, not just the stderr warning already printed.
+  CAWLDRON_FORCE_LOCKED_USED=$FM_CAWLDRON_OVERRODE
 else
   echo "warning: cannot verify the Cawldron lock for $ID: no project recorded in $META" >&2
 fi
 
 TMP="$META.tmp"
-grep -v '^kind=' "$META" > "$TMP"
+grep -vE '^kind=|^cawldron_force_locked=' "$META" > "$TMP"
 echo "kind=ship" >> "$TMP"
+[ "$CAWLDRON_FORCE_LOCKED_USED" -eq 0 ] || echo "cawldron_force_locked=1" >> "$TMP"
 mv "$TMP" "$META"
 
 HOME_Q=$(printf '%q' "$FM_HOME")
