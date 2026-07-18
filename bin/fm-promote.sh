@@ -53,6 +53,8 @@ grep -qx 'kind=scout' "$META" || { echo "error: task $ID is not a scout task (ki
 proj_field=$(grep '^project=' "$META" | head -1 | cut -d= -f2- || true)
 if [ -n "$proj_field" ]; then
   fm_cawldron_gate "$STATE" "$proj_field" "$FORCE_LOCKED_EFFECTIVE" promote || exit 1
+else
+  echo "warning: cannot verify the Cawldron lock for $ID: no project recorded in $META" >&2
 fi
 
 TMP="$META.tmp"

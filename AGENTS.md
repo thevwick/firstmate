@@ -93,7 +93,7 @@ state/               volatile runtime signals; gitignored
   .pr-check-quarantine/  private non-runnable storage for checks neutralized by the non-executing migration
   .pr-check-migration.log  private per-task outcomes distinguishing rebuilt or canonically registered replacement polls, quarantined unarmed polls, and incomplete migrations
   .pr-check-migration-scan-v1  private marker proving the non-executing scan disabled every unsafe legacy check; .pr-check-migration-v1 separately records completed private repairs
-  cawldron-lock-<project>  advisory per-project lock set by bin/fm-cawldron-lock.sh while the captain is live in a Cawldron session on that project; read by fm-spawn.sh's ship/scout collision gate (section 7) and surfaced at session start
+  cawldron-lock-<project>  advisory per-project lock set by bin/fm-cawldron-lock.sh while the captain is live in a Cawldron session on that project; read by fm-spawn.sh's ship/scout collision gate and fm-promote.sh's identical gate (section 7) and surfaced at session start
   x-watch.check.sh   generated X-mode relay poll shim; present only when opted in (section 14)
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
   x-context/         generated X-mode durable per-request reply context (platform/budget), keyed by request_id; survives inbox cleanup so a delayed follow-up recovers the original platform (section 14; bin/fm-x-lib.sh)
@@ -242,7 +242,7 @@ The spawn must resolve a genuine isolated task worktree distinct from the primar
 After spawning, confirm the worker is processing the brief, handle any trust dialog through `harness-adapters`, and record ship or scout work as under way.
 A persistent secondmate is recorded in the secondmate registry and runtime state, never as a backlog work item.
 
-Never dispatch a ship or scout crew to a project Cawldron-locked (`bin/fm-cawldron-lock.sh --list`) without the captain's explicit go (`fm-spawn.sh --force-locked`); a locked project's working tree may hold the captain's uncommitted live Cawldron edits to reconcile against a crew's PR before landing either.
+Never dispatch a ship or scout crew, or promote a scout to ship, on a project Cawldron-locked (`bin/fm-cawldron-lock.sh --list`) without the captain's explicit go (`fm-spawn.sh --force-locked` or `fm-promote.sh --force-locked`); a locked project's working tree may hold the captain's uncommitted live Cawldron edits to reconcile against a crew's PR before landing either.
 Set or clear that lock with `bin/fm-cawldron-lock.sh` yourself whenever the captain goes live in, or leaves, a Cawldron session on a project.
 
 Steer a worker with short single-line messages through fail-closed `fm-send`; put long instructions in a file.
