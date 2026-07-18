@@ -16,7 +16,8 @@
 #                 "NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>",
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed: <reason>",
-#                 "FMX: X mode on ..." or "FMX: X mode off ...".
+#                 "FMX: X mode on ..." or "FMX: X mode off ...",
+#                 "CAWLDRON_LOCK: <project> (since <age>[, note: <text>])".
 #          When a RUNNING secondmate worktree is fast-forwarded to firstmate's
 #          own current default-branch commit (a purely LOCAL fast-forward, never
 #          an origin fetch) AND its loaded instruction surface (AGENTS.md, bin/,
@@ -43,6 +44,10 @@
 #          A TANGLE line means the firstmate primary checkout (FM_ROOT) is stranded
 #          on a feature branch instead of its default branch - a crewmate's work
 #          landed in the primary instead of its own worktree; restore it per the line.
+#          A CAWLDRON_LOCK line surfaces one active Cawldron coordination lock
+#          (state/cawldron-lock-<project>; bin/fm-cawldron-lock.sh), one per active
+#          lock, silent when none. Purely read-only detection - it runs the same
+#          way whether or not FM_BOOTSTRAP_DETECT_ONLY is set.
 #          treehouse is also MISSING when its installed version lacks
 #          "treehouse get --lease" support.
 #          no-mistakes is also MISSING when its installed version is older than
@@ -100,6 +105,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-x-lib.sh"
 # shellcheck source=bin/fm-backend.sh disable=SC1091
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-cawldron-lock-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-cawldron-lock-lib.sh"
 
 fleet_sync_origin_backed_project_count() {
   local count proj
@@ -788,6 +795,20 @@ if [ -n "$tangle_branch" ]; then
   else
     echo "TANGLE: primary checkout on feature branch '$tangle_branch' (expected '$tangle_default'); the work is safe on that ref - restore the primary with: git -C $FM_ROOT checkout $tangle_default, then re-validate the branch in a proper worktree"
   fi
+fi
+# Cawldron coordination lock: read-only detection of any active lock
+# (bin/fm-cawldron-lock.sh; bin/fm-cawldron-lock-lib.sh owns the marker format).
+# Mutates nothing itself, so it runs in the read-only/lock-refused path too.
+if [ -d "$STATE" ]; then
+  while IFS=$'\t' read -r cawl_project cawl_since cawl_note; do
+    [ -n "$cawl_project" ] || continue
+    cawl_age=$(fm_cawldron_lock_age_human "$cawl_since")
+    if [ -n "$cawl_note" ]; then
+      echo "CAWLDRON_LOCK: $cawl_project (since $cawl_age, note: $cawl_note)"
+    else
+      echo "CAWLDRON_LOCK: $cawl_project (since $cawl_age)"
+    fi
+  done < <(fm_cawldron_lock_list "$STATE")
 fi
 crew=
 [ -f "$CONFIG/crew-harness" ] && crew=$(tr -d '[:space:]' < "$CONFIG/crew-harness" || true)

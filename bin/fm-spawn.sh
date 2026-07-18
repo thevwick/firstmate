@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--scout]
+# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--scout] [--force-locked]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
@@ -57,10 +57,16 @@
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real
 #   git worktree root distinct from the primary project checkout.
+#   A ship/scout spawn whose resolved project is Cawldron-locked
+#   (state/cawldron-lock-<project>; bin/fm-cawldron-lock.sh) is refused with a
+#   loud banner naming the project and lock age, unless --force-locked is passed
+#   or FM_SPAWN_FORCE_LOCKED=1 is set. --secondmate spawns are exempt.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
-#   source of truth; shared --scout/--harness/--model/--effort/--backend applies to every pair.
+#   source of truth; shared --scout/--harness/--model/--effort/--backend/--force-locked
+#   applies to every pair. A locked pair without the override is reported and
+#   skipped; the rest of the batch still launches.
 #   If config/crew-dispatch.json exists, shared --harness is required for crewmate
 #   and scout batches. The loop lives here, in bash, so callers never hand-write a
 #   multi-task shell loop (the tool shell is zsh, which does not word-split unquoted
@@ -84,7 +90,7 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,78p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,87p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -108,6 +114,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-cawldron-lock-lib.sh
+. "$SCRIPT_DIR/fm-cawldron-lock-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -123,6 +131,7 @@ HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
 BACKEND_SET=0
+FORCE_LOCKED=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -143,6 +152,7 @@ for a in "$@"; do
   case "$a" in
     --scout) KIND=scout ;;
     --secondmate) KIND=secondmate ;;
+    --force-locked) FORCE_LOCKED=1 ;;
     --harness) want_value=harness ;;
     --harness=*) HARNESS_ARG=${a#--harness=}; HARNESS_SET=1 ;;
     --model) want_value=model ;;
@@ -163,6 +173,13 @@ case "$EFFORT" in
   ''|low|medium|high|xhigh|max) ;;
   *) echo "error: --effort must be one of low, medium, high, xhigh, max" >&2; exit 1 ;;
 esac
+
+# Cawldron coordination lock override: --force-locked or FM_SPAWN_FORCE_LOCKED=1
+# skip the collision gate below (fm_cawldron_spawn_gate). The env var needs no
+# batch-forwarding: re-exec'd batch pairs inherit the parent's environment.
+FORCE_LOCKED_EFFECTIVE=0
+[ "$FORCE_LOCKED" -eq 0 ] || FORCE_LOCKED_EFFECTIVE=1
+[ "${FM_SPAWN_FORCE_LOCKED:-0}" != 1 ] || FORCE_LOCKED_EFFECTIVE=1
 
 # Backend selection (data/fm-backend-design-d7): explicit --backend, else
 # FM_BACKEND env, else config/backend, else runtime auto-detection, else
@@ -262,6 +279,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$MODEL" ] || shared_args+=(--model "$MODEL")
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
+  [ "$FORCE_LOCKED" -eq 0 ] || shared_args+=(--force-locked)
   for pair in "${POS[@]}"; do
     case "$pair" in
       *=*) : ;;
@@ -603,6 +621,36 @@ if [ "$KIND" = secondmate ]; then
   fi
 fi
 
+# Cawldron coordination lock gate (ship/scout only; --secondmate is exempt -
+# see the else branch below): refuse to spawn into a project the captain is
+# actively hand-editing through a live Cawldron session, unless overridden.
+# bin/fm-cawldron-lock-lib.sh owns the marker format; bin/fm-cawldron-lock.sh is
+# the only writer. Informational-only in the batch loop above: this function
+# exits 1, which the batch loop already reports as "FAILED to spawn" and skips,
+# continuing the rest of the pairs - no separate per-pair check needed there.
+fm_cawldron_spawn_gate() {
+  local proj_abs=$1 proj_name marker age note rule
+  proj_name=$(basename "$proj_abs")
+  marker=$(fm_cawldron_lock_path "$STATE" "$proj_name")
+  fm_cawldron_lock_read "$marker" || return 0
+  [ "$FORCE_LOCKED_EFFECTIVE" -eq 0 ] || return 0
+  age=$(fm_cawldron_lock_age_human "$FM_CAWL_SINCE")
+  note=$FM_CAWL_NOTE
+  rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+  {
+    printf '●%s\n' "$rule"
+    printf '●  CAWLDRON LOCK ACTIVE - %s\n' "$proj_name"
+    printf '●  Locked %s ago' "$age"
+    if [ -n "$note" ]; then printf ' (note: %s)' "$note"; fi
+    printf '\n'
+    printf "●  A background crew may collide with the captain's unlanded live Cawldron edits.\n"
+    printf '●  Pass --force-locked (or set FM_SPAWN_FORCE_LOCKED=1) to spawn anyway.\n'
+    printf '●%s\n' "$rule"
+  } >&2
+  echo "error: spawn refused: $proj_name is Cawldron-locked (locked $age ago); pass --force-locked to override" >&2
+  return 1
+}
+
 if [ "$KIND" = secondmate ]; then
   [ -n "$FIRSTMATE_HOME" ] || { echo "error: no firstmate home supplied or registered for $ID" >&2; exit 1; }
   PROJ_ABS=$(validate_firstmate_home_for_spawn "$ID" "$FIRSTMATE_HOME")
@@ -640,6 +688,7 @@ else
   PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
   WT=""
   BRIEF="$DATA/$ID/brief.md"
+  fm_cawldron_spawn_gate "$PROJ_ABS" || exit 1
 fi
 [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
 
