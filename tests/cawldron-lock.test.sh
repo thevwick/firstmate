@@ -18,6 +18,11 @@ TMP_ROOT=$(fm_test_tmproot fm-cawldron-lock)
 new_home() {
   local home="$TMP_ROOT/home-$RANDOM-$RANDOM"
   mkdir -p "$home/data" "$home/state" "$home/config" "$home/projects"
+  # Pin the crewmate harness. fm-spawn.sh resolves the harness (and aborts on an
+  # unresolvable one) BEFORE it reaches the Cawldron gate, so without this pin
+  # the spawn cases here would depend on whatever harness the ambient runtime
+  # detects and would abort early under a bare shell.
+  printf 'claude\n' > "$home/config/crew-harness"
   printf '%s\n' "$home"
 }
 
