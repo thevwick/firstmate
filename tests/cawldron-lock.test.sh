@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Behavior tests for the Cawldron coordination lock: bin/fm-cawldron-lock.sh
 # (set/clear/list, unknown-project warning, live-crew warning) and its
-# bin/fm-spawn.sh ship/scout collision gate (refusal, --force-locked and
-# FM_SPAWN_FORCE_LOCKED overrides). Every case runs against an isolated fake
+# bin/fm-spawn.sh ship/scout collision gate and the identical bin/fm-promote.sh
+# gate (refusal, --force-locked and FM_SPAWN_FORCE_LOCKED overrides, an
+# unreadable marker still gating). Every case runs against an isolated fake
 # firstmate home so it never touches this repo's own state/data.
 set -u
 
@@ -11,6 +12,7 @@ set -u
 
 LOCK="$ROOT/bin/fm-cawldron-lock.sh"
 SPAWN="$ROOT/bin/fm-spawn.sh"
+PROMOTE="$ROOT/bin/fm-promote.sh"
 TMP_ROOT=$(fm_test_tmproot fm-cawldron-lock)
 
 new_home() {
@@ -45,6 +47,23 @@ run_spawn() {
     FM_BACKEND=tmux \
     FM_SPAWN_NO_GUARD=1 \
     "$SPAWN" "$@" 2>&1
+}
+
+run_promote() {
+  local home=$1
+  shift
+  FM_ROOT_OVERRIDE='' FM_STATE_OVERRIDE='' FM_DATA_OVERRIDE='' FM_PROJECTS_OVERRIDE='' FM_CONFIG_OVERRIDE='' \
+    FM_HOME="$home" \
+    "$PROMOTE" "$@" 2>&1
+}
+
+# Seed a scout task whose meta records project=<project>, the field the promote
+# gate keys off.
+seed_scout() {
+  local home=$1 id=$2 project=$3
+  mkdir -p "$home/projects/$project"
+  printf 'kind=scout\nproject=%s\nwindow=fm-%s\n' "$home/projects/$project" "$id" \
+    > "$home/state/$id.meta"
 }
 
 # Set, list, and clear a lock in sequence; each step must leave the expected
@@ -316,6 +335,102 @@ test_bootstrap_reports_lock_in_detect_only() {
   pass "the bootstrap CAWLDRON_LOCK line survives the detect-only path"
 }
 
+# A promoted scout becomes a full committing ship crew, so the promote gate must
+# refuse exactly like a fresh ship spawn - and must leave kind=scout untouched,
+# since a half-applied promote would strip teardown protection anyway.
+test_promote_gate_refuses_when_locked() {
+  local home out status
+  home=$(new_home)
+  seed_scout "$home" scout-locked-p1 promo-locked
+  run_lock "$home" promo-locked >/dev/null
+
+  out=$(run_promote "$home" scout-locked-p1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "promoting into a locked project should be refused"
+  assert_contains "$out" "CAWLDRON LOCK ACTIVE - promo-locked" "promote refusal banner missing"
+  assert_contains "$out" "error: promote refused: promo-locked is Cawldron-locked" "promote refusal message missing"
+  assert_grep "kind=scout" "$home/state/scout-locked-p1.meta" "a refused promote must not flip kind="
+  pass "fm-promote.sh refuses a promote into a Cawldron-locked project"
+}
+
+# The unlocked path must reach the actual promote, proving the gate is keyed off
+# the meta's project= field and not refusing (or passing) unconditionally.
+test_promote_gate_silent_when_unlocked() {
+  local home out status
+  home=$(new_home)
+  seed_scout "$home" scout-free-p2 promo-free
+
+  out=$(run_promote "$home" scout-free-p2)
+  status=$?
+  expect_code 0 "$status" "promoting an unlocked project should succeed"
+  assert_not_contains "$out" "CAWLDRON LOCK ACTIVE" "an unlocked project must not trip the lock banner"
+  assert_grep "kind=ship" "$home/state/scout-free-p2.meta" "promote did not flip kind= to ship"
+  pass "fm-promote.sh does not gate an unlocked project"
+}
+
+# --force-locked overrides the refusal and the promote completes, leaving the
+# warning behind as the audit trail.
+test_promote_gate_force_locked_flag_overrides() {
+  local home out status
+  home=$(new_home)
+  seed_scout "$home" scout-flag-p3 promo-flag
+  run_lock "$home" promo-flag >/dev/null
+
+  out=$(run_promote "$home" scout-flag-p3 --force-locked)
+  status=$?
+  expect_code 0 "$status" "--force-locked should let the promote through"
+  assert_not_contains "$out" "CAWLDRON LOCK ACTIVE" "--force-locked should suppress the lock banner"
+  assert_contains "$out" "warning: promo-flag is Cawldron-locked" "an override must still leave an audit trail"
+  assert_grep "kind=ship" "$home/state/scout-flag-p3.meta" "the overridden promote did not flip kind= to ship"
+  pass "fm-promote.sh --force-locked overrides the Cawldron lock refusal"
+}
+
+# FM_SPAWN_FORCE_LOCKED=1 is the same override for promote as for spawn.
+test_promote_gate_force_locked_env_overrides() {
+  local home out status
+  home=$(new_home)
+  seed_scout "$home" scout-env-p4 promo-env
+  run_lock "$home" promo-env >/dev/null
+
+  out=$(FM_SPAWN_FORCE_LOCKED=1 run_promote "$home" scout-env-p4)
+  status=$?
+  expect_code 0 "$status" "FM_SPAWN_FORCE_LOCKED=1 should let the promote through"
+  assert_not_contains "$out" "CAWLDRON LOCK ACTIVE" "FM_SPAWN_FORCE_LOCKED=1 should suppress the lock banner"
+  assert_grep "kind=ship" "$home/state/scout-env-p4.meta" "the overridden promote did not flip kind= to ship"
+  pass "fm-promote.sh FM_SPAWN_FORCE_LOCKED=1 overrides the Cawldron lock refusal"
+}
+
+# An unreadable marker must gate the promote too, not read as unlocked.
+test_promote_gate_corrupt_marker_still_gates() {
+  local home out status
+  home=$(new_home)
+  seed_scout "$home" scout-corrupt-p5 promo-corrupt
+  : > "$home/state/cawldron-lock-promo-corrupt"
+
+  out=$(run_promote "$home" scout-corrupt-p5)
+  status=$?
+  [ "$status" -ne 0 ] || fail "promoting into a project with an unreadable marker should be refused"
+  assert_contains "$out" "CAWLDRON LOCK ACTIVE - promo-corrupt" "promote gate failed open on an unreadable marker"
+  assert_grep "kind=scout" "$home/state/scout-corrupt-p5.meta" "a refused promote must not flip kind="
+  pass "an unreadable marker still gates fm-promote.sh"
+}
+
+# A misspelled flag must be rejected rather than silently dropped - swallowing
+# "--forc-locked" would quietly refuse a promote the captain meant to override.
+test_promote_rejects_unknown_argument() {
+  local home out status
+  home=$(new_home)
+  seed_scout "$home" scout-typo-p6 promo-typo
+  run_lock "$home" promo-typo >/dev/null
+
+  out=$(run_promote "$home" scout-typo-p6 --forc-locked)
+  status=$?
+  [ "$status" -ne 0 ] || fail "a misspelled flag should be rejected"
+  assert_contains "$out" "error: unknown argument: --forc-locked" "misspelled flag was silently swallowed"
+  assert_grep "kind=scout" "$home/state/scout-typo-p6.meta" "a rejected promote must not flip kind="
+  pass "fm-promote.sh rejects an unrecognized argument instead of dropping it"
+}
+
 test_set_clear_list_roundtrip
 test_clear_when_not_locked
 test_empty_project_rejected
@@ -331,4 +446,10 @@ test_spawn_gate_force_locked_flag_overrides
 test_spawn_gate_force_locked_env_overrides
 test_multiline_note_rejected
 test_batch_skips_locked_pair_and_continues
+test_promote_gate_refuses_when_locked
+test_promote_gate_silent_when_unlocked
+test_promote_gate_force_locked_flag_overrides
+test_promote_gate_force_locked_env_overrides
+test_promote_gate_corrupt_marker_still_gates
+test_promote_rejects_unknown_argument
 test_bootstrap_reports_lock_in_detect_only

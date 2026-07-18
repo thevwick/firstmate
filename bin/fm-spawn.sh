@@ -92,9 +92,15 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  # Print the whole comment header, stopping at the first non-comment line, so
-  # the help text can never silently truncate as the header grows.
-  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+  # Print the whole comment header, stopping at the first real code line, so the
+  # help text can never silently truncate as the header grows. A blank line
+  # inside the header is a paragraph break, not the end of the header.
+  awk '
+    NR == 1 { next }
+    /^[[:space:]]*$/ { print ""; next }
+    /^#/ { sub(/^# ?/, ""); print; next }
+    { exit }
+  ' "$0"
 }
 
 case "${1:-}" in
