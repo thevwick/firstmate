@@ -726,6 +726,360 @@ SH
   pass "run_wrapped_build's repo-local resolution is command-agnostic (works for the coming Expo switch too)"
 }
 
+# --- pid field + stale-build self-cleanup -----------------------------------
+
+test_status_file_carries_pid() {
+  # The console contract now includes a pid field so a reader can tell a live
+  # build from a zombie "running" file with kill -0 <pid>.
+  local labhome="$TMP_ROOT/lab-pid" fmhome="$TMP_ROOT/fm-home-pid"
+  STATE_DIR="$labhome/state"; mkdir -p "$STATE_DIR"
+  FM_STATE_DIR="$fmhome/state"; mkdir -p "$FM_STATE_DIR"
+  # shellcheck disable=SC2034
+  {
+    ST_SLOT="s0" ST_REPO="r" ST_BRANCH="b" ST_PLATFORM="device" ST_TARGET="t"
+    ST_RUN_COMMAND="c" ST_PORT=8100 ST_STATUS="running" ST_ERROR="null"
+    ST_STARTED=1 ST_PERCENT="null" ST_LOGFILE="l" ST_PHASE_TOTAL=7
+    ST_PHASE="compile" ST_PHASE_INDEX=5 ST_PID=4242
+  }
+  status_write
+  local f; f="$FM_STATE_DIR/lab-build-s0.json"
+  [ "$(jq -r '.pid' "$f")" = "4242" ] || fail "status file must carry the owning build pid"
+  [ "$(jq -r '.pid | type' "$f")" = "number" ] || fail "pid must be a JSON number"
+  pass "status_write records the owning build pid in the contract file"
+}
+
+test_stale_running_with_dead_pid_is_reaped() {
+  # A non-terminal "running" file whose recorded pid is no longer alive is a
+  # zombie: status_stale_if_running must rewrite it failed so a new build never
+  # silently replaces a still-"running" file.
+  local fmhome="$TMP_ROOT/fm-home-stale"
+  FM_STATE_DIR="$fmhome/state"; mkdir -p "$FM_STATE_DIR"
+  local f="$FM_STATE_DIR/lab-build-z0.json"
+  local dead=999999; while kill -0 "$dead" 2>/dev/null; do dead=$((dead-1)); done
+  jq -n --argjson p "$dead" \
+    '{schema:1,slot:"z0",status:"running",pid:$p,error:null,message:"old"}' > "$f"
+  status_stale_if_running "$f"
+  [ "$(jq -r '.status' "$f")" = "failed" ] || fail "a running file with a dead pid must be marked failed"
+  [ "$(jq -r '.error' "$f")" != "null" ] || fail "a reaped stale build must carry an error string"
+  pass "status_stale_if_running reaps a zombie running file whose pid is dead"
+}
+
+test_stale_running_with_live_pid_is_left() {
+  # A running file whose pid is still alive is a genuinely live build: leave it.
+  local fmhome="$TMP_ROOT/fm-home-live"
+  FM_STATE_DIR="$fmhome/state"; mkdir -p "$FM_STATE_DIR"
+  local f="$FM_STATE_DIR/lab-build-z1.json"
+  jq -n --argjson p "$$" \
+    '{schema:1,slot:"z1",status:"running",pid:$p,error:null,message:"live"}' > "$f"
+  status_stale_if_running "$f"
+  [ "$(jq -r '.status' "$f")" = "running" ] || fail "a running file with a LIVE pid must be left untouched"
+  pass "status_stale_if_running leaves a running file whose pid is alive"
+}
+
+test_stale_terminal_file_is_left() {
+  # A terminal file (success/failed) is never touched, even if its pid is dead.
+  local fmhome="$TMP_ROOT/fm-home-term"
+  FM_STATE_DIR="$fmhome/state"; mkdir -p "$FM_STATE_DIR"
+  local f="$FM_STATE_DIR/lab-build-z2.json"
+  jq -n '{schema:1,slot:"z2",status:"success",pid:0,error:null,message:"done"}' > "$f"
+  status_stale_if_running "$f"
+  [ "$(jq -r '.status' "$f")" = "success" ] || fail "a terminal (success) file must be left untouched"
+  pass "status_stale_if_running never rewrites a terminal status file"
+}
+
+# --- pods gap (pod install when Pods/ or its xcconfig is missing) ------------
+
+test_pods_present_detection() {
+  local slot="$TMP_ROOT/pods-detect"
+  mkdir -p "$slot/ios"
+  # No Pods dir at all -> missing.
+  if pods_present "$slot"; then fail "no ios/Pods -> pods must be reported missing"; fi
+  # A Target Support Files dir with no Pods-*.xcconfig -> the broken state.
+  mkdir -p "$slot/ios/Pods/Target Support Files/Pods-App"
+  if pods_present "$slot"; then fail "Pods/ with Target Support Files but no xcconfig -> missing"; fi
+  # Once the app xcconfig exists -> present.
+  : > "$slot/ios/Pods/Target Support Files/Pods-App/Pods-App.debug.xcconfig"
+  pods_present "$slot" || fail "Pods/ with a Pods-*.xcconfig -> present"
+  pass "pods_present detects a missing/broken pods install by the xcconfig the build needs"
+}
+
+test_ensure_pods_runs_pod_install_when_missing() {
+  # With pods missing, ensure_pods must actually run pod install (the gap the
+  # real build hit: deps-cache made the RN CLI skip pods, so Pods/ was absent).
+  local slot="$TMP_ROOT/pods-install" fakebin
+  mkdir -p "$slot/ios"
+  fakebin=$(fm_fakebin "$slot")
+  # A fake pod that records it ran and creates the xcconfig, exactly as a real
+  # `pod install` would produce the Xcode-referenced base configuration file.
+  cat > "$fakebin/pod" <<'SH'
+#!/usr/bin/env bash
+echo "FAKE_POD_INSTALL ran in $PWD"
+mkdir -p "$PWD/Pods/Target Support Files/Pods-App"
+: > "$PWD/Pods/Target Support Files/Pods-App/Pods-App.debug.xcconfig"
+SH
+  chmod +x "$fakebin/pod"
+  # shellcheck disable=SC2034
+  { ST_SLOT="p0"; ST_STATUS="running"; STATE_DIR="$slot/st"; FM_STATE_DIR="$slot/st"; }
+  mkdir -p "$STATE_DIR"
+  local out rc
+  out=$(PATH="$fakebin:$PATH" ensure_pods "$slot" 2>&1); rc=$?
+  expect_code 0 "$rc" "ensure_pods should succeed once pod install produces the xcconfig"
+  assert_contains "$out" "FAKE_POD_INSTALL" "ensure_pods must actually run pod install when pods are missing"
+  pods_present "$slot" || fail "after ensure_pods the slot must have a usable pods install"
+  pass "ensure_pods runs pod install when Pods/ or its xcconfig is missing, closing the deps-cache pods gap"
+}
+
+test_ensure_pods_noop_when_present() {
+  # When pods are already installed, ensure_pods must NOT run pod install again.
+  local slot="$TMP_ROOT/pods-noop" fakebin
+  mkdir -p "$slot/ios/Pods/Target Support Files/Pods-App"
+  : > "$slot/ios/Pods/Target Support Files/Pods-App/Pods-App.debug.xcconfig"
+  fakebin=$(fm_fakebin "$slot")
+  cat > "$fakebin/pod" <<'SH'
+#!/usr/bin/env bash
+echo "FAKE_POD_INSTALL should not run"; exit 1
+SH
+  chmod +x "$fakebin/pod"
+  # shellcheck disable=SC2034
+  { ST_SLOT="p1"; ST_STATUS="running"; STATE_DIR="$slot/st"; FM_STATE_DIR="$slot/st"; }
+  mkdir -p "$STATE_DIR"
+  local out rc
+  out=$(PATH="$fakebin:$PATH" ensure_pods "$slot" 2>&1); rc=$?
+  expect_code 0 "$rc" "ensure_pods must succeed (no-op) when pods are already present"
+  assert_not_contains "$out" "FAKE_POD_INSTALL" "ensure_pods must NOT re-run pod install when pods are present"
+  pass "ensure_pods is a no-op when a usable pods install already exists"
+}
+
+test_ensure_pods_prefers_bundler_when_gemfile_present() {
+  # A repo pinning CocoaPods via bundler must be installed with bundle exec.
+  local slot="$TMP_ROOT/pods-bundler" fakebin
+  mkdir -p "$slot/ios"; : > "$slot/Gemfile"
+  fakebin=$(fm_fakebin "$slot")
+  # A fake bundle that records its args; a plain `pod` that must NOT be used.
+  cat > "$fakebin/bundle" <<'SH'
+#!/usr/bin/env bash
+echo "FAKE_BUNDLE $*"
+mkdir -p "$PWD/Pods/Target Support Files/Pods-App"
+: > "$PWD/Pods/Target Support Files/Pods-App/Pods-App.debug.xcconfig"
+SH
+  chmod +x "$fakebin/bundle"
+  cat > "$fakebin/pod" <<'SH'
+#!/usr/bin/env bash
+echo "FAKE_BARE_POD should not run"; exit 1
+SH
+  chmod +x "$fakebin/pod"
+  # shellcheck disable=SC2034
+  { ST_SLOT="p2"; ST_STATUS="running"; STATE_DIR="$slot/st"; FM_STATE_DIR="$slot/st"; }
+  mkdir -p "$STATE_DIR"
+  local out
+  out=$(PATH="$fakebin:$PATH" ensure_pods "$slot" 2>&1)
+  assert_contains "$out" "FAKE_BUNDLE exec pod install" "a Gemfile must drive pods via bundle exec pod install"
+  assert_not_contains "$out" "FAKE_BARE_POD" "bare pod must not run when a Gemfile is present"
+  pass "ensure_pods uses bundle exec pod install when a Gemfile pins CocoaPods"
+}
+
+# --- detached build handoff + terminal-status trap --------------------------
+#
+# The core robustness fix: the native build runs DETACHED so it outlives its
+# caller, and it writes a terminal status on its own exit (even when killed) so
+# no zombie "running" file is left behind. These are driven end to end with a
+# stubbed CLI (no real xcodebuild) via the real binary, since the detach and the
+# exit-trap behavior only exist across process boundaries.
+
+# fm_lab_scratch_fleet <dir> <rn-script-file>: build a hermetic fleet (config, a
+# git clone with the stubbed react-native at <rn-script-file>, fake pod/npm/xcrun)
+# and export the env the real engine needs. Sets FMHOME_SF for the caller.
+fm_lab_scratch_fleet() {
+  local dir=$1 rn_file=$2
+  local clone="$dir/projects/demo"
+  mkdir -p "$clone/ios" "$clone/node_modules/.bin"
+  git -C "$clone" init -q >/dev/null 2>&1
+  echo '{"lockfileVersion":3}' > "$clone/package-lock.json"
+  cp "$rn_file" "$clone/node_modules/.bin/react-native"
+  chmod +x "$clone/node_modules/.bin/react-native"
+  git -C "$clone" add -A >/dev/null 2>&1
+  git -C "$clone" -c user.email=t@t -c user.name=t commit -qm init >/dev/null 2>&1
+  local cfg="$dir/config/mobile-lab.json"; mkdir -p "$(dirname "$cfg")"
+  echo '{ "repos": { "demo": { "clone":"demo","metro_port_base":8300,"pool_size":4,"run_command":"react-native run-ios" } } }' > "$cfg"
+  local fakebin="$dir/fakebin"; mkdir -p "$fakebin"
+  cat > "$fakebin/pod" <<'SH'
+#!/usr/bin/env bash
+mkdir -p "$PWD/Pods/Target Support Files/Pods-App"
+: > "$PWD/Pods/Target Support Files/Pods-App/Pods-App.debug.xcconfig"
+SH
+  cat > "$fakebin/npm" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  cat > "$fakebin/xcrun" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = xctrace ] && printf '== Devices ==\nFake iPhone (18.0) (00008110000231D414D8401E)\n'
+SH
+  chmod +x "$fakebin/pod" "$fakebin/npm" "$fakebin/xcrun"
+  FMHOME_SF="$dir/fmhome"; mkdir -p "$FMHOME_SF/state"
+  export FM_MOBILE_LAB_CONFIG="$cfg" FM_MOBILE_LAB_HOME="$dir/lab"
+  export FM_PROJECTS_OVERRIDE="$dir/projects" FM_STATE_OVERRIDE="$FMHOME_SF/state"
+  export FM_MOBILE_LAB_NO_METRO=1 FM_MOBILE_LAB_MIN_FREE_GB=0
+  export FM_LAB_SCRATCH_PATH="$fakebin:$PATH"
+}
+
+# fm_write_rn <path> <mode> [arg]: write a stubbed react-native script to <path>.
+# mode=slow  emits <arg> "Compiling X/N" lines one per second (a long build to
+#            catch mid-run); mode=quick emits a short 3-line compile then install;
+#            mode=fail exits non-zero after a "boom" line (a failing build).
+fm_write_rn() {
+  local path=$1 mode=$2 arg=${3:-20}
+  case "$mode" in
+    slow)
+      cat > "$path" <<SH
+#!/usr/bin/env bash
+echo "Analyzing dependencies"
+for i in \$(seq 1 $arg); do echo "Compiling React-Core (\$i/$arg)"; sleep 1; done
+echo "Installing App on device"
+SH
+      ;;
+    quick)
+      cat > "$path" <<'SH'
+#!/usr/bin/env bash
+echo "Analyzing dependencies"
+for i in 1 2 3; do echo "Compiling React-Core ($i/3)"; sleep 1; done
+echo "Installing App on device"
+SH
+      ;;
+    fail)
+      cat > "$path" <<'SH'
+#!/usr/bin/env bash
+echo "Analyzing dependencies"
+echo "boom: build error"
+exit 7
+SH
+      ;;
+  esac
+  chmod +x "$path"
+}
+
+# fm_lab_wait_status <status-file> <target...>: poll until the status file's
+# status is one of the target words, or a timeout. Echoes the final status.
+fm_lab_wait_status() {
+  local f=$1; shift
+  local i st
+  for ((i=0; i<40; i++)); do
+    st=$(jq -r '.status // ""' "$f" 2>/dev/null)
+    for t in "$@"; do [ "$st" = "$t" ] && { printf '%s' "$st"; return 0; }; done
+    sleep 1
+  done
+  printf '%s' "${st:-timeout}"
+}
+
+test_default_build_detaches_and_returns_fast() {
+  # The default invocation must LAUNCH the build detached and RETURN quickly
+  # (before the ~build duration), leaving the build running under its own pid.
+  local d="$TMP_ROOT/detach-fast"; mkdir -p "$d"
+  local FMHOME_SF rn="$d/rn.sh"
+  fm_write_rn "$rn" slow 20
+  fm_lab_scratch_fleet "$d" "$rn"
+  local sf="$FMHOME_SF/state/lab-build-demo-0.json"
+  local t0 t1 out rc
+  t0=$(date +%s)
+  out=$(FM_MOBILE_LAB_LIB=0 PATH="$FM_LAB_SCRATCH_PATH" "$ENGINE" demo main --device --slot 0 2>&1); rc=$?
+  t1=$(date +%s)
+  expect_code 0 "$rc" "the default detached launch must return 0 immediately"
+  [ $((t1 - t0)) -lt 15 ] || fail "default launch must return well before the ~20s build finishes (took $((t1-t0))s)"
+  assert_contains "$out" "build started" "the default launch must announce the detached build"
+  # The build must still be running detached, under a live pid, after we returned.
+  sleep 2
+  [ -f "$sf" ] || fail "a status file must exist for the detached build"
+  local pid; pid=$(jq -r '.pid' "$sf")
+  [ "$pid" -gt 0 ] 2>/dev/null || fail "the status file must record the detached build pid"
+  kill -0 "$pid" 2>/dev/null || fail "the detached build must still be running after the caller returned"
+  # Let it finish, then confirm a clean terminal success and that pods ran.
+  local final; final=$(fm_lab_wait_status "$sf" success failed)
+  [ "$final" = "success" ] || fail "the detached build should reach success (got: $final)"
+  # Clean up any strays (the build already finished; belt-and-braces).
+  kill -TERM "$pid" 2>/dev/null || true
+  pass "the default invocation launches the build detached and returns fast, and the build runs to a terminal status on its own"
+}
+
+test_killed_detached_build_writes_terminal_failed() {
+  # The whole point: a killed build must NOT leave a zombie "running" file. Its
+  # own exit trap must write a terminal 'failed' with a specific error.
+  local d="$TMP_ROOT/detach-kill"; mkdir -p "$d"
+  local FMHOME_SF rn="$d/rn.sh"
+  fm_write_rn "$rn" slow 60
+  fm_lab_scratch_fleet "$d" "$rn"
+  local sf="$FMHOME_SF/state/lab-build-demo-0.json"
+  FM_MOBILE_LAB_LIB=0 PATH="$FM_LAB_SCRATCH_PATH" "$ENGINE" demo main --device --slot 0 >/dev/null 2>&1
+  # Wait until the build is genuinely mid-run under its own pid.
+  sleep 4
+  local pid; pid=$(jq -r '.pid' "$sf")
+  kill -0 "$pid" 2>/dev/null || fail "precondition: the detached build should be running"
+  # Kill it and confirm it self-marks failed (its exit trap), not stuck running.
+  kill -TERM "$pid" 2>/dev/null
+  local final; final=$(fm_lab_wait_status "$sf" failed success)
+  [ "$final" = "failed" ] || fail "a killed build must write a terminal 'failed' status, not stay 'running' (got: $final)"
+  local err; err=$(jq -r '.error' "$sf")
+  [ "$err" != "null" ] && [ -n "$err" ] || fail "a killed build's terminal status must carry a specific error"
+  # Ensure no build subtree leaked.
+  pkill -f 'react-native run-ios' 2>/dev/null || true
+  pass "a killed detached build writes a terminal 'failed' status via its own exit trap (no zombie 'running' file)"
+}
+
+test_wait_flag_blocks_until_build_finishes() {
+  # --wait must preserve the old blocking behavior: block until done and return
+  # the build's exit status (0 on success).
+  local d="$TMP_ROOT/detach-wait"; mkdir -p "$d"
+  local FMHOME_SF rn="$d/rn.sh"
+  fm_write_rn "$rn" quick
+  fm_lab_scratch_fleet "$d" "$rn"
+  local sf="$FMHOME_SF/state/lab-build-demo-0.json"
+  local t0 t1 rc
+  t0=$(date +%s)
+  FM_MOBILE_LAB_LIB=0 PATH="$FM_LAB_SCRATCH_PATH" "$ENGINE" demo main --device --slot 0 --wait >/dev/null 2>&1; rc=$?
+  t1=$(date +%s)
+  expect_code 0 "$rc" "--wait on a passing build must return 0"
+  [ $((t1 - t0)) -ge 3 ] || fail "--wait must block until the ~3s build finishes (returned after $((t1-t0))s)"
+  [ "$(jq -r '.status' "$sf")" = "success" ] || fail "--wait must leave a terminal success status"
+  pass "--wait blocks until the build finishes and returns its (success) exit code"
+}
+
+test_wait_flag_propagates_build_failure() {
+  # --wait must return non-zero when the build fails, and the status is failed.
+  local d="$TMP_ROOT/detach-wait-fail"; mkdir -p "$d"
+  local FMHOME_SF rn="$d/rn.sh"
+  fm_write_rn "$rn" fail
+  fm_lab_scratch_fleet "$d" "$rn"
+  local sf="$FMHOME_SF/state/lab-build-demo-0.json"
+  local rc
+  FM_MOBILE_LAB_LIB=0 PATH="$FM_LAB_SCRATCH_PATH" "$ENGINE" demo main --device --slot 0 --wait >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "--wait must return non-zero when the wrapped build fails"
+  [ "$(jq -r '.status' "$sf")" = "failed" ] || fail "a failing build must leave a terminal failed status"
+  pass "--wait propagates a build failure as a non-zero exit and a terminal failed status"
+}
+
+test_new_build_reaps_stale_slot_file() {
+  # A new build into a slot whose prior file is a dead-pid zombie must reap it
+  # (mark failed) rather than silently overwrite a still-"running" file. Proven
+  # by seeding a zombie, then confirming the new build takes over with a fresh
+  # live pid distinct from the dead one.
+  local d="$TMP_ROOT/detach-reap"; mkdir -p "$d"
+  local FMHOME_SF rn="$d/rn.sh"
+  fm_write_rn "$rn" quick
+  fm_lab_scratch_fleet "$d" "$rn"
+  local sf="$FMHOME_SF/state/lab-build-demo-0.json"
+  local dead=999999; while kill -0 "$dead" 2>/dev/null; do dead=$((dead-1)); done
+  jq -n --argjson p "$dead" \
+    '{schema:1,slot:"demo-0",repo:"demo",branch:"main",platform:"device",target:"x",run_command:"c",port:8300,phase:"compile",phase_index:5,phase_total:7,percent:null,status:"running",started_epoch:1,updated_epoch:1,phase_started_epoch:1,message:"zombie",logfile:"l",error:null,pid:$p}' > "$sf"
+  FM_MOBILE_LAB_LIB=0 PATH="$FM_LAB_SCRATCH_PATH" "$ENGINE" demo main --device --slot 0 >/dev/null 2>&1
+  sleep 1
+  local newpid; newpid=$(jq -r '.pid' "$sf")
+  [ "$newpid" != "$dead" ] || fail "the new build must replace the zombie's dead pid with its own live pid"
+  local final; final=$(fm_lab_wait_status "$sf" success failed)
+  [ "$final" = "success" ] || fail "the fresh build should run to success (got: $final)"
+  kill -TERM "$newpid" 2>/dev/null || true
+  pkill -f 'react-native run-ios' 2>/dev/null || true
+  pass "a new build reaps a stale dead-pid zombie file and takes the slot over with a fresh build"
+}
+
 # --- run all ----------------------------------------------------------------
 
 test_detect_pkgmgr
@@ -769,5 +1123,18 @@ test_unknown_repo_errors
 test_missing_run_command_errors
 test_run_wrapped_build_resolves_repo_local_binary
 test_run_wrapped_build_resolves_any_configured_cli_generically
+test_status_file_carries_pid
+test_stale_running_with_dead_pid_is_reaped
+test_stale_running_with_live_pid_is_left
+test_stale_terminal_file_is_left
+test_pods_present_detection
+test_ensure_pods_runs_pod_install_when_missing
+test_ensure_pods_noop_when_present
+test_ensure_pods_prefers_bundler_when_gemfile_present
+test_default_build_detaches_and_returns_fast
+test_killed_detached_build_writes_terminal_failed
+test_wait_flag_blocks_until_build_finishes
+test_wait_flag_propagates_build_failure
+test_new_build_reaps_stale_slot_file
 
 pass "all fm-mobile-lab tests passed"
