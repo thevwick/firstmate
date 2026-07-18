@@ -23,21 +23,6 @@
 # shellcheck disable=SC2034
 FM_CAWLDRON_RULE='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 
-# fm_cawldron_usage_header <script-path>: print <script-path>'s leading comment
-# header as help text, stopping at the first real code line, so the help can
-# never silently truncate as the header grows. A blank line inside the header is
-# a paragraph break, not the end of the header. Shared by the two Cawldron-lock
-# entrypoints (bin/fm-cawldron-lock.sh and bin/fm-spawn.sh); the unrelated bin/
-# scripts that still print a hardcoded line range are deliberately untouched.
-fm_cawldron_usage_header() {
-  awk '
-    NR == 1 { next }
-    /^[[:space:]]*$/ { print ""; next }
-    /^#/ { sub(/^# ?/, ""); print; next }
-    { exit }
-  ' "$1"
-}
-
 # fm_cawldron_lock_path <state-dir> <project>: print the marker path for
 # <project> under <state-dir>. Does not check existence.
 fm_cawldron_lock_path() {

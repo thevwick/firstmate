@@ -38,8 +38,10 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-cawldron-lock-lib.sh
 . "$SCRIPT_DIR/fm-cawldron-lock-lib.sh"
+# shellcheck source=bin/fm-usage-lib.sh
+. "$SCRIPT_DIR/fm-usage-lib.sh"
 
-usage() { fm_cawldron_usage_header "$0"; }
+usage() { fm_usage_header "$0"; }
 
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;

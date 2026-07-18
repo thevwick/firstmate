@@ -74,7 +74,8 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-pr-merge.sh`         | Record PR metadata, then merge a task's canonical full GitHub URL                    |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
 | `fm-cawldron-lock.sh`    | Set, clear, and list the per-project Cawldron coordination lock                       |
-| `fm-cawldron-lock-lib.sh` | Shared Cawldron marker format, lock reading, the spawn/promote refusal gate, and the header-terminating usage printer both Cawldron entrypoints use |
+| `fm-cawldron-lock-lib.sh` | Shared Cawldron marker format, lock reading, and the spawn/promote refusal gate |
+| `fm-usage-lib.sh`        | Shared help printer that renders a script's leading comment header as its `--help` |
 | `fm-teardown.sh`         | Fail-closed teardown: return landed ship worktrees, require completed scout deliverables, retire secondmate homes |
 | `fm-harness.sh`          | Detect the running harness and resolve crew or secondmate harness, model, and effort |
 | `fm-lock.sh`             | Per-home firstmate session lock                                                      |
