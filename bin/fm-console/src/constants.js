@@ -112,3 +112,29 @@ export const FIRSTMATE_ACTIVITY_CAPTURE_LINES = 25;
 // glance. The captain can still see the full capture via the idle-fleet
 // layout, where the panel takes over IN FLIGHT's whole freed box.
 export const FIRSTMATE_ACTIVITY_STRIP_ROWS = 5;
+
+// The fm-mobile-lab build-status contract's canonical ordered phase
+// vocabulary (data/mobile-lab-status-contract.md v1, "Phases"). The console
+// maps a status file's phase string to this list's label/order; a phase name
+// outside this set is rendered by its raw string rather than crashing (the
+// lab and console are built by separate crews against the shared contract
+// file, so a forward-compatible degrade here is deliberate).
+export const LAB_PHASES = ['preflight', 'worktree', 'deps', 'pods', 'compile', 'link', 'install'];
+
+export const LAB_PHASE_LABELS = {
+  preflight: 'preflight',
+  worktree: 'worktree',
+  deps: 'deps',
+  pods: 'pods',
+  compile: 'compile',
+  link: 'link',
+  install: 'install',
+};
+
+// Heartbeat staleness threshold for a lab-build status file's updated_epoch,
+// per the contract's "Console rendering expectations": green if fresh, amber
+// once updates stop landing (a possible wedge as opposed to a fast phase).
+// Lab-build files are small JSON (no du-style tree walk), so they are read on
+// the normal board REFRESH_INTERVAL_MS cadence rather than the slower
+// DU_INTERVAL_MS one (see app.js's refresh callback).
+export const LAB_HEARTBEAT_FRESH_SECS = 15;

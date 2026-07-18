@@ -20,6 +20,8 @@ import {
   formatProfile,
   branchForTask,
   firstmateActivityLines,
+  buildLabBuildCard,
+  buildLabBuildCards,
 } from '../src/state.js';
 
 test('extractTicket finds a generic ticket key in branch or brief', () => {
@@ -367,4 +369,153 @@ test('firstmateActivityLines returns every line unchanged when under the maxLine
 test('firstmateActivityLines with a null maxLines returns every line (minus trailing blanks), no cap', () => {
   const raw = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n');
   assert.equal(firstmateActivityLines(raw, null).length, 50);
+});
+
+// buildLabBuildCard: the MOBILE LAB view-model builder, exercised against
+// fixtures shaped exactly like data/mobile-lab-status-contract.md v1 - a
+// running build with a numeric percent, a running build with percent: null
+// (the honest-indeterminate case), a terminal success, and a terminal
+// failure, plus the required defensive paths (malformed JSON, absent file,
+// partial/missing fields).
+
+const CONTRACT_RUNNING_PERCENT = {
+  schema: 1,
+  slot: 'dashpivot-mobile-0',
+  repo: 'dashpivot-mobile',
+  branch: 'release/26.9',
+  platform: 'device',
+  target: "Thev's iPhone (iOS 26.5)",
+  run_command: "react-native run-ios --scheme 'Dashpivot Dev'",
+  port: 8111,
+  phase: 'compile',
+  phase_index: 5,
+  phase_total: 7,
+  percent: 62,
+  status: 'running',
+  started_epoch: 1000,
+  updated_epoch: 1123,
+  phase_started_epoch: 1100,
+  message: 'Compiling React-Core (1240/2100)',
+  logfile: 'state/build-dashpivot-mobile-0.log',
+  error: null,
+};
+
+test('buildLabBuildCard derives the full card from a running/percent-known contract fixture', () => {
+  const card = buildLabBuildCard({ slot: 'dashpivot-mobile-0', raw: CONTRACT_RUNNING_PERCENT, parseError: null }, 1130);
+  assert.equal(card.available, true);
+  assert.equal(card.slot, 'dashpivot-mobile-0');
+  assert.equal(card.repo, 'dashpivot-mobile');
+  assert.equal(card.branch, 'release/26.9');
+  assert.equal(card.platform, 'device');
+  assert.equal(card.target, "Thev's iPhone (iOS 26.5)");
+  assert.equal(card.phase, 'compile');
+  assert.equal(card.phaseKnown, true);
+  assert.equal(card.phaseIndex, 5);
+  assert.equal(card.phaseTotal, 7);
+  assert.equal(card.percent, 62);
+  assert.equal(card.percentUnknown, false);
+  assert.equal(card.status, 'running');
+  assert.equal(card.totalElapsedSecs, 130);
+  assert.equal(card.phaseElapsedSecs, 30);
+  assert.equal(card.ageSecs, 7);
+  assert.equal(card.message, 'Compiling React-Core (1240/2100)');
+  assert.equal(card.logfile, 'state/build-dashpivot-mobile-0.log');
+  assert.equal(card.error, null);
+  assert.equal(card.heartbeat, 'green');
+});
+
+test('buildLabBuildCard marks a running build stale (amber) once updated_epoch falls outside the fresh window', () => {
+  const card = buildLabBuildCard({ slot: 's', raw: CONTRACT_RUNNING_PERCENT, parseError: null }, 1123 + 30);
+  assert.equal(card.heartbeat, 'amber');
+});
+
+test('buildLabBuildCard renders percent: null as an honest indeterminate meter, never a fake percent', () => {
+  const raw = { ...CONTRACT_RUNNING_PERCENT, phase: 'pods', phase_index: 3, percent: null };
+  const card = buildLabBuildCard({ slot: 's', raw, parseError: null }, 1130);
+  assert.equal(card.percent, null);
+  assert.equal(card.percentUnknown, true);
+});
+
+test('buildLabBuildCard maps a terminal success status to a green heartbeat regardless of age', () => {
+  const raw = { ...CONTRACT_RUNNING_PERCENT, status: 'success', percent: 100, phase: 'install', phase_index: 7 };
+  const card = buildLabBuildCard({ slot: 's', raw, parseError: null }, 1123 + 999999);
+  assert.equal(card.status, 'success');
+  assert.equal(card.heartbeat, 'green');
+});
+
+test('buildLabBuildCard maps a terminal failure to a red heartbeat and surfaces error + logfile', () => {
+  const raw = {
+    ...CONTRACT_RUNNING_PERCENT,
+    status: 'failed',
+    phase: 'link',
+    phase_index: 6,
+    error: 'libavcodec has no arm64-simulator slice; use --device',
+  };
+  const card = buildLabBuildCard({ slot: 's', raw, parseError: null }, 1123 + 999999);
+  assert.equal(card.status, 'failed');
+  assert.equal(card.heartbeat, 'red');
+  assert.equal(card.error, 'libavcodec has no arm64-simulator slice; use --device');
+  assert.equal(card.logfile, 'state/build-dashpivot-mobile-0.log');
+});
+
+test('buildLabBuildCard falls back gracefully on a phase name outside the canonical set (forward-compat)', () => {
+  const raw = { ...CONTRACT_RUNNING_PERCENT, phase: 'some-future-phase' };
+  const card = buildLabBuildCard({ slot: 's', raw, parseError: null }, 1130);
+  assert.equal(card.available, true);
+  assert.equal(card.phaseKnown, false);
+  assert.equal(card.phase, 'some-future-phase');
+});
+
+test('buildLabBuildCard renders a parse-error entry as unavailable, never throwing', () => {
+  const card = buildLabBuildCard({ slot: 'broken-slot', raw: null, parseError: 'Unexpected token m in JSON' }, 1130);
+  assert.equal(card.available, false);
+  assert.equal(card.slot, 'broken-slot');
+  assert.match(card.error, /Unexpected token/);
+});
+
+test('buildLabBuildCard renders a missing/empty raw entry as unavailable, never throwing', () => {
+  assert.equal(buildLabBuildCard({ slot: 's', raw: null, parseError: null }, 1130).available, false);
+  assert.equal(buildLabBuildCard({ slot: 's', raw: undefined, parseError: null }, 1130).available, false);
+  assert.equal(buildLabBuildCard(undefined, 1130).available, false);
+});
+
+test('buildLabBuildCard defaults every field defensively on a partial/malformed-shape object, never throwing', () => {
+  // Not a parse error (valid JSON), but a shape that violates the contract:
+  // wrong types, missing fields entirely. Every field must default cleanly.
+  const raw = { slot: 'x', percent: 'not-a-number', phase_index: 'nope', status: 42, updated_epoch: 'nope' };
+  const card = buildLabBuildCard({ slot: 'weird-shape', raw, parseError: null }, 1130);
+  assert.equal(card.available, true);
+  assert.equal(card.percent, null);
+  assert.equal(card.percentUnknown, true);
+  assert.equal(card.phaseIndex, null);
+  assert.equal(card.phaseKnown, false);
+  assert.equal(card.repo, null);
+  assert.equal(card.branch, null);
+  assert.equal(card.message, '');
+  assert.equal(card.ageSecs, null);
+  // status is not a string, so the default('running')-shaped fallback still
+  // applies via str()'s typeof guard - never a crash on a wrong-typed field.
+  assert.equal(card.status, 'running');
+});
+
+test('buildLabBuildCard clamps an out-of-range percent into 0-100', () => {
+  assert.equal(buildLabBuildCard({ slot: 's', raw: { ...CONTRACT_RUNNING_PERCENT, percent: 140 }, parseError: null }, 1130).percent, 100);
+  assert.equal(buildLabBuildCard({ slot: 's', raw: { ...CONTRACT_RUNNING_PERCENT, percent: -5 }, parseError: null }, 1130).percent, 0);
+});
+
+test('buildLabBuildCards sorts by most-recently-updated first and includes unavailable entries', () => {
+  const entries = [
+    { slot: 'old', raw: { ...CONTRACT_RUNNING_PERCENT, updated_epoch: 100 }, parseError: null },
+    { slot: 'new', raw: { ...CONTRACT_RUNNING_PERCENT, updated_epoch: 500 }, parseError: null },
+    { slot: 'broken', raw: null, parseError: 'bad json' },
+  ];
+  const cards = buildLabBuildCards(entries, 600);
+  assert.deepEqual(cards.map((c) => c.slot), ['new', 'old', 'broken']);
+  assert.equal(cards[2].available, false);
+});
+
+test('buildLabBuildCards returns an empty list for no entries, never throwing', () => {
+  assert.deepEqual(buildLabBuildCards([], 100), []);
+  assert.deepEqual(buildLabBuildCards(null, 100), []);
+  assert.deepEqual(buildLabBuildCards(undefined, 100), []);
 });

@@ -7,7 +7,14 @@
 // snapshot into cards and computes a few header facts the snapshot omits
 // (disk, watcher liveness, afk), which are cheap, console-local reads.
 
-import { WATCHER_GRACE_SECS, GROUP_ORDER, CARD_ROW_HEIGHT, SECTION_ROW_CHROME } from './constants.js';
+import {
+  WATCHER_GRACE_SECS,
+  GROUP_ORDER,
+  CARD_ROW_HEIGHT,
+  SECTION_ROW_CHROME,
+  LAB_PHASES,
+  LAB_HEARTBEAT_FRESH_SECS,
+} from './constants.js';
 
 // Extract a ticket chip from a task's branch name or brief text, if one is
 // present. A ticket is OPTIONAL metadata: many tasks (e.g. poc/* work) have
@@ -322,4 +329,102 @@ export function buildHeader({
     queued: counts.queued,
     blocked: counts.blocked,
   };
+}
+
+// Build one MOBILE LAB card from a raw lab-build-<slot>.json read (io.js's
+// readLabBuildStatuses entry: { slot, raw, parseError }), per
+// data/mobile-lab-status-contract.md v1. This is the ONE place the console
+// interprets that contract - every field is defaulted defensively here so a
+// malformed, partial, or oddly-shaped file (the lab crew builds against the
+// same contract independently; a field could be missing or the wrong type)
+// renders as an "unavailable" card instead of propagating nulls/undefined
+// into the UI or throwing. `nowSecs` is passed in (not read from Date.now())
+// so this stays pure and unit-testable like every other function in this
+// file.
+export function buildLabBuildCard(entry, nowSecs) {
+  const slot = entry?.slot || '(unknown)';
+  if (entry?.parseError || !entry?.raw || typeof entry.raw !== 'object') {
+    return {
+      slot,
+      available: false,
+      error: entry?.parseError || 'no status file',
+    };
+  }
+
+  const raw = entry.raw;
+  const str = (v, fallback = null) => (typeof v === 'string' && v ? v : fallback);
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const int = (v) => {
+    const n = num(v);
+    return n == null ? null : Math.trunc(n);
+  };
+
+  const status = str(raw.status, 'running');
+  const phase = str(raw.phase);
+  const phaseIndex = int(raw.phase_index);
+  const phaseTotal = int(raw.phase_total);
+  let percent = num(raw.percent);
+  if (percent != null) percent = Math.max(0, Math.min(100, percent));
+
+  const updatedEpoch = num(raw.updated_epoch);
+  const startedEpoch = num(raw.started_epoch);
+  const phaseStartedEpoch = num(raw.phase_started_epoch);
+
+  const ageSecs = updatedEpoch != null ? Math.max(0, nowSecs - updatedEpoch) : null;
+  const totalElapsedSecs = startedEpoch != null ? Math.max(0, nowSecs - startedEpoch) : null;
+  const phaseElapsedSecs = phaseStartedEpoch != null ? Math.max(0, nowSecs - phaseStartedEpoch) : null;
+
+  // Heartbeat: 'failed' always reads red regardless of age (a failure is
+  // terminal, not stale); 'success' reads green (a finished build has no
+  // heartbeat to keep fresh); 'running' derives fresh/amber from updated_epoch
+  // per the contract, and an unresolvable age (no updated_epoch at all)
+  // degrades to amber rather than a false-fresh green.
+  let heartbeat;
+  if (status === 'failed') heartbeat = 'red';
+  else if (status === 'success') heartbeat = 'green';
+  else if (ageSecs == null) heartbeat = 'amber';
+  else heartbeat = ageSecs < LAB_HEARTBEAT_FRESH_SECS ? 'green' : 'amber';
+
+  const phaseKnown = phase != null && LAB_PHASES.includes(phase);
+
+  return {
+    slot,
+    available: true,
+    repo: str(raw.repo),
+    branch: str(raw.branch),
+    platform: str(raw.platform),
+    target: str(raw.target),
+    runCommand: str(raw.run_command),
+    port: int(raw.port),
+    phase,
+    phaseKnown,
+    phaseIndex,
+    phaseTotal,
+    percent,
+    percentUnknown: percent == null,
+    status,
+    startedEpoch,
+    updatedEpoch,
+    phaseStartedEpoch,
+    totalElapsedSecs,
+    phaseElapsedSecs,
+    ageSecs,
+    message: str(raw.message, ''),
+    logfile: str(raw.logfile),
+    error: str(raw.error),
+    heartbeat,
+  };
+}
+
+// Build every MOBILE LAB card from io.js's readLabBuildStatuses output, most
+// recently updated first so an actively-building slot always leads. Pure:
+// `nowSecs` is threaded in rather than read internally, matching every other
+// time-dependent builder in this file.
+export function buildLabBuildCards(entries, nowSecs) {
+  const cards = (entries || []).map((e) => buildLabBuildCard(e, nowSecs));
+  return cards.sort((a, b) => {
+    const au = a.updatedEpoch ?? -Infinity;
+    const bu = b.updatedEpoch ?? -Infinity;
+    return bu - au;
+  });
 }
