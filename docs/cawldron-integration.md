@@ -46,7 +46,8 @@ Firstmate sets and clears the lock explicitly (there is no auto-detection of a l
 
 ## Code-vs-vault caveats
 
-Two specific claims below were verified by reading the Cawldron repo directly (read-only; nothing there was changed), at commit `4b6b664` (2026-06-24), path `/Users/thev/cawldron/firstmate/projects/cawldron`.
+Two specific claims below were verified by reading the Cawldron repo directly (read-only; nothing there was changed), at commit `4b6b664` (2026-06-24).
+Source paths below are repo-relative to that checkout.
 
 **(a) Cawldron is claude-only in fact, though its agent registry is adapter-shaped for other CLIs.**
 `packages/engine/src/agents.ts` documents itself as a v1, claude-only spike: its `AGENTS` registry (an array of `{id, bin, ...}` entries) has exactly one entry, `{id: "claude", bin: "claude"}`, with a trailing comment marking where `codex` / `opencode` / other CLIs would land.
@@ -69,6 +70,6 @@ Firstmate is one fleet supervising a bounded set of registered projects; Cawldro
 The repo is the join key between them: a project's `cawldron.yml` is committed *in that project's own repo*, not in firstmate's.
 Firstmate is the discoverer, not the owner, of that contract - it reads a project's `cawldron.yml` (when reconciling gates/protected paths per the table above) the same way it reads any other committed project convention, never authoring or shipping one itself.
 
-This is a separate relationship from the fact that Cawldron's own source happens to be cloned inside a firstmate home (`/Users/thev/cawldron/firstmate/projects/cawldron`, the path read for this document).
+This is a separate relationship from the fact that Cawldron's own source happens to be cloned inside a firstmate home (the same commit `4b6b664` checkout read for this document).
 That clone means a firstmate instance *builds Cawldron* the same way it would build any other registered project - ordinary project-delivery work, unrelated to whether Cawldron is being used to *drive* some other product repo.
 A firstmate developing Cawldron and a firstmate coordinating with a captain's live Cawldron session on an unrelated product repo are two independent relationships that happen to involve the same tool name.
