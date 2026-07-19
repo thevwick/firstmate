@@ -27,6 +27,15 @@
 #   --push    fast-forward the FORK by pushing the upstream commit to origin,
 #             then fast-forward the local default branch to match. Refuses on a
 #             diverged fork. Run this when the report says the fork is behind.
+#             This is an outward-facing write to a shared default branch, so it
+#             is a human-invoked command, never something an agent or a sweep
+#             runs on its own.
+#   --sweep   mark the run as UNATTENDED: no terminal is watching and stderr is
+#             discarded by the caller, so git must never sit on a credential or
+#             passphrase prompt. Bootstrap passes this. It cannot be combined
+#             with --push, because a prompt-free guarantee only makes sense when
+#             nobody is there to answer the prompt; a human who typed --push
+#             gets ordinary interactive authentication.
 #
 # The local fast-forward mechanics live in bin/fm-ff-lib.sh (base_mode is the
 # fetched upstream commit, so there is one ff implementation, not several).
@@ -38,12 +47,19 @@
 #   "firstmate: updated: <detail>"        the fork was advanced (--push only)
 #   "firstmate: STUCK: <detail>"          diverged; left untouched, needs a human
 #
-# Exit status: 0 whenever the run said what it found, including a report-only
-# STUCK. --push exits 1 on either of its two refusals to advance the fork - a
-# diverged fork, or a push git rejected - so a non-interactive caller can tell a
-# refusal from a success without parsing the output.
+# STUCK is reserved for a branch-shaped problem a human must reconcile: a
+# diverged fork, or a push git rejected as a non-fast-forward. A remote that
+# could not be reached or authenticated is NOT stuck - nothing about the
+# branches is wrong - so it reports as a skip naming credentials or the network,
+# which points at the real cause instead of sending the operator to read history.
 #
-# Usage: fm-upstream-sync.sh [--push] [--help]
+# Exit status: 0 whenever the run said what it found, including a report-only
+# STUCK. --push exits 1 whenever it was asked to advance the fork and did not,
+# whether because the fork diverged, the push was rejected, or origin could not
+# be reached, so a scripted caller can tell a refusal from a success without
+# parsing the output.
+#
+# Usage: fm-upstream-sync.sh [--push] [--sweep] [--help]
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,29 +72,55 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 UPSTREAM_REMOTE="${FM_UPSTREAM_REMOTE:-upstream}"
 LABEL=firstmate
 PUSH=no
-
-# Never block on a credential prompt. This runs from the session-start sweep
-# with stderr swallowed, so an interactive prompt would be an invisible hang;
-# an unauthenticated remote must fail fast and report a skip instead.
-# BatchMode is APPENDED rather than defaulted, because GIT_TERMINAL_PROMPT does
-# not cover ssh's own passphrase prompt: an operator with their own
-# GIT_SSH_COMMAND (a custom identity file, a ProxyCommand) must still get the
-# non-interactive guarantee, and a later -o wins over an earlier one.
-export GIT_TERMINAL_PROMPT=0
-export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes"
+SWEEP=no
 
 usage() {
-  sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,62p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --push) PUSH=yes ;;
+    --sweep) SWEEP=yes ;;
     --help|-h) usage; exit 0 ;;
-    *) echo "error: unknown argument '$1' (usage: fm-upstream-sync.sh [--push])" >&2; exit 2 ;;
+    *) echo "error: unknown argument '$1' (usage: fm-upstream-sync.sh [--push] [--sweep])" >&2; exit 2 ;;
   esac
   shift
 done
+
+if [ "$PUSH" = yes ] && [ "$SWEEP" = yes ]; then
+  echo "error: --sweep is unattended and cannot be combined with --push" >&2
+  exit 2
+fi
+
+# Unattended only. Nobody is watching this run and the caller discards stderr, so
+# an interactive prompt would be an invisible hang; an unauthenticated remote must
+# fail fast and report a skip instead. A human who deliberately typed the command
+# keeps ordinary interactive authentication, because an ssh-agent-less operator
+# with a passphrase-protected key must still be able to answer for themselves.
+#
+# GIT_TERMINAL_PROMPT does not cover ssh's own passphrase prompt, so BatchMode is
+# forced too, and it is PREPENDED immediately after the program word rather than
+# appended: ssh uses the FIRST obtained value for each parameter, so an option
+# added after an operator's own -o BatchMode=no would be ignored.
+if [ "$SWEEP" = yes ]; then
+  export GIT_TERMINAL_PROMPT=0
+  if [ -n "${GIT_SSH_COMMAND:-}" ]; then
+    read -r ssh_prog ssh_rest <<<"$GIT_SSH_COMMAND"
+    export GIT_SSH_COMMAND="$ssh_prog -o BatchMode=yes${ssh_rest:+ $ssh_rest}"
+  else
+    export GIT_SSH_COMMAND="ssh -o BatchMode=yes"
+  fi
+fi
+
+# An unattended run has no terminal to write to and its caller throws stderr away.
+# A human run gets git's own diagnostic, which is the only place the real cause of
+# an authentication or network failure is spelled out.
+relay_git_error() {  # <text>
+  [ "$SWEEP" = yes ] && return 0
+  [ -n "$1" ] || return 0
+  printf '%s\n' "$1" | sed 's/^/  /' >&2
+}
 
 # Report and exit 0: an absent upstream remote is the normal single-remote
 # install, not a problem to escalate.
@@ -100,18 +142,25 @@ DEFAULT=$(default_branch "$FM_ROOT") || {
   exit 0
 }
 
-if ! git -C "$FM_ROOT" fetch "$UPSTREAM_REMOTE" --quiet 2>/dev/null; then
-  echo "$LABEL: skipped: cannot fetch $UPSTREAM_REMOTE"
-  exit 0
-fi
+# A fetch that fails says nothing about the branches, so it is a skip naming the
+# network or credentials rather than a STUCK that would send the operator off to
+# read history for a problem that is actually a key or a missing connection.
+fetch_remote() {  # <remote>
+  local remote=$1 err
+  if ! err=$(git -C "$FM_ROOT" fetch "$remote" --quiet 2>&1); then
+    echo "$LABEL: skipped: cannot reach $remote (network or credentials)"
+    relay_git_error "$err"
+    return 1
+  fi
+  return 0
+}
+
+fetch_remote "$UPSTREAM_REMOTE" || exit 0
 # origin too, because the whole classification below is read off origin/<default>.
 # A stale remote-tracking ref would under-report the fork's own commits and turn a
 # genuine divergence into a clean "behind", which is precisely the case that must
 # never be advanced automatically. Never classify against data we failed to refresh.
-if ! git -C "$FM_ROOT" fetch origin --quiet 2>/dev/null; then
-  echo "$LABEL: skipped: cannot fetch origin"
-  exit 0
-fi
+fetch_remote origin || exit 0
 
 UPSTREAM_REF="$UPSTREAM_REMOTE/$DEFAULT"
 ORIGIN_REF="origin/$DEFAULT"
@@ -170,7 +219,16 @@ fi
 # push, so git itself is the final guard: if origin has moved in a way that is
 # no longer a fast-forward, the push is rejected rather than overwriting it.
 if ! out=$(git -C "$FM_ROOT" push origin "$UPSTREAM_REV:refs/heads/$DEFAULT" 2>&1); then
-  echo "$LABEL: STUCK: fast-forward push to origin/$DEFAULT was rejected - needs attention"
+  # Two very different failures wear the same non-zero exit. Only a ref git
+  # actually refused is a branch problem worth a STUCK; anything else means the
+  # push never got far enough to have an opinion about branches, so it reports as
+  # a skip naming the real cause instead of pointing at history.
+  case "$out" in
+    *'[rejected]'*|*'non-fast-forward'*|*'fetch first'*|*'stale info'*)
+      echo "$LABEL: STUCK: fast-forward push to origin/$DEFAULT was rejected as a non-fast-forward - needs attention" ;;
+    *)
+      echo "$LABEL: skipped: cannot push to origin (network or credentials)" ;;
+  esac
   printf '%s\n' "$out" | sed 's/^/  /' >&2
   exit 1
 fi

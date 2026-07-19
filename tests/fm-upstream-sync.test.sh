@@ -289,6 +289,96 @@ test_push_is_idempotent() {
   pass "fm-upstream-sync: --push is idempotent once the fork is level"
 }
 
+# The prompt-free guarantee belongs to the unattended sweep, where nobody can
+# answer a prompt and stderr is thrown away. A human who deliberately typed the
+# command must keep ordinary interactive authentication, so the guard must not
+# leak onto that path.
+# A fake ssh that records the arguments git handed it, so the tests observe the
+# environment git actually used rather than re-deriving what the script exported.
+# Its ssh:// remote never connects, which is the point: the run fails, and what is
+# under test is what it did on the way there.
+make_ssh_case() {  # <name>
+  local c=$1
+  c=$(new_case "$c")
+  cat > "$c/report-ssh" <<'EOF'
+#!/usr/bin/env bash
+echo "SSH_ARGS: $*" >> "$REPORT_FILE"
+echo "ssh: could not authenticate" >&2
+exit 255
+EOF
+  chmod +x "$c/report-ssh"
+  git -C "$c/clone" remote set-url upstream "ssh://host.invalid/upstream.git"
+  : > "$c/ssh-args"
+  printf '%s\n' "$c"
+}
+
+# ssh takes the FIRST value it obtains for a parameter, so an option appended
+# after an operator's own -o BatchMode=no would be silently ignored and the
+# unattended run could still hang on a passphrase prompt.
+test_sweep_prepends_batchmode_ahead_of_operator_options() {
+  local c out
+  c=$(make_ssh_case batchmode-order)
+
+  REPORT_FILE="$c/ssh-args" FM_ROOT_OVERRIDE="$c/clone" \
+    GIT_SSH_COMMAND="$c/report-ssh -o BatchMode=no" "$SYNC" --sweep >/dev/null 2>&1 || true
+  out=$(cat "$c/ssh-args")
+  assert_contains "$out" "-o BatchMode=yes" \
+    "the unattended sweep should force BatchMode on"
+  case "$out" in
+    *"BatchMode=yes"*"BatchMode=no"*) ;;
+    *) fail "BatchMode=yes must come BEFORE the operator's own option, since ssh takes the first value it obtains (got: $out)" ;;
+  esac
+  pass "fm-upstream-sync: the sweep prepends BatchMode ahead of operator options"
+}
+
+# The prompt-free guarantee belongs to the unattended sweep, where nobody can
+# answer a prompt and the caller discards stderr. A human who deliberately typed
+# the command keeps ordinary interactive authentication and gets git's own
+# diagnostic, which is the only place the real cause is spelled out.
+test_manual_run_stays_interactive_and_shows_git_errors() {
+  local c out
+  c=$(make_ssh_case manual-interactive)
+
+  out=$(REPORT_FILE="$c/ssh-args" FM_ROOT_OVERRIDE="$c/clone" \
+        GIT_SSH_COMMAND="$c/report-ssh" "$SYNC" 2>&1)
+  assert_contains "$out" "could not authenticate" \
+    "a manual run should surface git's own diagnostic instead of swallowing it"
+  assert_not_contains "$(cat "$c/ssh-args")" "BatchMode" \
+    "a manual run must not force BatchMode onto the operator's own ssh command"
+
+  out=$(REPORT_FILE="$c/ssh-args" FM_ROOT_OVERRIDE="$c/clone" \
+        GIT_SSH_COMMAND="$c/report-ssh" "$SYNC" --sweep 2>&1)
+  assert_not_contains "$out" "could not authenticate" \
+    "an unattended run should keep git's own stderr out of its report"
+  pass "fm-upstream-sync: non-interactive git is scoped to the unattended sweep"
+}
+
+# An unreachable or unauthenticated remote is not a branch problem, so calling it
+# STUCK would send the operator to read history over what is actually a key.
+test_unreachable_remote_is_a_skip_not_stuck() {
+  local c out
+  c=$(new_case unreachable)
+  git -C "$c/clone" remote set-url upstream "$c/does-not-exist.git"
+  out=$(run_sync "$c" --sweep)
+  assert_contains "$out" "cannot reach upstream (network or credentials)" \
+    "an unreachable remote should name the real cause"
+  assert_not_contains "$out" "STUCK" \
+    "an unreachable remote is not a divergence and must not be reported as STUCK"
+  pass "fm-upstream-sync: an unreachable remote reports as a skip, not STUCK"
+}
+
+# --sweep exists to guarantee no prompt can hang an unattended run; --push is a
+# human action that may legitimately need to authenticate interactively.
+test_sweep_and_push_are_mutually_exclusive() {
+  local c out rc
+  c=$(new_case sweep-push)
+  out=$(run_sync "$c" --push --sweep) && rc=0 || rc=$?
+  [ "${rc:-0}" -ne 0 ] || fail "--push --sweep should be rejected"
+  assert_contains "$out" "cannot be combined" \
+    "the rejection should say why the combination is refused"
+  pass "fm-upstream-sync: --sweep and --push are mutually exclusive"
+}
+
 test_unknown_argument_is_rejected() {
   local c out rc
   c=$(new_case bad-arg)
@@ -319,6 +409,31 @@ test_bootstrap_relays_behind_and_stuck_only() {
   pass "fm-bootstrap: relays actionable UPSTREAM_SYNC outcomes and stays quiet otherwise"
 }
 
+# A timeout is the one skip worth saying out loud: unlike the free skips, it
+# spends its whole budget at every single session start until the remote is
+# reachable again, and an unexplained recurring startup delay is exactly what
+# nobody manages to diagnose later.
+test_bootstrap_relays_drift_check_timeout() {
+  local c out stub
+  c=$(new_case bootstrap-timeout)
+  stub="$c/stubbin"
+  mkdir -p "$stub"
+  # Copy bootstrap's whole bin next to a drift check that never returns, so the
+  # SCRIPT_DIR-resolved sweep is the slow one while everything else is genuine.
+  cp "$ROOT"/bin/*.sh "$stub/"
+  cat > "$stub/fm-upstream-sync.sh" <<'EOF'
+#!/usr/bin/env bash
+sleep 120
+EOF
+  chmod +x "$stub/fm-upstream-sync.sh"
+
+  out=$(FM_ROOT_OVERRIDE="$c/clone" FM_HOME="$c/clone" \
+        FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT=1 "$stub/fm-bootstrap.sh" 2>/dev/null)
+  assert_contains "$out" "UPSTREAM_SYNC: firstmate: skipped: drift check timed out" \
+    "a timed-out drift check should be relayed rather than silently costing time"
+  pass "fm-bootstrap: relays a drift-check timeout as its own line"
+}
+
 test_no_upstream_remote_is_silent_skip
 test_current_fork_reports_current
 test_ahead_only_fork_is_current_not_stuck
@@ -332,5 +447,10 @@ test_report_only_stuck_still_exits_zero
 test_push_fast_forwards_the_fork
 test_push_reports_when_local_branch_could_not_follow
 test_push_is_idempotent
+test_sweep_prepends_batchmode_ahead_of_operator_options
+test_manual_run_stays_interactive_and_shows_git_errors
+test_unreachable_remote_is_a_skip_not_stuck
+test_sweep_and_push_are_mutually_exclusive
 test_unknown_argument_is_rejected
 test_bootstrap_relays_behind_and_stuck_only
+test_bootstrap_relays_drift_check_timeout

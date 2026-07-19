@@ -34,13 +34,16 @@ When any diagnostic needs captain attention, report the plain consequence and re
 - `FLEET_SYNC: <repo>: STUCK: on <state>, N commits behind <base> - needs attention` - the clone is dirty, on a non-default branch, detached with unique commits, or diverged, so the sync left it untouched (never forcing or discarding); it will keep falling behind until you look.
   A loud STUCK, especially a growing N across bootstraps, means that clone needs hands-on attention; dispatch a crewmate or resolve it before it strands work.
 - `UPSTREAM_SYNC: firstmate: behind: <detail>` - this firstmate repo is a fork whose origin has fallen behind the upstream project it tracks, and the drift is a clean fast-forward.
-  The sweep only reports and moves nothing at all; run the `bin/fm-upstream-sync.sh --push` command named in the line to bring the fork forward, which is an outward-facing write and so is never automatic.
-  Do this before `/updatefirstmate`, which pulls from origin and can only deliver what the fork already has.
+  The sweep only reports and moves nothing at all.
+  Surface the drift to the captain and stop there: advancing the fork writes directly to a shared default branch, which is outward-facing work that never happens without the captain, so report the printed command as theirs to run rather than running it yourself.
+  Mention that it matters before `/updatefirstmate`, which pulls from origin and can only deliver what the fork already has.
 - `UPSTREAM_SYNC: firstmate: STUCK: fork has diverged ... - needs attention` - the fork is both ahead of and behind upstream, so there is no fast-forward and it was left completely untouched.
   Reconciling it needs a rebase and a force push, which is a deliberate human operation: take a backup ref first, and never let a sweep do it.
   A fork that is only ahead is not diverged; that is the normal state of a fork carrying its own work and it reports as current.
-  Only these two outcomes are relayed: a fork that is current, and one whose drift could not be assessed at all (no upstream remote, unreachable, not a repo), are both silent, so a single-remote install never prints an UPSTREAM_SYNC line.
-  Run `bin/fm-upstream-sync.sh` directly when you want the skip reason.
+  A fork that is current, and one whose drift could not be assessed at all (no upstream remote, unreachable, not a repo), are both silent, so a single-remote install never prints an UPSTREAM_SYNC line.
+  Run `bin/fm-upstream-sync.sh` directly when you want the skip reason; that report-only form moves nothing and is safe to run.
+- `UPSTREAM_SYNC: firstmate: skipped: drift check timed out after <N>s` - the one skip that is relayed rather than silent, because an unreachable upstream spends that whole budget at every session start until it is fixed.
+  Nothing is wrong with the fork itself and no work is blocked; report the recurring startup delay and its cause to the captain so the unreachable remote can be sorted out.
 - `PR_CHECK_MIGRATION: canonical polls rebuilt and armed; resume supervision for this home` - the non-executing migration rebuilt canonical task polls from validated metadata, and those polls are already armed.
   Independently verify the private per-task outcome record, then resume the emitted supervision protocol after finishing the session-start wake handling.
 - `PR_CHECK_MIGRATION: validated replacement polls armed; resume supervision for this home` - a retry proved canonical publication provenance, metadata identity binding, and single-link integrity for a replacement poll resolving an earlier ambiguous migration outcome.

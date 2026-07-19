@@ -71,8 +71,13 @@
 #          it has both an origin and an upstream remote: behind means the fork is
 #          fast-forwardable and names the --push command that advances it, STUCK
 #          means the fork has diverged and is left untouched for a human. A
-#          single-remote install and an already-current fork are both silent.
-#          The sweep never pushes, rebases, or forces anything.
+#          single-remote install and an already-current fork are both silent, as
+#          is every skip that merely means drift could not be assessed - except a
+#          timeout, which is relayed as its own skip line because it spends its
+#          whole budget on every session start until the remote is reachable
+#          again. The check runs unattended (--sweep), so it can never block on a
+#          credential prompt, and it never pushes, rebases, or forces anything;
+#          --push is a human-invoked command and is never run from here.
 #          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the six MUTATING sweeps
 #          (PR-check migration, secondmate_sync, secondmate_liveness_sweep,
 #          x_mode_setup, upstream_sync, fleet_sync) while still printing every read-only detect line
@@ -209,14 +214,19 @@ upstream_sync() {
   # two hung remotes stall session start for the sum of both.
   timeout=$(fleet_sync_bootstrap_timeout)
   [ "$timeout" -le 20 ] || timeout=20
-  if ! bootstrap_run_bounded "$timeout" "$tmp" "$SCRIPT_DIR/fm-upstream-sync.sh"; then
-    # A timed-out drift check assessed nothing, exactly like any other skip, so
-    # it stays silent rather than reporting drift it never measured.
+  # --sweep: nobody is watching and stderr is discarded just below, so the drift
+  # check must never sit on a credential prompt waiting for an answer.
+  if ! bootstrap_run_bounded "$timeout" "$tmp" "$SCRIPT_DIR/fm-upstream-sync.sh" --sweep; then
+    # A timeout is the one skip worth saying out loud. Every other skip is free,
+    # but this one silently spends its whole budget at every single session start
+    # for as long as the remote stays unreachable, and an unexplained recurring
+    # delay is exactly what nobody manages to diagnose months later.
+    echo "UPSTREAM_SYNC: firstmate: skipped: drift check timed out after ${timeout}s"
     rm -f "$tmp"
     return 0
   fi
-  # Relay only the two ACTIONABLE outcomes. Every skip means the drift could not
-  # be assessed at all (no upstream remote, unreachable, not a repo), which is
+  # Relay only the ACTIONABLE outcomes. Every remaining skip means the drift could
+  # not be assessed at all (no upstream remote, unreachable, not a repo), which is
   # the normal state for a non-forked install and is never something the captain
   # can act on, so it stays silent and keeps "silent = all good" true.
   while IFS= read -r line; do
