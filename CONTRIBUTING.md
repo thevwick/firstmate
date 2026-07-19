@@ -76,8 +76,14 @@ for test_script in tests/*.test.sh; do bash "$test_script"; done   # behavior te
 tmp=$(mktemp -d) && printf 'done: smoke\n' > "$tmp/smoke.status" && FM_STATE_OVERRIDE="$tmp" FM_SIGNAL_GRACE=1 FM_POLL=1 FM_HEARTBEAT=999999 bin/fm-watch-arm.sh  # watcher re-arm smoke test (prints arm status, then an actionable signal)
 ```
 
+Run the watcher smoke test from a checkout that is itself a disposable treehouse worktree and it first prints a loud relocation banner on stderr before arming normally; that is the expected self-correction, not a failure.
+
 Discover tests by listing `tests/*.test.sh`: each is a self-contained bash script named `<subject>.test.sh`, and its header comment describes what it covers, so run one directly to focus on a subject.
 Tests that need a real optional backend or an explicit opt-in (real herdr/zellij/cmux smoke tests, the live Pi regression) skip themselves and print the tool or environment gate needed to enable them, so the run-all loop above is always safe.
+
+A suite that runs `bin/fm-watch.sh`, `bin/fm-watch-arm.sh`, `bin/fm-watch-checkpoint.sh`, or `bin/fm-afk-start.sh` needs a treehouse pool-root pin, because those launchers relocate themselves out of a disposable pool slot and a checkout that is itself a task worktree is exactly that shape.
+Sourcing `tests/lib.sh`, directly or through a helper that sources it, inherits the tree-wide `FM_TREEHOUSE_POOL_ROOT` pin; a standalone suite sets the variable itself, and a suite that only mentions a launcher without running it carries the `relocation-pool-pin: not-needed` marker instead.
+`tests/fm-relocation-pool-pin.test.sh` enforces that at authoring time.
 
 ## Questions
 

@@ -154,6 +154,9 @@ When it is unset, most scripts use the repo root as the home; when it is set, sc
 When `FM_HOME` is unset, it also behaves as the old whole-root override.
 `bin/fm-send.sh` is intentionally stricter than that general fallback: it requires `FM_HOME` to be set before resolving a target, so operator steers cannot silently resolve against the wrong home.
 `FM_STATE_OVERRIDE`, `FM_DATA_OVERRIDE`, `FM_PROJECTS_OVERRIDE`, and `FM_CONFIG_OVERRIDE` override individual operational directories for tests and specialized harness setup.
+`FM_HOME` is also where a long-lived supervision process relocates itself to survive treehouse's lingering-process sweep, which kills every process whose working directory resolves under a returned worktree regardless of who started it.
+The watcher, its arm wrapper, the bounded foreground checkpoint, and the away-mode daemon each move into `FM_HOME` before starting anything long-lived when their working directory is a disposable pool slot outside this home, announce the move loudly on stderr, and then continue normally.
+A durably leased secondmate home is itself a pool slot but is stable for that home's lifetime, so containment in `FM_HOME` is the discriminator that keeps it exempt; `bin/fm-wake-lib.sh`'s header owns the exact contract, and `FM_TREEHOUSE_POOL_ROOT` overrides the pool root it compares against.
 For the herdr backend, `FM_HOME` also determines the workspace label used by the adapter.
 For the zellij backend, `FM_HOME` does not split containers, but it determines the readable home prefix embedded in visible tab titles; use `FM_ZELLIJ_SESSION` when a separate zellij session is needed.
 The full zellij home label also includes a short hash of the resolved `FM_ROOT` path.
@@ -406,6 +409,7 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=3    # consecutive provably-working stale escalati
 FM_WATCH_TRIAGE_LOG_MAX_BYTES=262144   # size cap for the watcher's absorbed-wake debug log
 FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT=     # optional seconds allowed for bootstrap's best-effort clone refresh; unset/blank defaults to max(20, 5 + 3 * origin-backed-project-count)
 FM_FLEET_PRUNE=1        # set to 0 to skip pruning local branches whose upstream is gone
+FM_TREEHOUSE_POOL_ROOT=  # firstmate-private treehouse pool root for the disposable-cwd relocation only; falls back to TREEHOUSE_DIR then ~/.treehouse, and a root that does not resolve leaves the relocation inert
 FM_STALE_WORKTREE_LOCK_AGE_SECS=30       # min mtime age before fm-teardown.sh treats a leftover worktree git index.lock as provably stale
 FM_TREEHOUSE_RETURN_LOCK_RETRIES=3        # retries after a treehouse return fails on the transient git index.lock signature
 FM_TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS=1 # seconds fm-teardown.sh waits before each retry after that signature
