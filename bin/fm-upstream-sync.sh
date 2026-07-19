@@ -19,16 +19,17 @@
 # current; treating it as drift would alarm on every run for as long as the fork
 # has work of its own. Only being behind is drift.
 #
-# Two levels of action, so the outward-facing half is never a surprise:
-#   default   fetch upstream, fast-forward the LOCAL default branch when safe,
-#             and report how far the fork is behind. Nothing is pushed. This is
-#             what the session-start sweep runs.
-#   --push    additionally fast-forward the FORK itself by pushing the local
-#             default branch to origin. Refuses on a diverged fork. Run this
-#             when the report says the fork is behind.
+# Two levels of action, so nothing moves until a human asks for it:
+#   default   REPORT ONLY. Fetch both remotes and report how far the fork is
+#             behind. No branch is moved and nothing is pushed. This is what the
+#             session-start sweep runs, and a routine sweep must never mutate a
+#             branch nobody asked it to move.
+#   --push    fast-forward the FORK by pushing the upstream commit to origin,
+#             then fast-forward the local default branch to match. Refuses on a
+#             diverged fork. Run this when the report says the fork is behind.
 #
-# The fast-forward mechanics live in bin/fm-ff-lib.sh (base_mode is the fetched
-# upstream commit, so there is one ff implementation, not several).
+# The local fast-forward mechanics live in bin/fm-ff-lib.sh (base_mode is the
+# fetched upstream commit, so there is one ff implementation, not several).
 #
 # Output is one line per outcome, in fm-fleet-sync.sh's vocabulary:
 #   "firstmate: skipped: <reason>"        benign, nothing to do
@@ -51,8 +52,14 @@ UPSTREAM_REMOTE="${FM_UPSTREAM_REMOTE:-upstream}"
 LABEL=firstmate
 PUSH=no
 
+# Never block on a credential prompt. This runs from the session-start sweep
+# with stderr swallowed, so an interactive prompt would be an invisible hang;
+# an unauthenticated remote must fail fast and report a skip instead.
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}"
+
 usage() {
-  sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -86,6 +93,14 @@ DEFAULT=$(default_branch "$FM_ROOT") || {
 
 if ! git -C "$FM_ROOT" fetch "$UPSTREAM_REMOTE" --quiet 2>/dev/null; then
   echo "$LABEL: skipped: cannot fetch $UPSTREAM_REMOTE"
+  exit 0
+fi
+# origin too, because the whole classification below is read off origin/<default>.
+# A stale remote-tracking ref would under-report the fork's own commits and turn a
+# genuine divergence into a clean "behind", which is precisely the case that must
+# never be advanced automatically. Never classify against data we failed to refresh.
+if ! git -C "$FM_ROOT" fetch origin --quiet 2>/dev/null; then
+  echo "$LABEL: skipped: cannot fetch origin"
   exit 0
 fi
 
@@ -126,12 +141,12 @@ if [ "$AHEAD" -gt 0 ]; then
   exit 0
 fi
 
-# Strictly behind: a genuine fast-forward.
+# Strictly behind: a genuine fast-forward. The default run reports it and stops.
+# It deliberately does NOT move the local default branch: a routine session-start
+# sweep that silently advances a branch is exactly the kind of surprise this
+# feature exists to prevent, and it would leave the local branch ahead of the
+# fork's origin. Moving anything is --push's job, because a human asked for it.
 if [ "$PUSH" != yes ]; then
-  # Advance the local default branch so the checkout is current even before the
-  # fork itself is pushed. ff_target refuses anything that is not a clean
-  # fast-forward, so a dirty or diverged local checkout is skipped, not forced.
-  ff_target "$FM_ROOT" "$LABEL" "$UPSTREAM_REV" no no >/dev/null 2>&1 || true
   echo "$LABEL: behind: fork is $BEHIND commits behind $UPSTREAM_REF; run bin/fm-upstream-sync.sh --push to fast-forward it"
   exit 0
 fi

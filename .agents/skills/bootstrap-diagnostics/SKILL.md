@@ -34,8 +34,8 @@ When any diagnostic needs captain attention, report the plain consequence and re
 - `FLEET_SYNC: <repo>: STUCK: on <state>, N commits behind <base> - needs attention` - the clone is dirty, on a non-default branch, detached with unique commits, or diverged, so the sync left it untouched (never forcing or discarding); it will keep falling behind until you look.
   A loud STUCK, especially a growing N across bootstraps, means that clone needs hands-on attention; dispatch a crewmate or resolve it before it strands work.
 - `UPSTREAM_SYNC: firstmate: behind: <detail>` - this firstmate repo is a fork whose origin has fallen behind the upstream project it tracks, and the drift is a clean fast-forward.
-  The local default branch was already advanced; run the `bin/fm-upstream-sync.sh --push` command named in the line to bring the fork itself forward, which is an outward-facing write and so is never automatic.
-  Do this before `/updatefirstmate`, which pulls from origin and would otherwise report `already current` while the fork is still behind upstream.
+  The sweep only reports and moves nothing at all; run the `bin/fm-upstream-sync.sh --push` command named in the line to bring the fork forward, which is an outward-facing write and so is never automatic.
+  Do this before `/updatefirstmate`, which pulls from origin and can only deliver what the fork already has.
 - `UPSTREAM_SYNC: firstmate: STUCK: fork has diverged ... - needs attention` - the fork is both ahead of and behind upstream, so there is no fast-forward and it was left completely untouched.
   Reconciling it needs a rebase and a force push, which is a deliberate human operation: take a backup ref first, and never let a sweep do it.
   A fork that is only ahead is not diverged; that is the normal state of a fork carrying its own work and it reports as current.

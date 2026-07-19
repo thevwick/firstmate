@@ -31,7 +31,7 @@ This touches only the firstmate repo and its own worktrees, never anything under
 
    On a fork, origin is the fork rather than the upstream project, so this step only ever delivers what the fork itself already has.
    Upstream work reaches the fork through `bin/fm-upstream-sync.sh`, whose drift report the session-start digest surfaces as an `UPSTREAM_SYNC:` line.
-   If that line says the fork is behind, bring the fork forward first and then run this updater, or it will report `already current` while still being behind upstream.
+   If that line says the fork is behind, bring the fork forward with `bin/fm-upstream-sync.sh --push` first and then run this updater, because this step can only ever deliver what the fork already has.
 
 2. **Re-read AGENTS.md if your own instructions changed.**
    When the updater printed `reread-firstmate: yes`, the tracked instruction surface (`AGENTS.md`, `bin/`, or `.agents/skills/`) just advanced under you.

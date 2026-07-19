@@ -54,6 +54,10 @@ new_case() {  # <name>
   printf '%s\n' "$c"
 }
 
+# The advance_* fixtures deliberately leave the clone's remote-tracking refs
+# stale. Refreshing them here would pre-fetch the very refs the script is
+# responsible for refreshing, hiding a stale-ref misclassification from the suite.
+#
 # advance_upstream <case> <n>: add n commits to upstream only.
 advance_upstream() {  # <case> <n>
   local c=$1 n=$2 work="$1/up-work" i
@@ -63,8 +67,6 @@ advance_upstream() {  # <case> <n>
     commit_file "$work" "up-$i.txt" "upstream $i"
   done
   git -C "$work" push -q origin main
-  git -C "$c/clone" fetch -q upstream
-  git -C "$c/clone" fetch -q origin
 }
 
 # advance_fork <case> <n>: add n commits to the fork only (creates divergence
@@ -77,7 +79,6 @@ advance_fork() {  # <case> <n>
     commit_file "$work" "fork-$i.txt" "fork $i"
   done
   git -C "$work" push -q origin main
-  git -C "$c/clone" fetch -q origin
 }
 
 run_sync() {  # <case> [args...]
@@ -145,14 +146,51 @@ test_behind_fork_reports_and_pushes_nothing() {
   pass "fm-upstream-sync: a behind fork is reported and nothing is pushed"
 }
 
-test_behind_fork_fast_forwards_local_default_branch() {
-  local c
+# The default run is REPORT ONLY. A routine session-start sweep must never move a
+# branch nobody asked it to move, and advancing local main past the fork's origin
+# would also push upstream code into anything based on this checkout.
+test_default_run_leaves_local_default_branch_unmoved() {
+  local c before
   c=$(new_case behind-local-ff)
   advance_upstream "$c" 2
+  before=$(git -C "$c/clone" rev-parse main)
   run_sync "$c" >/dev/null
+  [ "$(git -C "$c/clone" rev-parse main)" = "$before" ] \
+    || fail "the default run must not move the local default branch"
+  pass "fm-upstream-sync: the default run reports drift without moving the local branch"
+}
+
+# --push is the deliberate, human-invoked action, so it is the one path allowed to
+# bring the local checkout along with the fork it just advanced.
+test_push_fast_forwards_local_default_branch() {
+  local c
+  c=$(new_case push-local-ff)
+  advance_upstream "$c" 2
+  run_sync "$c" --push >/dev/null
   [ "$(git -C "$c/clone" rev-parse main)" = "$(upstream_head "$c")" ] \
-    || fail "the local default branch should fast-forward to upstream even before a push"
-  pass "fm-upstream-sync: the local default branch fast-forwards to upstream"
+    || fail "--push should leave the local default branch level with upstream"
+  pass "fm-upstream-sync: --push fast-forwards the local default branch too"
+}
+
+# Classification is read off origin/<default>, so the script must refresh that ref
+# itself. If it trusted a stale one, a fork that gained commits behind its back
+# would read as 0 ahead and be misreported as a clean fast-forward - defeating the
+# STUCK path that is the whole safety guarantee.
+test_stale_origin_ref_still_classifies_divergence() {
+  local c out stale
+  c=$(new_case stale-origin)
+  advance_upstream "$c" 2
+  advance_fork "$c" 1
+  stale=$(git -C "$c/clone" rev-parse origin/main)
+  [ "$stale" != "$(fork_head "$c")" ] \
+    || fail "fixture bug: origin/main should still be stale before the run"
+
+  out=$(run_sync "$c")
+  assert_contains "$out" "STUCK:" \
+    "a fork advanced behind the script's back must still be seen as diverged"
+  assert_contains "$out" "1 ahead and 2 behind" \
+    "the refreshed comparison should count the fork's unfetched commits"
+  pass "fm-upstream-sync: a stale origin ref is refreshed before classifying"
 }
 
 # The safety-critical case. A diverged fork holds commits upstream does not;
@@ -249,7 +287,9 @@ test_no_upstream_remote_is_silent_skip
 test_current_fork_reports_current
 test_ahead_only_fork_is_current_not_stuck
 test_behind_fork_reports_and_pushes_nothing
-test_behind_fork_fast_forwards_local_default_branch
+test_default_run_leaves_local_default_branch_unmoved
+test_push_fast_forwards_local_default_branch
+test_stale_origin_ref_still_classifies_divergence
 test_diverged_fork_is_stuck_and_untouched
 test_diverged_fork_refuses_push_too
 test_push_fast_forwards_the_fork

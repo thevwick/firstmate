@@ -137,6 +137,37 @@ fleet_sync_bootstrap_timeout() {
   echo "$timeout"
 }
 
+# Run a child in its own process group and wait at most <timeout> seconds for it.
+# Returns 0 when the child finished on its own, 1 when it was killed on timeout.
+# Every bootstrap sweep that touches the network goes through this, so a slow,
+# hung, or credential-prompting remote can never hold up session start.
+BOOTSTRAP_BOUNDED_ELAPSED=0
+bootstrap_run_bounded() {  # <timeout> <outfile> <cmd> [args...]
+  local timeout=$1 out=$2 monitor_was_on=0 pid start elapsed
+  shift 2
+  case $- in *m*) monitor_was_on=1 ;; esac
+  set -m 2>/dev/null || true
+  "$@" >"$out" 2>/dev/null &
+  pid=$!
+
+  start=$SECONDS
+  while jobs -r -p | grep -qx "$pid"; do
+    elapsed=$((SECONDS - start))
+    if [ "$elapsed" -ge "$timeout" ]; then
+      kill -TERM "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true
+      BOOTSTRAP_BOUNDED_ELAPSED=$elapsed
+      return 1
+    fi
+    sleep 1
+  done
+  wait "$pid" 2>/dev/null || true
+  [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true
+  BOOTSTRAP_BOUNDED_ELAPSED=$((SECONDS - start))
+  return 0
+}
+
 fleet_sync_relay_filtered_output() {
   local tmp=$1 line
   while IFS= read -r line; do
@@ -169,9 +200,15 @@ upstream_sync() {
   # $FM_ROOT/bin: FM_ROOT is the repo being INSPECTED for drift, which is not
   # necessarily the checkout this bootstrap is running from.
   [ -x "$SCRIPT_DIR/fm-upstream-sync.sh" ] || return 0
-  local tmp line
+  local tmp line timeout
   tmp=$(mktemp "${TMPDIR:-/tmp}/fm-upstream-sync.XXXXXX" 2>/dev/null) || return 0
-  "$SCRIPT_DIR/fm-upstream-sync.sh" >"$tmp" 2>/dev/null || true
+  timeout=$(fleet_sync_bootstrap_timeout)
+  if ! bootstrap_run_bounded "$timeout" "$tmp" "$SCRIPT_DIR/fm-upstream-sync.sh"; then
+    # A timed-out drift check assessed nothing, exactly like any other skip, so
+    # it stays silent rather than reporting drift it never measured.
+    rm -f "$tmp"
+    return 0
+  fi
   # Relay only the two ACTIONABLE outcomes. Every skip means the drift could not
   # be assessed at all (no upstream remote, unreachable, not a repo), which is
   # the normal state for a non-forked install and is never something the captain
@@ -190,28 +227,13 @@ fleet_sync() {
 
   tmp=$(mktemp "${TMPDIR:-/tmp}/fm-fleet-sync.XXXXXX" 2>/dev/null) || return 0
   timeout=$(fleet_sync_bootstrap_timeout)
-  monitor_was_on=0
-  case $- in *m*) monitor_was_on=1 ;; esac
-  set -m 2>/dev/null || true
-  "$FM_ROOT/bin/fm-fleet-sync.sh" >"$tmp" 2>/dev/null &
-  pid=$!
-
-  start=$SECONDS
-  while jobs -r -p | grep -qx "$pid"; do
-    elapsed=$((SECONDS - start))
-    if [ "$elapsed" -ge "$timeout" ]; then
-      kill -TERM "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-      [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true
-      fleet_sync_relay_all_output "$tmp"
-      echo "FLEET_SYNC: fleet: skipped: bootstrap refresh timed out (timeout=${timeout}s elapsed=${elapsed}s)"
-      rm -f "$tmp"
-      return 0
-    fi
-    sleep 1
-  done
-  wait "$pid" 2>/dev/null || true
-  [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true
+  if ! bootstrap_run_bounded "$timeout" "$tmp" "$FM_ROOT/bin/fm-fleet-sync.sh"; then
+    elapsed=$BOOTSTRAP_BOUNDED_ELAPSED
+    fleet_sync_relay_all_output "$tmp"
+    echo "FLEET_SYNC: fleet: skipped: bootstrap refresh timed out (timeout=${timeout}s elapsed=${elapsed}s)"
+    rm -f "$tmp"
+    return 0
+  fi
 
   fleet_sync_relay_filtered_output "$tmp"
   rm -f "$tmp"
