@@ -85,15 +85,20 @@ fm_path_age() {
 # watcher it started was safe. The call is idempotent, so the second one detects
 # nothing and prints nothing.
 #
-# The relocation deliberately does NOT resolve an already-absolute FM_HOME or
-# STATE. FM_HOME doubles as a byte-exact cross-process identity string: the
+# The relocation deliberately does NOT resolve an already-absolute FM_HOME,
+# STATE or FM_ROOT. FM_HOME doubles as a byte-exact cross-process identity string: the
 # watcher writes it into state/.watch.lock/fm-home and fm_watcher_lock_matches_pid,
 # bin/fm-turnend-guard.sh, bin/fm-continuity-pretool-check.sh,
 # bin/fm-pr-check-migrate.sh and bin/fm-watch-arm.sh all compare it verbatim
 # against their own logically derived value. Rewriting it to the resolved path
 # would desynchronize the lock from every one of them whenever a component of
 # the home path is a symlink. Only a genuinely relative value, which a chdir
-# really does invalidate, is re-anchored.
+# really does invalidate, is re-anchored, and every relative one is: FM_HOME,
+# STATE with FM_STATE_OVERRIDE, and FM_ROOT with FM_ROOT_OVERRIDE. A partially
+# re-anchored environment is harder to reason about than a fully re-anchored one,
+# and FM_ROOT in particular is inherited by every child process the launcher
+# starts, so a stale relative value would resolve against the wrong directory
+# well after the relocation.
 fm_path_under() {
   local child=$1 parent=$2
   [ -n "$parent" ] || return 1
@@ -138,7 +143,7 @@ fm_cwd_is_disposable_slot() {
 # the cwd is condemned but chdir into FM_HOME failed.
 # shellcheck disable=SC2034  # FM_DISPOSABLE_ERROR is read by the sourcing launchers
 fm_relocate_from_disposable_cwd() {
-  local headline=$1 rule state_abs
+  local headline=$1 rule state_abs root_abs
   FM_DISPOSABLE_ERROR=
   fm_cwd_is_disposable_slot || return 0
   # Re-anchor only the paths a chdir would actually invalidate, which is the
@@ -160,6 +165,16 @@ fm_relocate_from_disposable_cwd() {
       fi
       ;;
   esac
+  root_abs=
+  case "$FM_ROOT" in
+    /*) ;;
+    *)
+      if ! root_abs=$(fm_resolve_dir "$FM_ROOT"); then
+        FM_DISPOSABLE_ERROR="the code root ($FM_ROOT) is relative and no longer resolves, so it cannot be re-anchored before leaving the disposable task worktree ($FM_DISPOSABLE_CWD)"
+        return 1
+      fi
+      ;;
+  esac
   if ! CDPATH='' cd -- "$FM_HOME" 2>/dev/null; then
     FM_DISPOSABLE_ERROR="cannot move out of the disposable task worktree ($FM_DISPOSABLE_CWD) into the home ($FM_DISPOSABLE_HOME)"
     return 1
@@ -171,6 +186,10 @@ fm_relocate_from_disposable_cwd() {
   if [ -n "$state_abs" ]; then
     STATE=$state_abs
     [ -z "${FM_STATE_OVERRIDE:-}" ] || FM_STATE_OVERRIDE=$state_abs
+  fi
+  if [ -n "$root_abs" ]; then
+    FM_ROOT=$root_abs
+    [ -z "${FM_ROOT_OVERRIDE:-}" ] || FM_ROOT_OVERRIDE=$root_abs
   fi
   rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
   {

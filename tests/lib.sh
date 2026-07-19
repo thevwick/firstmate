@@ -34,6 +34,19 @@ FM_TEST_LIB_SOURCED=1
 # strips this to verify real refusal.
 export FM_GATE_REFUSE_BYPASS=1
 
+# Pin the treehouse pool root to a path that does not exist, for the whole test
+# tree rather than suite by suite. Tests run the launchers and the watcher from
+# the repo checkout while pointing FM_HOME at a temp dir, and when the checkout
+# is itself a treehouse pool slot - which it is for any crewmate task worktree -
+# that is exactly the shape bin/fm-wake-lib.sh's cwd guard relocates out of. An
+# unresolvable pool root leaves the guard inert, so every suite behaves
+# identically in CI and inside a task worktree. This is the one owner of the pin:
+# the guard lives at a choke point in bin/fm-watch.sh, so any suite that runs the
+# watcher inherits the hazard, and pinning per suite only re-surfaces it the next
+# time a suite grows a watcher call. The tests that ARE about the guard set
+# TREEHOUSE_DIR themselves on the invocation, which still overrides this.
+export TREEHOUSE_DIR="${TMPDIR:-/tmp}/fm-absent-treehouse-pool-$$"
+
 # Resolve the repo root from this library's own location. Consumed by sourcing
 # test files, not by this library, so it reads as "unused" here.
 # shellcheck disable=SC2034

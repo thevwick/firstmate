@@ -23,13 +23,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCH="$ROOT/bin/fm-afk-launch.sh"
 START="$ROOT/bin/fm-afk-start.sh"
 
-# These tests run the away-mode launchers from the repo checkout while pointing
-# FM_HOME at a temp dir. When the checkout is itself a treehouse pool slot -
-# which it is for any crewmate task worktree - that is exactly the shape the
-# launcher's cwd guard relocates out of, so the suite would behave one way in CI
-# and another inside a task worktree. Point the pool root at a path that does not
-# exist, which makes the guard inert and the suite identical in both places. The
-# tests that ARE about the guard set TREEHOUSE_DIR themselves.
+# tests/lib.sh owns this pin for the rest of the test tree, but this suite is
+# deliberately standalone - it keeps its own non-exiting `fail` so a backend e2e
+# case can clean up after itself - so it never sources that library and must
+# carry the pin itself. It runs the away-mode launchers from the repo checkout
+# while pointing FM_HOME at a temp dir, and when the checkout is itself a
+# treehouse pool slot - which it is for any crewmate task worktree - that is
+# exactly the shape the launcher's cwd guard relocates out of, so the suite would
+# behave one way in CI and another inside a task worktree. Point the pool root at
+# a path that does not exist, which makes the guard inert and the suite identical
+# in both places. The tests that ARE about the guard set TREEHOUSE_DIR themselves.
 export TREEHOUSE_DIR="${TMPDIR:-/tmp}/fm-afk-absent-treehouse-pool-$$"
 
 FAILED=0

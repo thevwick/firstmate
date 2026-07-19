@@ -15,14 +15,6 @@ LIB="$ROOT/bin/fm-wake-lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-watcher-lock-tests)
 
-# These tests arm from the repo checkout while pointing FM_HOME at a temp dir.
-# When the checkout is itself a treehouse pool slot - which it is for any crewmate
-# task worktree - that is exactly the shape fm-watch-arm.sh's cwd guard refuses,
-# so the suite would pass in CI and fail in a task worktree. Point the pool root
-# at a path that does not exist, which makes the guard inert for every test that
-# is not about it. The two tests that ARE about it set TREEHOUSE_DIR themselves.
-export TREEHOUSE_DIR="$TMP_ROOT/absent-treehouse-pool"
-
 # `fail` exits the suite immediately, so a process killed only on the happy path
 # is stranded by every failing assertion after it was forked. A leaked watcher
 # keeps polling forever against a state dir the cleanup has already removed, so
@@ -248,6 +240,40 @@ test_relocation_reports_a_state_fault_distinctly() {
     *"into the home"*) fail "STATE fault reused the home-chdir wording ($out)" ;;
   esac
   pass "a STATE re-anchor fault reports its own cause, not the home chdir's"
+}
+
+# FM_ROOT is inherited by every child the launcher starts, so a relative value
+# left un-anchored across the chdir resolves against the home rather than the
+# directory it was written for, and keeps doing so long after the relocation.
+# An absolute FM_ROOT must survive untouched, exactly as FM_HOME and STATE do.
+test_relocation_re_anchors_a_relative_root() {
+  local dir pool slot home root out
+  dir=$(make_case relocate-root-relative)
+  pool="$dir/pool"
+  slot="$pool/firstmate-abc123/12/firstmate"
+  home="$dir/home"
+  root="$dir/root"
+  mkdir -p "$slot" "$home" "$root"
+  out=$(cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$home" \
+    FM_ROOT_OVERRIDE="../../../../root" \
+    bash -c '
+      . "$1"
+      fm_relocate_from_disposable_cwd headline 2>/dev/null || exit 7
+      printf "%s\n%s\n" "$FM_ROOT" "$FM_ROOT_OVERRIDE"
+    ' _ "$LIB") || fail "relocation from a relative code root failed"
+  [ "$(printf '%s\n' "$out" | sed -n 1p)" = "$(cd "$root" && pwd -P)" ] \
+    || fail "relocation left FM_ROOT relative and now wrong ($(printf '%s\n' "$out" | sed -n 1p))"
+  [ "$(printf '%s\n' "$out" | sed -n 2p)" = "$(cd "$root" && pwd -P)" ] \
+    || fail "relocation re-anchored FM_ROOT but not FM_ROOT_OVERRIDE, which children inherit"
+
+  out=$(cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_ROOT_OVERRIDE="$root" \
+    bash -c '
+      . "$1"
+      fm_relocate_from_disposable_cwd headline 2>/dev/null || exit 7
+      printf "%s\n" "$FM_ROOT"
+    ' _ "$LIB") || fail "relocation with an absolute code root failed"
+  [ "$out" = "$root" ] || fail "relocation rewrote an absolute FM_ROOT away from $root ($out)"
+  pass "relocation re-anchors a relative code root and leaves an absolute one alone"
 }
 
 test_arm_allows_leased_home_cwd() {
@@ -1180,6 +1206,7 @@ test_relocation_preserves_absolute_fm_home_identity
 test_relocation_absolutizes_a_relative_fm_home
 test_relocation_ignores_an_unresolvable_absolute_state
 test_relocation_reports_a_state_fault_distinctly
+test_relocation_re_anchors_a_relative_root
 test_arm_allows_leased_home_cwd
 test_singleton_start
 test_pid_identity_is_locale_invariant
