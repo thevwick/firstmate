@@ -38,6 +38,11 @@
 #   "firstmate: updated: <detail>"        the fork was advanced (--push only)
 #   "firstmate: STUCK: <detail>"          diverged; left untouched, needs a human
 #
+# Exit status: 0 whenever the run said what it found, including a report-only
+# STUCK. --push exits 1 on either of its two refusals to advance the fork - a
+# diverged fork, or a push git rejected - so a non-interactive caller can tell a
+# refusal from a success without parsing the output.
+#
 # Usage: fm-upstream-sync.sh [--push] [--help]
 set -eu
 
@@ -55,11 +60,15 @@ PUSH=no
 # Never block on a credential prompt. This runs from the session-start sweep
 # with stderr swallowed, so an interactive prompt would be an invisible hang;
 # an unauthenticated remote must fail fast and report a skip instead.
+# BatchMode is APPENDED rather than defaulted, because GIT_TERMINAL_PROMPT does
+# not cover ssh's own passphrase prompt: an operator with their own
+# GIT_SSH_COMMAND (a custom identity file, a ProxyCommand) must still get the
+# non-interactive guarantee, and a later -o wins over an earlier one.
 export GIT_TERMINAL_PROMPT=0
-export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}"
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes"
 
 usage() {
-  sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -138,6 +147,12 @@ fi
 # taken first, never an automatic sweep. Leave it strictly alone.
 if [ "$AHEAD" -gt 0 ]; then
   echo "$LABEL: STUCK: fork has diverged from $UPSTREAM_REF, $AHEAD ahead and $BEHIND behind - needs attention, reconcile it by hand"
+  # A report-only run did its job and exits 0. --push was asked to advance the
+  # fork and did not, which is the same refusal as a rejected push below, so it
+  # exits the same way rather than looking like a success to a scripted caller.
+  if [ "$PUSH" = yes ]; then
+    exit 1
+  fi
   exit 0
 fi
 
@@ -159,5 +174,28 @@ if ! out=$(git -C "$FM_ROOT" push origin "$UPSTREAM_REV:refs/heads/$DEFAULT" 2>&
   printf '%s\n' "$out" | sed 's/^/  /' >&2
   exit 1
 fi
-ff_target "$FM_ROOT" "$LABEL" "$UPSTREAM_REV" no no >/dev/null 2>&1 || true
-echo "$LABEL: updated: fork fast-forwarded $BEHIND commits to $UPSTREAM_REF"
+# The fork itself has moved. Bringing the local default branch along is a second,
+# independent step that ff_target legitimately declines whenever the checkout is
+# dirty, detached, or sitting on a feature branch - which is the COMMON case,
+# since a feature branch is where an operator usually is when they run this. So
+# capture its outcome instead of discarding it: reporting a bare "fast-forwarded"
+# when only origin moved would leave the local branch quietly stranded, and the
+# next default run compares origin against upstream and reports current.
+# ff_target sets FF_STATUS in this shell, so its output goes to a file rather
+# than a command substitution, which would run it in a subshell.
+FF_LINE=""
+if FF_LOG=$(mktemp "${TMPDIR:-/tmp}/fm-upstream-ff.XXXXXX" 2>/dev/null); then
+  ff_target "$FM_ROOT" "$LABEL" "$UPSTREAM_REV" no no >"$FF_LOG" 2>&1 || true
+  FF_LINE=$(sed -n '1p' "$FF_LOG")
+  rm -f "$FF_LOG"
+else
+  ff_target "$FM_ROOT" "$LABEL" "$UPSTREAM_REV" no no >/dev/null 2>&1 || true
+fi
+
+UPDATED="$LABEL: updated: fork fast-forwarded $BEHIND commits to $UPSTREAM_REF"
+if [ "$FF_STATUS" = updated ] || [ "$FF_STATUS" = current ]; then
+  echo "$UPDATED"
+else
+  REASON=${FF_LINE#"$LABEL: skipped: "}
+  echo "$UPDATED; local $DEFAULT branch not moved${REASON:+: $REASON}"
+fi

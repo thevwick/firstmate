@@ -202,7 +202,13 @@ upstream_sync() {
   [ -x "$SCRIPT_DIR/fm-upstream-sync.sh" ] || return 0
   local tmp line timeout
   tmp=$(mktemp "${TMPDIR:-/tmp}/fm-upstream-sync.XXXXXX" 2>/dev/null) || return 0
+  # Same timeout helper as fleet sync rather than a second convention, but capped:
+  # that budget scales with the fleet, and this sweep is one repo doing two
+  # fetches, so a 20-project home would otherwise grant it a fleet-sized window.
+  # It also runs before fleet_sync, so an uncapped budget would let a home with
+  # two hung remotes stall session start for the sum of both.
   timeout=$(fleet_sync_bootstrap_timeout)
+  [ "$timeout" -le 20 ] || timeout=20
   if ! bootstrap_run_bounded "$timeout" "$tmp" "$SCRIPT_DIR/fm-upstream-sync.sh"; then
     # A timed-out drift check assessed nothing, exactly like any other skip, so
     # it stays silent rather than reporting drift it never measured.

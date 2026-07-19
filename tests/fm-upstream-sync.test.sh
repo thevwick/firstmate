@@ -217,17 +217,53 @@ test_diverged_fork_is_stuck_and_untouched() {
 }
 
 test_diverged_fork_refuses_push_too() {
-  local c out before
+  local c out before rc
   c=$(new_case diverged-push)
   advance_upstream "$c" 2
   advance_fork "$c" 1
   before=$(fork_head "$c")
 
-  out=$(run_sync "$c" --push)
+  out=$(run_sync "$c" --push) && rc=0 || rc=$?
   assert_contains "$out" "STUCK:" "--push on a diverged fork must still report STUCK"
+  [ "${rc:-0}" -ne 0 ] \
+    || fail "--push refusing to advance the fork must not exit like a success"
   [ "$(fork_head "$c")" = "$before" ] \
     || fail "--push must never force a diverged fork forward"
   pass "fm-upstream-sync: --push refuses a diverged fork rather than forcing it"
+}
+
+# A report-only run is doing its job when it reports a divergence, so it stays a
+# success; only --push, which was asked to advance the fork and did not, fails.
+test_report_only_stuck_still_exits_zero() {
+  local c rc
+  c=$(new_case diverged-report-rc)
+  advance_upstream "$c" 2
+  advance_fork "$c" 1
+  run_sync "$c" >/dev/null && rc=0 || rc=$?
+  [ "${rc:-0}" -eq 0 ] \
+    || fail "a report-only run that found drift should still exit 0"
+  pass "fm-upstream-sync: a report-only STUCK is a successful report"
+}
+
+# The local fast-forward is a second, independent step, and running --push from a
+# feature branch is the common case. When only the fork moved, the report must say
+# so rather than reading as a full success and stranding the local branch silently.
+test_push_reports_when_local_branch_could_not_follow() {
+  local c out
+  c=$(new_case push-local-blocked)
+  advance_upstream "$c" 2
+  git -C "$c/clone" checkout -q -b feature
+
+  out=$(run_sync "$c" --push)
+  assert_contains "$out" "updated: fork fast-forwarded 2 commits" \
+    "the fork really did advance, so that fact stays in the report"
+  assert_contains "$out" "local main branch not moved" \
+    "the report must say the local default branch was left behind"
+  assert_contains "$out" "on feature, expected main" \
+    "the report should carry the concrete reason the local branch could not follow"
+  [ "$(fork_head "$c")" = "$(upstream_head "$c")" ] \
+    || fail "--push should still have advanced the fork itself"
+  pass "fm-upstream-sync: --push reports a local branch it could not bring along"
 }
 
 test_push_fast_forwards_the_fork() {
@@ -292,7 +328,9 @@ test_push_fast_forwards_local_default_branch
 test_stale_origin_ref_still_classifies_divergence
 test_diverged_fork_is_stuck_and_untouched
 test_diverged_fork_refuses_push_too
+test_report_only_stuck_still_exits_zero
 test_push_fast_forwards_the_fork
+test_push_reports_when_local_branch_could_not_follow
 test_push_is_idempotent
 test_unknown_argument_is_rejected
 test_bootstrap_relays_behind_and_stuck_only
