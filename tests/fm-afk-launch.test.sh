@@ -42,41 +42,49 @@ trap GLOBAL_CLEANUP EXIT
 
 # ---------------------------------------------------------------------------
 # UNIT 0: the away-mode daemon is long-lived, so starting it from a treehouse
-# pool slot that is not this home is refused before any state is touched. A cwd
-# inside the home is not refused, even when the home is itself a leased slot.
+# pool slot that is not this home relocates into the home before the daemon exec,
+# loudly, and then continues. A cwd inside the home is left alone, even when the
+# home is itself a leased slot.
 # ---------------------------------------------------------------------------
-unit_disposable_cwd_refused() {
-  local st pool slot home out status
+unit_disposable_cwd_relocated() {
+  local st pool slot slot_real home out
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-cwd.XXXXXX")
   pool="$st/pool"
   slot="$pool/firstmate-abc123/3/firstmate"
   home="$st/home"
   out="$st/out"
   mkdir -p "$slot" "$home/state"
+  slot_real=$(cd "$slot" && pwd -P)
   ( cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
-    "$START" ) > "$out" 2>&1
-  status=$?
-  if [ "$status" -ne 0 ] && grep -qF 'REFUSING TO START AWAY MODE' "$out"; then
-    pass "disposable-cwd: refuses to start the daemon from a foreign pool slot"
+    bash -c '. "$1"; FM_AFK_DAEMON=/bin/true; fm_afk_start_main' _ "$START" ) > "$out" 2>&1
+  if grep -qF 'RELOCATED AWAY MODE' "$out" && grep -qF "$slot_real" "$out"; then
+    pass "disposable-cwd: relocates out of a foreign pool slot and names it"
   else
-    fail "disposable-cwd: did not refuse a foreign pool slot (status $status)"
+    fail "disposable-cwd: did not relocate out of a foreign pool slot ($(cat "$out"))"
   fi
-  if [ ! -e "$home/state/.afk" ]; then
-    pass "disposable-cwd: refuses before entering away mode"
+  if ! grep -qF 'REFUSING TO START AWAY MODE' "$out"; then
+    pass "disposable-cwd: does not refuse away mode"
   else
-    fail "disposable-cwd: entered away mode despite refusing to start the daemon"
+    fail "disposable-cwd: refused instead of relocating"
+  fi
+  # Relocating rather than refusing means away mode is entered with a daemon that
+  # can survive to own it, never entered and then abandoned.
+  if [ -e "$home/state/.afk" ]; then
+    pass "disposable-cwd: away mode is entered normally after relocating"
+  else
+    fail "disposable-cwd: relocation blocked away mode from being entered"
   fi
 
-  # A leased home is under the pool but IS this home, so the guard must let it by.
+  # A leased home is under the pool but IS this home, so nothing should relocate.
   home="$pool/firstmate-abc123/4/firstmate"
   out="$st/out-home"
   mkdir -p "$home/state"
   ( cd "$home" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
     FM_AFK_STATE_PREPARED=1 "$START" ) > "$out" 2>&1
-  if ! grep -qF 'REFUSING TO START AWAY MODE' "$out"; then
-    pass "disposable-cwd: does not refuse a cwd inside its own leased home"
+  if ! grep -qF 'RELOCATED AWAY MODE' "$out"; then
+    pass "disposable-cwd: does not relocate a cwd inside its own leased home"
   else
-    fail "disposable-cwd: refused its own leased home"
+    fail "disposable-cwd: relocated out of its own leased home"
   fi
   rm -rf "$st"
 }
@@ -924,7 +932,7 @@ unit_malformed_record_fails_closed
 unit_stop_malformed_record_fails_closed
 unit_tmux_planned_record_and_collision
 unit_stop_validates_before_signal
-unit_disposable_cwd_refused
+unit_disposable_cwd_relocated
 unit_lock_requires_complete_metadata
 unit_stop_surfaces_afk_removal_failure
 unit_stop_confirms_daemon_exit

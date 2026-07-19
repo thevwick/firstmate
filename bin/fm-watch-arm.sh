@@ -15,13 +15,15 @@
 #
 # A SECOND, distinct reaping hazard is the working directory the arm runs from.
 # bin/fm-wake-lib.sh's fm_cwd_is_disposable_slot owns that contract; this script
-# REFUSES to arm when it fires, naming the offending cwd and the fix. The primary
+# RELOCATES to FM_HOME when it fires, loudly, then arms normally. The primary
 # shell's cwd persists across tool calls, so one `cd` into a task worktree
 # silently condemns everything armed afterwards.
-# The refusal deliberately does NOT relocate the cwd itself. The arm process is
-# not the only process that has to survive: the harness's own wrapper shell is the
-# arm's parent and keeps the condemned cwd, so an internal `cd` would produce a
-# watcher that still dies while looking safe.
+# Relocating BEFORE the fork is what makes this correct: the watcher child
+# inherits the safe cwd, so neither the arm nor the watcher is in the sweep path.
+# The harness's own wrapper shell keeps the condemned cwd, but that does not
+# reintroduce the hazard - a wrapper shell killed by the sweep merely orphans the
+# already-running watcher, which keeps running under init.
+# It stays a warning rather than a silent repair so the condition remains visible.
 # On a harness with a PreToolUse-equivalent hook, bin/fm-arm-pretool-check.sh
 # applies the command-position policy before the command runs; see
 # docs/arm-pretool-check.md for the blessed tree and deny reason codes. It is a
@@ -69,13 +71,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
-# The cwd guard runs before any watcher work: a watcher armed from a disposable
-# pool slot is condemned, so refuse rather than start one that will be reaped.
-if fm_cwd_is_disposable_slot; then
-  fm_disposable_cwd_banner \
-    'REFUSING TO ARM THE WATCHER - CWD IS A DISPOSABLE TASK WORKTREE' \
-    'bin/fm-watch-arm.sh'
-  echo "watcher: FAILED - refusing to arm from a disposable task worktree ($FM_DISPOSABLE_CWD)"
+# The cwd guard runs before any watcher work, and well before the fork, so the
+# watcher child inherits the relocated cwd rather than a condemned one.
+if ! fm_relocate_from_disposable_cwd \
+  'RELOCATED THE WATCHER OUT OF A DISPOSABLE TASK WORKTREE'; then
+  echo "watcher: FAILED - cannot move out of the disposable task worktree ($FM_DISPOSABLE_CWD) into the home ($FM_DISPOSABLE_HOME)"
   exit 1
 fi
 

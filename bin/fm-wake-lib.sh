@@ -65,8 +65,14 @@ fm_path_age() {
 # pool-root variable and defaults to ~/.treehouse; a pool root that does not
 # resolve leaves the guard inert.
 #
-# Callers detect with fm_cwd_is_disposable_slot, render the shared banner with
-# fm_disposable_cwd_banner, then emit their own typed failure line and exit.
+# The condition is self-correcting rather than operator-correctable. A launcher
+# calls fm_relocate_from_disposable_cwd, which moves the launcher process itself
+# into FM_HOME before it forks anything, so both the launcher and its long-lived
+# child sit outside the sweep path. The relocation is announced loudly on stderr
+# and carries no remedy command, because there is nothing left for the operator to
+# do. It stays a warning rather than a silent repair so the condition remains
+# visible. A failed chdir into FM_HOME means a genuinely broken home, and the
+# helper returns non-zero so the caller can fail with its own typed line.
 fm_path_under() {
   local child=$1 parent=$2
   [ -n "$parent" ] || return 1
@@ -77,13 +83,14 @@ fm_path_under() {
   esac
 }
 
+# Runs in a subshell so a direct call can never relocate the calling process.
 fm_resolve_dir() {
   local path=$1
   [ -n "$path" ] || return 1
-  CDPATH='' cd -- "$path" 2>/dev/null && pwd -P
+  ( CDPATH='' cd -- "$path" 2>/dev/null && pwd -P )
 }
 
-# Sets FM_DISPOSABLE_CWD and FM_DISPOSABLE_HOME on a refusal.
+# Sets FM_DISPOSABLE_CWD and FM_DISPOSABLE_HOME when the cwd is condemned.
 FM_DISPOSABLE_CWD=
 FM_DISPOSABLE_HOME=
 fm_cwd_is_disposable_slot() {
@@ -100,19 +107,30 @@ fm_cwd_is_disposable_slot() {
   return 0
 }
 
-fm_disposable_cwd_banner() {
-  local headline=$1 restart_command=$2 rule
+# Relocates the calling process out of a condemned cwd, if it is in one.
+# Returns 0 when there was nothing to do or the relocation succeeded, and 1 when
+# the cwd is condemned but chdir into FM_HOME failed.
+fm_relocate_from_disposable_cwd() {
+  local headline=$1 rule state_abs
+  fm_cwd_is_disposable_slot || return 0
+  # Re-anchor the home and state paths first: a chdir invalidates any of them that
+  # was relative to the condemned cwd, and the resolved home is already absolute.
+  state_abs=$(fm_resolve_dir "$STATE") || return 1
+  CDPATH='' cd -- "$FM_DISPOSABLE_HOME" 2>/dev/null || return 1
+  FM_HOME=$FM_DISPOSABLE_HOME
+  STATE=$state_abs
+  [ -z "${FM_STATE_OVERRIDE:-}" ] || FM_STATE_OVERRIDE=$state_abs
   rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
   {
     printf '●%s\n' "$rule"
     printf '●  %s\n' "$headline"
-    printf '●  cwd:     %s\n' "$FM_DISPOSABLE_CWD"
-    printf '●  home:    %s\n' "$FM_DISPOSABLE_HOME"
+    printf '●  was:     %s\n' "$FM_DISPOSABLE_CWD"
+    printf '●  now:     %s\n' "$FM_DISPOSABLE_HOME"
     printf '●  A long-lived process started from a treehouse pool slot is killed by\n'
     printf '●  signal 16 (exit 144) the moment any session returns that slot, because\n'
     printf '●  the sweep matches on working directory, not on who started the process.\n'
-    printf '●  Start it from this home instead:\n'
-    printf '●      cd %s && %s\n' "$FM_DISPOSABLE_HOME" "$restart_command"
+    printf '●  This process moved to the home before starting anything long-lived, so\n'
+    printf '●  neither it nor its children are in the sweep path. Nothing to do.\n'
     printf '●%s\n' "$rule"
   } >&2
 }
