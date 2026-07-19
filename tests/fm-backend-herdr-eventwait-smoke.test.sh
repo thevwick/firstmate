@@ -113,7 +113,7 @@ pass "real herdr ($HERDR_VERSION): a driven idle->blocked transition returns the
 # --- the watcher's fast-path lands a stale record in the scratch wake queue ---
 # Source the watcher (its guard returns before the relocation/lock/loop) and
 # override wake so handle_push_transition enqueues without exiting the test.
-# This suite is standalone and needs no TREEHOUSE_DIR pin: it only SOURCES the
+# This suite is standalone and needs no pool-root pin: it only SOURCES the
 # watcher and never executes it or any launcher, and the disposable-cwd
 # relocation lives below the watcher's source guard.
 export FM_STATE_OVERRIDE="$STATE"

@@ -98,7 +98,7 @@ test_arm_relocates_out_of_disposable_pool_cwd() {
   mkdir "$state/.watch.lock"
   printf '%s\n' "$live" > "$state/.watch.lock/pid"
   touch -t 200001010000 "$state/.last-watcher-beat"
-  ( cd "$slot" && PATH="$fakebin:$PATH" TREEHOUSE_DIR="$pool" FM_HOME="$home" \
+  ( cd "$slot" && PATH="$fakebin:$PATH" FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=3 "$WATCH_ARM" ) > "$armout" 2>&1 &
   armpid=$!
@@ -131,7 +131,7 @@ test_relocated_watcher_does_not_run_in_condemned_cwd() {
   mark_pr_check_migration_complete "$state"
   mkdir -p "$slot" "$home"
   slot_real=$(cd "$slot" && pwd -P)
-  ( cd "$slot" && PATH="$fakebin:$PATH" TREEHOUSE_DIR="$pool" FM_HOME="$home" \
+  ( cd "$slot" && PATH="$fakebin:$PATH" FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=20 "$WATCH_ARM" ) > "$armout" 2>&1 &
   armpid=$!
@@ -180,7 +180,7 @@ test_relocation_preserves_absolute_fm_home_identity() {
   link="$dir/home-link"
   mkdir -p "$slot" "$home"
   ln -s "$home" "$link"
-  out=$(cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$link" FM_STATE_OVERRIDE="$state" \
+  out=$(cd "$slot" && FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="$link" FM_STATE_OVERRIDE="$state" \
     bash -c '
       . "$1"
       fm_relocate_from_disposable_cwd headline 2>/dev/null || exit 7
@@ -204,7 +204,7 @@ test_relocation_absolutizes_a_relative_fm_home() {
   slot="$pool/firstmate-abc123/9/firstmate"
   home="$dir/home"
   mkdir -p "$slot" "$home"
-  out=$(cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="../../../../home" \
+  out=$(cd "$slot" && FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="../../../../home" \
     bash -c '
       . "$1"
       fm_relocate_from_disposable_cwd headline 2>/dev/null || exit 7
@@ -228,7 +228,7 @@ test_relocation_ignores_an_unresolvable_absolute_state() {
   slot="$pool/firstmate-abc123/10/firstmate"
   home="$dir/home"
   mkdir -p "$slot" "$home"
-  out=$(cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="$dir/gone-state" \
+  out=$(cd "$slot" && FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="$dir/gone-state" \
     bash -c '
       . "$1"
       rmdir "$STATE"
@@ -251,7 +251,7 @@ test_relocation_reports_a_state_fault_distinctly() {
   slot="$pool/firstmate-abc123/11/firstmate"
   home="$dir/home"
   mkdir -p "$slot" "$home"
-  out=$(cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="relstate" \
+  out=$(cd "$slot" && FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="relstate" \
     bash -c '
       . "$1"
       rmdir "$STATE"
@@ -280,7 +280,7 @@ test_relocation_re_anchors_a_relative_root() {
   home="$dir/home"
   root="$dir/root"
   mkdir -p "$slot" "$home" "$root"
-  out=$(cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$home" \
+  out=$(cd "$slot" && FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="$home" \
     FM_ROOT_OVERRIDE="../../../../root" \
     bash -c '
       . "$1"
@@ -292,7 +292,7 @@ test_relocation_re_anchors_a_relative_root() {
   [ "$(printf '%s\n' "$out" | sed -n 2p)" = "$(cd "$root" && pwd -P)" ] \
     || fail "relocation re-anchored FM_ROOT but not FM_ROOT_OVERRIDE, which children inherit"
 
-  out=$(cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_ROOT_OVERRIDE="$root" \
+  out=$(cd "$slot" && FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="$home" FM_ROOT_OVERRIDE="$root" \
     bash -c '
       . "$1"
       fm_relocate_from_disposable_cwd headline 2>/dev/null || exit 7
@@ -300,6 +300,40 @@ test_relocation_re_anchors_a_relative_root() {
     ' _ "$LIB") || fail "relocation with an absolute code root failed"
   [ "$out" = "$root" ] || fail "relocation rewrote an absolute FM_ROOT away from $root ($out)"
   pass "relocation re-anchors a relative code root and leaves an absolute one alone"
+}
+
+# Every path the lib derives from STATE has to follow STATE across the chdir.
+# A wake queue left pointing at the pre-relocation state directory would have the
+# enqueue side writing one file and the drain side reading another.
+test_relocation_re_anchors_state_derived_paths() {
+  local dir pool slot home out
+  dir=$(make_case relocate-derived-paths)
+  pool="$dir/pool"
+  slot="$pool/firstmate-abc123/13/firstmate"
+  home="$dir/home"
+  mkdir -p "$slot" "$home/relstate"
+  out=$(cd "$slot" && FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="../../../../home/relstate" \
+    bash -c '
+      . "$1"
+      fm_relocate_from_disposable_cwd headline 2>/dev/null || exit 7
+      printf "%s\n%s\n" "$FM_WAKE_QUEUE" "$FM_WAKE_QUEUE_LOCK"
+    ' _ "$LIB") || fail "relocation with a relative STATE failed"
+  [ "$(printf '%s\n' "$out" | sed -n 1p)" = "$(cd "$home/relstate" && pwd -P)/.wake-queue" ] \
+    || fail "the wake queue did not follow the re-anchored STATE ($(printf '%s\n' "$out" | sed -n 1p))"
+  [ "$(printf '%s\n' "$out" | sed -n 2p)" = "$(cd "$home/relstate" && pwd -P)/.wake-queue.lock" ] \
+    || fail "the wake queue lock did not follow the re-anchored STATE"
+
+  out=$(cd "$slot" && FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/relstate" FM_WAKE_QUEUE="$dir/pinned-queue" \
+    bash -c '
+      . "$1"
+      fm_relocate_from_disposable_cwd headline 2>/dev/null || exit 7
+      printf "%s\n" "$FM_WAKE_QUEUE"
+    ' _ "$LIB") || fail "relocation with a pinned wake queue failed"
+  [ "$out" = "$dir/pinned-queue" ] \
+    || fail "relocation overwrote a caller-supplied wake queue ($out)"
+  pass "relocation re-anchors STATE-derived paths and keeps a pinned one"
 }
 
 test_arm_allows_leased_home_cwd() {
@@ -323,7 +357,7 @@ test_arm_allows_leased_home_cwd() {
   mkdir "$state/.watch.lock"
   printf '%s\n' "$live" > "$state/.watch.lock/pid"
   touch -t 200001010000 "$state/.last-watcher-beat"
-  ( cd "$home" && PATH="$fakebin:$PATH" TREEHOUSE_DIR="$pool" FM_HOME="$home" \
+  ( cd "$home" && PATH="$fakebin:$PATH" FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=3 "$WATCH_ARM" ) > "$armout" 2>&1 &
   armpid=$!
@@ -1233,6 +1267,7 @@ test_relocation_absolutizes_a_relative_fm_home
 test_relocation_ignores_an_unresolvable_absolute_state
 test_relocation_reports_a_state_fault_distinctly
 test_relocation_re_anchors_a_relative_root
+test_relocation_re_anchors_state_derived_paths
 test_arm_allows_leased_home_cwd
 test_singleton_start
 test_pid_identity_is_locale_invariant

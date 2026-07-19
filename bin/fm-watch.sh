@@ -77,7 +77,14 @@ mkdir -p "$STATE"
 # shellcheck source=bin/fm-check-lib.sh
 . "$SCRIPT_DIR/fm-check-lib.sh"
 
-WATCH_LOCK="$STATE/.watch.lock"
+# The single owner of this file's STATE-derived paths, so the disposable-cwd
+# relocation below the source guard can recompute all of them in one call and a
+# path added here cannot be left pointing at the pre-relocation state directory.
+watch_derive_state_paths() {
+  WATCH_LOCK="$STATE/.watch.lock"
+  TRIAGE_LOG="$STATE/.watch-triage.log"
+}
+watch_derive_state_paths
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
 WATCHER_STALE_GRACE=${FM_WATCHER_STALE_GRACE:-${FM_GUARD_GRACE:-300}}
 # The disposable-cwd relocation, singleton-lock acquisition, EXIT trap, and the
@@ -143,7 +150,7 @@ STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provabl
 # These cases re-surface once for a recheck every PAUSE_RESURFACE_SECS - far
 # longer than the wedge threshold, but finite so a forgotten hold cannot rot invisibly.
 PAUSE_RESURFACE_SECS=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
-TRIAGE_LOG="$STATE/.watch-triage.log"
+# TRIAGE_LOG itself is derived by watch_derive_state_paths above.
 TRIAGE_LOG_MAX_BYTES=${FM_WATCH_TRIAGE_LOG_MAX_BYTES:-262144}
 # Consecutive event-path failures (fm_backend_wait_transition returning 2 -
 # connect/subscribe failure) before the push fast-path is disabled for the rest
@@ -700,14 +707,14 @@ fi
 # construction rather than per entry point. It sits below the source guard so a
 # unit test that only sources this file keeps its own cwd. It is idempotent: a
 # launcher that already relocated leaves the cwd undetected here and nothing is
-# printed twice. WATCH_LOCK is re-derived afterwards because a relative STATE is
-# re-anchored by the relocation.
+# printed twice. This file's own STATE-derived paths are re-derived afterwards
+# because a relative STATE is re-anchored by the relocation.
 if ! fm_relocate_from_disposable_cwd \
   'RELOCATED THE WATCHER OUT OF A DISPOSABLE TASK WORKTREE'; then
   echo "watcher: FAILED - $FM_DISPOSABLE_ERROR" >&2
   exit 1
 fi
-WATCH_LOCK="$STATE/.watch.lock"
+watch_derive_state_paths
 
 # Before acquiring the watcher lock or enumerating any runnable check, replace
 # or quarantine checks created by older versions. The migration compares bytes

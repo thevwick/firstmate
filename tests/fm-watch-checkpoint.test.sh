@@ -102,7 +102,7 @@ test_checkpoint_relocates_out_of_disposable_pool_cwd() {
   slot_real=$(cd "$slot" && pwd -P)
   home_real=$(cd "$home" && pwd -P)
   status=0
-  ( cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+  ( cd "$slot" && FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 1 ) >"$out" 2>"$err" || status=$?
   expect_code 124 "$status" "relocated checkpoint exit"
   assert_contains "$(cat "$err")" "RELOCATED THE WATCHER" "checkpoint did not warn about the relocation"

@@ -3,11 +3,24 @@
 
 FM_WAKE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_WAKE_DEFAULT_ROOT="$(cd "$FM_WAKE_LIB_DIR/.." && pwd)"
-FM_ROOT="${FM_ROOT_OVERRIDE:-${FM_ROOT:-$FM_WAKE_DEFAULT_ROOT}}"
-FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
-STATE="${FM_STATE_OVERRIDE:-${STATE:-$FM_HOME/state}}"
-FM_WAKE_QUEUE="${FM_WAKE_QUEUE:-$STATE/.wake-queue}"
-FM_WAKE_QUEUE_LOCK="${FM_WAKE_QUEUE_LOCK:-$STATE/.wake-queue.lock}"
+# Whether the environment supplied these explicitly, captured once at source time
+# so a re-derivation never silently overwrites a caller's own value.
+FM_WAKE_QUEUE_PINNED="${FM_WAKE_QUEUE:+1}"
+FM_WAKE_QUEUE_LOCK_PINNED="${FM_WAKE_QUEUE_LOCK:+1}"
+
+# The single owner of every path this lib derives from FM_ROOT, FM_HOME or STATE.
+# It runs at source time and again after a relocation re-anchors the base paths,
+# so a derived path added here is re-anchored by construction and cannot drift out
+# of sync with the base it came from. Each assignment keeps an already-set value,
+# so re-running it recomputes only what the relocation invalidated.
+fm_derive_paths() {
+  FM_ROOT="${FM_ROOT_OVERRIDE:-${FM_ROOT:-$FM_WAKE_DEFAULT_ROOT}}"
+  FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+  STATE="${FM_STATE_OVERRIDE:-${STATE:-$FM_HOME/state}}"
+  [ -n "$FM_WAKE_QUEUE_PINNED" ] || FM_WAKE_QUEUE="$STATE/.wake-queue"
+  [ -n "$FM_WAKE_QUEUE_LOCK_PINNED" ] || FM_WAKE_QUEUE_LOCK="$STATE/.wake-queue.lock"
+}
+fm_derive_paths
 FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
 mkdir -p "$STATE"
 
@@ -61,9 +74,12 @@ fm_path_age() {
 #
 # A durably leased secondmate home is itself a pool slot (bin/fm-home-seed.sh) but
 # is stable for that home's lifetime, so a cwd inside FM_HOME is always safe. Only
-# a pool slot that is NOT this home is refused. TREEHOUSE_DIR is treehouse's own
-# pool-root variable and defaults to ~/.treehouse; a pool root that does not
-# resolve leaves the guard inert.
+# a pool slot that is NOT this home is refused. The pool root resolves from
+# FM_TREEHOUSE_POOL_ROOT first, then TREEHOUSE_DIR, then ~/.treehouse; a pool root
+# that does not resolve leaves the guard inert. FM_TREEHOUSE_POOL_ROOT is
+# firstmate-private and exists so the test harness can point this guard at an
+# absent pool without redirecting the real treehouse CLI, which reads
+# TREEHOUSE_DIR as its own pool root and would act on a bogus value.
 #
 # The condition is self-correcting rather than operator-correctable. A launcher
 # calls fm_relocate_from_disposable_cwd, which moves the launcher process itself
@@ -100,7 +116,10 @@ fm_path_age() {
 # re-anchored environment is harder to reason about than a fully re-anchored one,
 # and FM_ROOT in particular is inherited by every child process the launcher
 # starts, so a stale relative value would resolve against the wrong directory
-# well after the relocation.
+# well after the relocation. Everything derived FROM those bases is then
+# recomputed through fm_derive_paths, the single owner of that derivation, rather
+# than re-anchored variable by variable, so a path added there is covered
+# automatically.
 fm_path_under() {
   local child=$1 parent=$2
   [ -n "$parent" ] || return 1
@@ -131,7 +150,7 @@ fm_cwd_is_disposable_slot() {
   FM_DISPOSABLE_CWD=
   FM_DISPOSABLE_HOME=
   cwd=$(pwd -P 2>/dev/null) || return 1
-  pool=$(fm_resolve_dir "${TREEHOUSE_DIR:-${HOME:-}/.treehouse}") || return 1
+  pool=$(fm_resolve_dir "${FM_TREEHOUSE_POOL_ROOT:-${TREEHOUSE_DIR:-${HOME:-}/.treehouse}}") || return 1
   fm_path_under "$cwd" "$pool" || return 1
   home=$(fm_resolve_dir "$FM_HOME") || home=$FM_HOME
   fm_path_under "$cwd" "$home" && return 1
@@ -193,6 +212,10 @@ fm_relocate_from_disposable_cwd() {
     FM_ROOT=$root_abs
     [ -z "${FM_ROOT_OVERRIDE:-}" ] || FM_ROOT_OVERRIDE=$root_abs
   fi
+  # Recompute every derived path from the re-anchored bases through their single
+  # owner, so nothing derived from STATE or FM_HOME survives the chdir as a stale
+  # relative value.
+  fm_derive_paths
   rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
   {
     printf '●%s\n' "$rule"

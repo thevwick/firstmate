@@ -32,8 +32,11 @@ START="$ROOT/bin/fm-afk-start.sh"
 # exactly the shape the launcher's cwd guard relocates out of, so the suite would
 # behave one way in CI and another inside a task worktree. Point the pool root at
 # a path that does not exist, which makes the guard inert and the suite identical
-# in both places. The tests that ARE about the guard set TREEHOUSE_DIR themselves.
-export TREEHOUSE_DIR="${TMPDIR:-/tmp}/fm-afk-absent-treehouse-pool-$$"
+# in both places. The tests that ARE about the guard set FM_TREEHOUSE_POOL_ROOT
+# themselves. The pin uses firstmate's private FM_TREEHOUSE_POOL_ROOT rather than
+# TREEHOUSE_DIR so it never redirects the real treehouse CLI, which reads
+# TREEHOUSE_DIR as its own pool root.
+export FM_TREEHOUSE_POOL_ROOT="${TMPDIR:-/tmp}/fm-afk-absent-treehouse-pool-$$"
 
 FAILED=0
 fail() { printf 'not ok - %s\n' "$1" >&2; FAILED=1; }
@@ -67,7 +70,7 @@ unit_disposable_cwd_relocated() {
   out="$st/out"
   mkdir -p "$slot" "$home/state"
   slot_real=$(cd "$slot" && pwd -P)
-  ( cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+  ( cd "$slot" && FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
     bash -c '. "$1"; FM_AFK_DAEMON=/bin/true; fm_afk_start_main' _ "$START" ) > "$out" 2>&1
   if grep -qF 'RELOCATED AWAY MODE' "$out" && grep -qF "$slot_real" "$out"; then
     pass "disposable-cwd: relocates out of a foreign pool slot and names it"
@@ -91,7 +94,7 @@ unit_disposable_cwd_relocated() {
   home="$pool/firstmate-abc123/4/firstmate"
   out="$st/out-home"
   mkdir -p "$home/state"
-  ( cd "$home" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+  ( cd "$home" && FM_TREEHOUSE_POOL_ROOT="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
     FM_AFK_STATE_PREPARED=1 "$START" ) > "$out" 2>&1
   if ! grep -qF 'RELOCATED AWAY MODE' "$out"; then
     pass "disposable-cwd: does not relocate a cwd inside its own leased home"

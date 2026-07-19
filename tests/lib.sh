@@ -44,8 +44,12 @@ export FM_GATE_REFUSE_BYPASS=1
 # the guard lives at a choke point in bin/fm-watch.sh, so any suite that runs the
 # watcher inherits the hazard, and pinning per suite only re-surfaces it the next
 # time a suite grows a watcher call. The tests that ARE about the guard set
-# TREEHOUSE_DIR themselves on the invocation, which still overrides this.
-export TREEHOUSE_DIR="${TMPDIR:-/tmp}/fm-absent-treehouse-pool-$$"
+# FM_TREEHOUSE_POOL_ROOT themselves on the invocation, which still overrides this.
+# The pin uses firstmate's private FM_TREEHOUSE_POOL_ROOT rather than TREEHOUSE_DIR
+# on purpose: TREEHOUSE_DIR is the real treehouse CLI's own pool root, so pinning
+# it tree-wide would point a genuine `treehouse get --lease` at a pool that does
+# not exist instead of merely making this guard inert.
+export FM_TREEHOUSE_POOL_ROOT="${TMPDIR:-/tmp}/fm-absent-treehouse-pool-$$"
 
 # Resolve the repo root from this library's own location. Consumed by sourcing
 # test files, not by this library, so it reads as "unused" here.
