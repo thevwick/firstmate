@@ -73,6 +73,25 @@ fm_path_age() {
 # do. It stays a warning rather than a silent repair so the condition remains
 # visible. A failed chdir into FM_HOME means a genuinely broken home, and the
 # helper returns non-zero so the caller can fail with its own typed line.
+#
+# bin/fm-watch.sh calls it itself, which is the choke point every watcher
+# launcher passes through, so no present or future launcher can miss the guard.
+# A launcher that also BLOCKS for the watcher's lifetime - bin/fm-watch-arm.sh
+# while it waits on its child, bin/fm-watch-checkpoint.sh for the whole bounded
+# checkpoint, bin/fm-afk-start.sh before the daemon exec - calls it on its own
+# account too, since a launcher killed by the sweep ends the work even when the
+# watcher it started was safe. The call is idempotent, so the second one detects
+# nothing and prints nothing.
+#
+# The relocation deliberately does NOT resolve an already-absolute FM_HOME or
+# STATE. FM_HOME doubles as a byte-exact cross-process identity string: the
+# watcher writes it into state/.watch.lock/fm-home and fm_watcher_lock_matches_pid,
+# bin/fm-turnend-guard.sh, bin/fm-continuity-pretool-check.sh,
+# bin/fm-pr-check-migrate.sh and bin/fm-watch-arm.sh all compare it verbatim
+# against their own logically derived value. Rewriting it to the resolved path
+# would desynchronize the lock from every one of them whenever a component of
+# the home path is a symlink. Only a genuinely relative value, which a chdir
+# really does invalidate, is re-anchored.
 fm_path_under() {
   local child=$1 parent=$2
   [ -n "$parent" ] || return 1
@@ -113,13 +132,24 @@ fm_cwd_is_disposable_slot() {
 fm_relocate_from_disposable_cwd() {
   local headline=$1 rule state_abs
   fm_cwd_is_disposable_slot || return 0
-  # Re-anchor the home and state paths first: a chdir invalidates any of them that
-  # was relative to the condemned cwd, and the resolved home is already absolute.
+  # Re-anchor only the paths a chdir would actually invalidate, which is the
+  # genuinely relative ones. FM_HOME doubles as a byte-exact cross-process
+  # identity string, written into the watcher lock and compared verbatim by the
+  # guard, the checkpoint and the continuity check, so an already-absolute value
+  # must survive relocation unchanged even when a path component is a symlink.
   state_abs=$(fm_resolve_dir "$STATE") || return 1
-  CDPATH='' cd -- "$FM_DISPOSABLE_HOME" 2>/dev/null || return 1
-  FM_HOME=$FM_DISPOSABLE_HOME
-  STATE=$state_abs
-  [ -z "${FM_STATE_OVERRIDE:-}" ] || FM_STATE_OVERRIDE=$state_abs
+  CDPATH='' cd -- "$FM_HOME" 2>/dev/null || return 1
+  case "$FM_HOME" in
+    /*) ;;
+    *) FM_HOME=$FM_DISPOSABLE_HOME ;;
+  esac
+  case "$STATE" in
+    /*) ;;
+    *)
+      STATE=$state_abs
+      [ -z "${FM_STATE_OVERRIDE:-}" ] || FM_STATE_OVERRIDE=$state_abs
+      ;;
+  esac
   rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
   {
     printf '●%s\n' "$rule"

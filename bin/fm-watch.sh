@@ -49,6 +49,15 @@ mkdir -p "$STATE"
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# The one choke point every watcher launcher must pass through, so the
+# disposable-cwd relocation covers all present and future launchers by
+# construction rather than per entry point. It is idempotent: a launcher that
+# already relocated leaves the cwd undetected here and nothing is printed twice.
+if ! fm_relocate_from_disposable_cwd \
+  'RELOCATED THE WATCHER OUT OF A DISPOSABLE TASK WORKTREE'; then
+  echo "watcher: FAILED - cannot move out of the disposable task worktree ($FM_DISPOSABLE_CWD) into the home ($FM_DISPOSABLE_HOME)" >&2
+  exit 1
+fi
 # Shared wake classifier (captain-relevant verbs + signal/stale/heartbeat
 # predicates), the SAME library the away-mode daemon uses, so the triage policy
 # has one definition.

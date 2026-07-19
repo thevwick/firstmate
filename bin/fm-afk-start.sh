@@ -128,7 +128,8 @@ fm_afk_start_main() {
     echo "afk: FAILED - cannot move out of the disposable task worktree ($FM_DISPOSABLE_CWD) into the home ($FM_DISPOSABLE_HOME)" >&2
     return 1
   fi
-  # The relocation re-anchors STATE, so re-derive the paths taken from it.
+  # The relocation may re-anchor a relative STATE, so re-derive the paths taken
+  # from it. An already-absolute STATE is left byte-identical.
   FM_AFK_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
   FM_AFK_LOCK="$FM_AFK_STATE/.supervise-daemon.lock"
 

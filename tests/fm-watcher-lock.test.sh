@@ -23,6 +23,25 @@ TMP_ROOT=$(fm_test_tmproot fm-watcher-lock-tests)
 # is not about it. The two tests that ARE about it set TREEHOUSE_DIR themselves.
 export TREEHOUSE_DIR="$TMP_ROOT/absent-treehouse-pool"
 
+# `fail` exits the suite immediately, so a process killed only on the happy path
+# is stranded by every failing assertion after it was forked. A leaked watcher
+# keeps polling forever against a state dir the cleanup has already removed, so
+# register each real process for teardown at the moment it is launched.
+FM_TEST_PIDS=()
+
+track_pid() {
+  FM_TEST_PIDS+=("$1")
+}
+
+fm_watcher_lock_test_cleanup() {
+  local p
+  for p in "${FM_TEST_PIDS[@]:-}"; do
+    [ -n "$p" ] && kill "$p" 2>/dev/null
+  done
+  fm_test_cleanup
+}
+trap fm_watcher_lock_test_cleanup EXIT
+
 mark_pr_check_migration_complete() {
   local state=$1
   printf '%s\n' fm-pr-check-migration-scan-v1 > "$state/.pr-check-migration-scan-v1"
@@ -57,6 +76,7 @@ test_arm_relocates_out_of_disposable_pool_cwd() {
   # arm relocated and then continued rather than stopping at the guard.
   sleep 300 >/dev/null 2>&1 &
   live=$!
+  track_pid "$live"
   mkdir "$state/.watch.lock"
   printf '%s\n' "$live" > "$state/.watch.lock/pid"
   touch -t 200001010000 "$state/.last-watcher-beat"
@@ -64,6 +84,7 @@ test_arm_relocates_out_of_disposable_pool_cwd() {
     FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=3 "$WATCH_ARM" ) > "$armout" 2>&1 &
   armpid=$!
+  track_pid "$armpid"
   wait_for_exit "$armpid" 120
   status=$?
   [ "$status" -ne 124 ] || fail "arm blocked instead of relocating out of a disposable pool cwd"
@@ -96,6 +117,7 @@ test_relocated_watcher_does_not_run_in_condemned_cwd() {
     FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=20 "$WATCH_ARM" ) > "$armout" 2>&1 &
   armpid=$!
+  track_pid "$armpid"
   watchpid=
   for i in $(seq 1 100); do
     watchpid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
@@ -103,6 +125,7 @@ test_relocated_watcher_does_not_run_in_condemned_cwd() {
     sleep 0.2
   done
   [ -n "$watchpid" ] || fail "relocated arm never forked a watcher that took the lock"
+  track_pid "$watchpid"
   # lsof is the portable-enough way to read another process's cwd on macOS.
   watchcwd=$(lsof -a -p "$watchpid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
   if [ -n "$watchcwd" ]; then
@@ -111,11 +134,69 @@ test_relocated_watcher_does_not_run_in_condemned_cwd() {
     esac
     pass "relocated arm forks a watcher outside the condemned cwd ($watchcwd)"
   else
-    pass "relocated arm forks a watcher (cwd unreadable on this host, skipped)"
+    # Empty lsof output means either a host that cannot report another process's
+    # cwd or a watcher that has already exited, and the second is a real
+    # regression rather than a capability gap. Only the first may pass.
+    kill -0 "$watchpid" 2>/dev/null \
+      || fail "watcher exited before its cwd could be read ($(cat "$armout"))"
+    pass "relocated arm forks a live watcher (cwd unreadable on this host, skipped)"
   fi
   kill "$watchpid" 2>/dev/null || true
   kill "$armpid" 2>/dev/null || true
   wait "$armpid" 2>/dev/null || true
+}
+
+# FM_HOME is not only a path: it is written verbatim into the watcher lock and
+# compared byte-exactly by the guard, the checkpoint and the continuity check,
+# while every other process derives it logically. Resolving it during relocation
+# would desynchronize the lock identity from all of them whenever any component
+# of the home path is a symlink, so an already-absolute value must survive
+# relocation unchanged.
+test_relocation_preserves_absolute_fm_home_identity() {
+  local dir state pool slot home link out
+  dir=$(make_case relocate-home-identity)
+  state="$dir/state"
+  pool="$dir/pool"
+  slot="$pool/firstmate-abc123/8/firstmate"
+  home="$dir/home"
+  link="$dir/home-link"
+  mkdir -p "$slot" "$home"
+  ln -s "$home" "$link"
+  out=$(cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$link" FM_STATE_OVERRIDE="$state" \
+    bash -c '
+      . "$1"
+      fm_relocate_from_disposable_cwd headline 2>/dev/null || exit 7
+      printf "%s\n%s\n%s\n" "$FM_HOME" "$STATE" "$(pwd -P)"
+    ' _ "$LIB") || fail "relocation from a symlinked home failed"
+  [ "$(printf '%s\n' "$out" | sed -n 1p)" = "$link" ] \
+    || fail "relocation rewrote an absolute FM_HOME ($(printf '%s\n' "$out" | sed -n 1p)) away from $link"
+  [ "$(printf '%s\n' "$out" | sed -n 2p)" = "$state" ] \
+    || fail "relocation rewrote an absolute STATE away from $state"
+  [ "$(printf '%s\n' "$out" | sed -n 3p)" = "$(cd "$home" && pwd -P)" ] \
+    || fail "relocation did not land in the home ($(printf '%s\n' "$out" | sed -n 3p))"
+  pass "relocation leaves an absolute FM_HOME and STATE byte-identical"
+}
+
+# A relative FM_HOME is the one case a chdir genuinely invalidates, so there the
+# rewrite is required rather than harmful.
+test_relocation_absolutizes_a_relative_fm_home() {
+  local dir pool slot home out
+  dir=$(make_case relocate-home-relative)
+  pool="$dir/pool"
+  slot="$pool/firstmate-abc123/9/firstmate"
+  home="$dir/home"
+  mkdir -p "$slot" "$home"
+  out=$(cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="../../../../home" \
+    bash -c '
+      . "$1"
+      fm_relocate_from_disposable_cwd headline 2>/dev/null || exit 7
+      printf "%s\n%s\n" "$FM_HOME" "$(pwd -P)"
+    ' _ "$LIB") || fail "relocation from a relative home failed"
+  [ "$(printf '%s\n' "$out" | sed -n 1p)" = "$(cd "$home" && pwd -P)" ] \
+    || fail "relocation left FM_HOME relative and now wrong ($(printf '%s\n' "$out" | sed -n 1p))"
+  [ "$(printf '%s\n' "$out" | sed -n 2p)" = "$(cd "$home" && pwd -P)" ] \
+    || fail "relocation did not land in the relative home"
+  pass "relocation re-anchors a relative FM_HOME to its resolved path"
 }
 
 test_arm_allows_leased_home_cwd() {
@@ -135,6 +216,7 @@ test_arm_allows_leased_home_cwd() {
   # proves the cwd guard let it past.
   sleep 300 >/dev/null 2>&1 &
   live=$!
+  track_pid "$live"
   mkdir "$state/.watch.lock"
   printf '%s\n' "$live" > "$state/.watch.lock/pid"
   touch -t 200001010000 "$state/.last-watcher-beat"
@@ -142,6 +224,7 @@ test_arm_allows_leased_home_cwd() {
     FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=3 "$WATCH_ARM" ) > "$armout" 2>&1 &
   armpid=$!
+  track_pid "$armpid"
   wait_for_exit "$armpid" 120
   status=$?
   [ "$status" -ne 124 ] || fail "arm never returned from its own leased home"
@@ -903,6 +986,7 @@ test_arm_fails_loud_when_no_fresh_watcher_confirmable() {
   touch -t 200001010000 "$state/.last-watcher-beat"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=3 "$WATCH_ARM" > "$armout" &
   armpid=$!
+  track_pid "$armpid"
   wait_for_exit "$armpid" 120
   status=$?
   [ "$status" -ne 124 ] || fail "arm never returned for an unconfirmable watcher"
@@ -1041,6 +1125,8 @@ test_pid_identity_is_locale_invariant() {
 
 test_arm_relocates_out_of_disposable_pool_cwd
 test_relocated_watcher_does_not_run_in_condemned_cwd
+test_relocation_preserves_absolute_fm_home_identity
+test_relocation_absolutizes_a_relative_fm_home
 test_arm_allows_leased_home_cwd
 test_singleton_start
 test_pid_identity_is_locale_invariant

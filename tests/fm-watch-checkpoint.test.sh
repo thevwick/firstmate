@@ -87,7 +87,33 @@ test_existing_singleton_watcher_is_not_success() {
   pass "checkpoint rejects an existing watcher singleton as unowned"
 }
 
+# Codex supervision runs the checkpoint, not the arm, so the disposable-cwd
+# relocation has to cover this launcher as well. The wrapper blocks in the
+# foreground for the whole checkpoint, so it must leave the sweep path itself
+# rather than relying on the watcher it starts doing so.
+test_checkpoint_relocates_out_of_disposable_pool_cwd() {
+  local home pool slot slot_real home_real out err status
+  home=$(make_home relocate)
+  pool="$TMP_ROOT/relocate-pool"
+  slot="$pool/firstmate-abc123/7/firstmate"
+  out="$home/out.txt"
+  err="$home/err.txt"
+  mkdir -p "$slot"
+  slot_real=$(cd "$slot" && pwd -P)
+  home_real=$(cd "$home" && pwd -P)
+  status=0
+  ( cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 1 ) >"$out" 2>"$err" || status=$?
+  expect_code 124 "$status" "relocated checkpoint exit"
+  assert_contains "$(cat "$err")" "RELOCATED THE WATCHER" "checkpoint did not warn about the relocation"
+  assert_contains "$(cat "$err")" "$slot_real" "checkpoint warning did not name the condemned cwd"
+  assert_contains "$(cat "$err")" "$home_real" "checkpoint warning did not name the home it moved to"
+  assert_contains "$(cat "$out")" "checkpoint: no actionable wake within 1s" "checkpoint did not proceed past the relocation"
+  pass "checkpoint relocates out of a treehouse pool slot that is not this home"
+}
+
 test_quiet_checkpoint_exits_124_cleanly
 test_signal_passes_through_and_exits_zero
+test_checkpoint_relocates_out_of_disposable_pool_cwd
 test_registered_check_uses_preserved_watcher_environment
 test_existing_singleton_watcher_is_not_success

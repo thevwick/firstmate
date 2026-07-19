@@ -6,6 +6,9 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECONDS_ARG=${FM_CODEX_WATCH_CHECKPOINT:-180}
 
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+
 usage() {
   cat <<'EOF'
 Usage: fm-watch-checkpoint.sh [--seconds <n>]
@@ -72,6 +75,16 @@ run_with_perl_timeout() {
     exit($? >> 8);
   ' "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh"
 }
+
+# bin/fm-watch.sh relocates itself too, but this wrapper blocks in the foreground
+# for the whole bounded checkpoint, so it must leave the sweep path on its own
+# account: a wrapper killed by the sweep ends the checkpoint even though the
+# watcher it started was safe.
+if ! fm_relocate_from_disposable_cwd \
+  'RELOCATED THE WATCHER CHECKPOINT OUT OF A DISPOSABLE TASK WORKTREE'; then
+  echo "checkpoint: FAILED - cannot move out of the disposable task worktree ($FM_DISPOSABLE_CWD) into the home ($FM_DISPOSABLE_HOME)" >&2
+  exit 1
+fi
 
 set +e
 if command -v timeout >/dev/null 2>&1; then
