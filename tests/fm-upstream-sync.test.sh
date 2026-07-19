@@ -278,6 +278,79 @@ test_push_fast_forwards_the_fork() {
   pass "fm-upstream-sync: --push fast-forwards a behind fork to upstream"
 }
 
+# The push-failure classification must not read git's prose, because those strings
+# are translated: on a non-English machine a genuine non-fast-forward would fall
+# through to the benign arm and be reported as a network skip, inverting the one
+# signal the STUCK line exists to raise. The cause is read off the refs instead,
+# so pinning git to a non-English locale must not change the verdict.
+test_push_rejection_is_classified_without_reading_git_prose() {
+  local c out rc
+  c=$(new_case push-rejected-locale)
+  advance_upstream "$c" 2
+  # The fork gains its own commit only AFTER the script has fetched and decided it
+  # is a clean fast-forward, so the run gets all the way to a real push that origin
+  # then refuses. A pre-receive hook on the fork is the deterministic way to land
+  # that race: it advances the fork's own main and then rejects the push.
+  cat > "$c/fork.git/hooks/pre-receive" <<'EOF'
+#!/usr/bin/env bash
+# Out of the push quarantine, so the sneaked-in commit survives the rejection the
+# way a concurrent push by someone else would.
+unset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+old=$(git rev-parse refs/heads/main)
+new=$(git commit-tree "$old^{tree}" -p "$old" -m "sneaked in")
+git update-ref refs/heads/main "$new"
+exit 1
+EOF
+  chmod +x "$c/fork.git/hooks/pre-receive"
+
+  out=$(LC_ALL=de_DE.UTF-8 LANG=de_DE.UTF-8 LANGUAGE=de run_sync "$c" --push) && rc=0 || rc=$?
+  assert_contains "$out" "STUCK: origin/main moved and no longer fast-forwards" \
+    "a refused push must be classified from the refs, not from git's localized prose"
+  assert_not_contains "$out" "network or credentials" \
+    "a branch problem must never be downgraded to a network skip"
+  [ "${rc:-0}" -ne 0 ] || fail "--push that did not advance the fork must exit non-zero"
+  pass "fm-upstream-sync: push refusal is classified from refs, not localized prose"
+}
+
+# --push was asked to advance the fork. A remote it could not reach means it did
+# not, so a scripted caller must be able to see that without parsing the output.
+# A report-only run was not asked to advance anything, so the same skip is a
+# successful report there.
+test_push_exits_nonzero_when_a_remote_cannot_be_reached() {
+  local c rc
+  c=$(new_case push-fetch-fail)
+  git -C "$c/clone" remote set-url upstream "$c/does-not-exist.git"
+
+  run_sync "$c" --push >/dev/null 2>&1 && rc=0 || rc=$?
+  [ "${rc:-0}" -ne 0 ] \
+    || fail "--push must exit non-zero when it could not reach a remote"
+
+  run_sync "$c" >/dev/null 2>&1 && rc=0 || rc=$?
+  [ "${rc:-0}" -eq 0 ] \
+    || fail "a report-only run that skipped on an unreachable remote should still exit 0"
+  pass "fm-upstream-sync: an unreachable remote fails --push and is benign report-only"
+}
+
+# Git shell-parses GIT_SSH_COMMAND, so a quoted program path containing spaces is
+# legitimate. Splitting it on whitespace would leave an unrunnable command and the
+# sweep would blame the network for a failure it caused itself.
+test_sweep_preserves_a_quoted_ssh_program_path() {
+  local c prog out
+  c=$(make_ssh_case ssh-quoted-path)
+  prog="$c/My Tools/report-ssh"
+  mkdir -p "$c/My Tools"
+  cp "$c/report-ssh" "$prog"
+
+  REPORT_FILE="$c/ssh-args" FM_ROOT_OVERRIDE="$c/clone" \
+    GIT_SSH_COMMAND="\"$prog\" -F /dev/null" "$SYNC" --sweep >/dev/null 2>&1 || true
+  out=$(cat "$c/ssh-args")
+  assert_contains "$out" "SSH_ARGS:" \
+    "a quoted ssh program path must still be runnable after BatchMode is prepended"
+  assert_contains "$out" "-F /dev/null" \
+    "the operator's own ssh options must be preserved"
+  pass "fm-upstream-sync: the sweep preserves a quoted ssh program path"
+}
+
 test_push_is_idempotent() {
   local c out
   c=$(new_case push-idem)
@@ -446,6 +519,9 @@ test_diverged_fork_refuses_push_too
 test_report_only_stuck_still_exits_zero
 test_push_fast_forwards_the_fork
 test_push_reports_when_local_branch_could_not_follow
+test_push_rejection_is_classified_without_reading_git_prose
+test_push_exits_nonzero_when_a_remote_cannot_be_reached
+test_sweep_preserves_a_quoted_ssh_program_path
 test_push_is_idempotent
 test_sweep_prepends_batchmode_ahead_of_operator_options
 test_manual_run_stays_interactive_and_shows_git_errors

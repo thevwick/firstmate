@@ -48,16 +48,28 @@
 #   "firstmate: STUCK: <detail>"          diverged; left untouched, needs a human
 #
 # STUCK is reserved for a branch-shaped problem a human must reconcile: a
-# diverged fork, or a push git rejected as a non-fast-forward. A remote that
-# could not be reached or authenticated is NOT stuck - nothing about the
-# branches is wrong - so it reports as a skip naming credentials or the network,
-# which points at the real cause instead of sending the operator to read history.
+# diverged fork, or a push origin refused. A remote that could not be reached or
+# authenticated is NOT stuck - nothing about the branches is wrong - so it
+# reports as a skip naming credentials or the network, which points at the real
+# cause instead of sending the operator to read history.
 #
-# Exit status: 0 whenever the run said what it found, including a report-only
-# STUCK. --push exits 1 whenever it was asked to advance the fork and did not,
-# whether because the fork diverged, the push was rejected, or origin could not
-# be reached, so a scripted caller can tell a refusal from a success without
-# parsing the output.
+# That distinction is drawn STRUCTURALLY, never by reading git's prose: those
+# strings are translated, so on a non-English machine a genuine non-fast-forward
+# would fall through to the benign arm and invert the one signal this script
+# exists to raise. After a failed push the script re-reaches origin and compares
+# refs instead. Origin unreachable means the push never got an opinion about
+# branches, so it is the network skip; anything else is reported loudly, because
+# an unclassifiable refusal must never be quietly downgraded.
+#
+# Exit status, so a scripted caller can tell a refusal from a success without
+# parsing the output:
+#   report-only  always 0. It was asked to say what it found and it did, whether
+#                that was current, behind, a divergence, or a skip because a
+#                remote could not be reached.
+#   --push       0 only when the fork ends up level with upstream, counting the
+#                no-op case where it already was. 1 whenever it was asked to
+#                advance the fork and did not, whether the fork diverged, origin
+#                refused the push, or either remote could not be reached.
 #
 # Usage: fm-upstream-sync.sh [--push] [--sweep] [--help]
 set -eu
@@ -75,7 +87,7 @@ PUSH=no
 SWEEP=no
 
 usage() {
-  sed -n '2,62p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,74p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -93,6 +105,16 @@ if [ "$PUSH" = yes ] && [ "$SWEEP" = yes ]; then
   exit 2
 fi
 
+# The exit status every "could not do it" path shares. A report-only run was not
+# asked to advance anything, so any skip is still a successful report. A --push
+# run WAS asked to advance the fork, so every path that leaves the fork behind
+# upstream - an unreachable remote, a missing ref, a divergence, a refused push -
+# exits non-zero rather than looking like a success to a scripted caller.
+REFUSED_EXIT=0
+if [ "$PUSH" = yes ]; then
+  REFUSED_EXIT=1
+fi
+
 # Unattended only. Nobody is watching this run and the caller discards stderr, so
 # an interactive prompt would be an invisible hang; an unauthenticated remote must
 # fail fast and report a skip instead. A human who deliberately typed the command
@@ -103,11 +125,30 @@ fi
 # forced too, and it is PREPENDED immediately after the program word rather than
 # appended: ssh uses the FIRST obtained value for each parameter, so an option
 # added after an operator's own -o BatchMode=no would be ignored.
+#
+# Git SHELL-parses GIT_SSH_COMMAND, so the program word may legitimately be
+# quoted or contain spaces. Splitting on whitespace would mangle such a value and
+# leave the sweep reporting a network failure it caused itself, so the value is
+# re-split the same way git does and requoted term by term. A value the shell
+# cannot parse falls back to appending, which is weaker but never destructive.
+prepend_ssh_batchmode() {
+  local parts=() rebuilt i
+  if ! eval "parts=($GIT_SSH_COMMAND)" 2>/dev/null || [ "${#parts[@]}" -eq 0 ]; then
+    export GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes"
+    return 0
+  fi
+  rebuilt=$(printf '%q' "${parts[0]}")
+  rebuilt="$rebuilt -o BatchMode=yes"
+  for ((i = 1; i < ${#parts[@]}; i++)); do
+    rebuilt="$rebuilt $(printf '%q' "${parts[i]}")"
+  done
+  export GIT_SSH_COMMAND="$rebuilt"
+}
+
 if [ "$SWEEP" = yes ]; then
   export GIT_TERMINAL_PROMPT=0
   if [ -n "${GIT_SSH_COMMAND:-}" ]; then
-    read -r ssh_prog ssh_rest <<<"$GIT_SSH_COMMAND"
-    export GIT_SSH_COMMAND="$ssh_prog -o BatchMode=yes${ssh_rest:+ $ssh_rest}"
+    prepend_ssh_batchmode
   else
     export GIT_SSH_COMMAND="ssh -o BatchMode=yes"
   fi
@@ -122,24 +163,24 @@ relay_git_error() {  # <text>
   printf '%s\n' "$1" | sed 's/^/  /' >&2
 }
 
-# Report and exit 0: an absent upstream remote is the normal single-remote
+# Report and move on: an absent upstream remote is the normal single-remote
 # install, not a problem to escalate.
 if ! git -C "$FM_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "$LABEL: skipped: not a git repo"
-  exit 0
+  exit "$REFUSED_EXIT"
 fi
 if ! git -C "$FM_ROOT" remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1; then
   echo "$LABEL: skipped: no $UPSTREAM_REMOTE remote"
-  exit 0
+  exit "$REFUSED_EXIT"
 fi
 if ! git -C "$FM_ROOT" remote get-url origin >/dev/null 2>&1; then
   echo "$LABEL: skipped: no origin remote"
-  exit 0
+  exit "$REFUSED_EXIT"
 fi
 
 DEFAULT=$(default_branch "$FM_ROOT") || {
   echo "$LABEL: skipped: cannot determine default branch"
-  exit 0
+  exit "$REFUSED_EXIT"
 }
 
 # A fetch that fails says nothing about the branches, so it is a skip naming the
@@ -155,29 +196,29 @@ fetch_remote() {  # <remote>
   return 0
 }
 
-fetch_remote "$UPSTREAM_REMOTE" || exit 0
+fetch_remote "$UPSTREAM_REMOTE" || exit "$REFUSED_EXIT"
 # origin too, because the whole classification below is read off origin/<default>.
 # A stale remote-tracking ref would under-report the fork's own commits and turn a
 # genuine divergence into a clean "behind", which is precisely the case that must
 # never be advanced automatically. Never classify against data we failed to refresh.
-fetch_remote origin || exit 0
+fetch_remote origin || exit "$REFUSED_EXIT"
 
 UPSTREAM_REF="$UPSTREAM_REMOTE/$DEFAULT"
 ORIGIN_REF="origin/$DEFAULT"
 if ! UPSTREAM_REV=$(git -C "$FM_ROOT" rev-parse --verify --quiet "$UPSTREAM_REF^{commit}"); then
   echo "$LABEL: skipped: $UPSTREAM_REF does not exist"
-  exit 0
+  exit "$REFUSED_EXIT"
 fi
 if ! ORIGIN_REV=$(git -C "$FM_ROOT" rev-parse --verify --quiet "$ORIGIN_REF^{commit}"); then
   echo "$LABEL: skipped: $ORIGIN_REF does not exist"
-  exit 0
+  exit "$REFUSED_EXIT"
 fi
 
 # Ahead/behind of the FORK relative to upstream. "ahead" is the fork's own
 # unlanded work, which is exactly what must never be rewritten automatically.
 counts=$(git -C "$FM_ROOT" rev-list --left-right --count "$ORIGIN_REV...$UPSTREAM_REV" 2>/dev/null) || {
   echo "$LABEL: skipped: cannot compare $ORIGIN_REF with $UPSTREAM_REF"
-  exit 0
+  exit "$REFUSED_EXIT"
 }
 AHEAD=$(printf '%s\n' "$counts" | awk '{print $1}')
 BEHIND=$(printf '%s\n' "$counts" | awk '{print $2}')
@@ -196,13 +237,7 @@ fi
 # taken first, never an automatic sweep. Leave it strictly alone.
 if [ "$AHEAD" -gt 0 ]; then
   echo "$LABEL: STUCK: fork has diverged from $UPSTREAM_REF, $AHEAD ahead and $BEHIND behind - needs attention, reconcile it by hand"
-  # A report-only run did its job and exits 0. --push was asked to advance the
-  # fork and did not, which is the same refusal as a rejected push below, so it
-  # exits the same way rather than looking like a success to a scripted caller.
-  if [ "$PUSH" = yes ]; then
-    exit 1
-  fi
-  exit 0
+  exit "$REFUSED_EXIT"
 fi
 
 # Strictly behind: a genuine fast-forward. The default run reports it and stops.
@@ -219,16 +254,25 @@ fi
 # push, so git itself is the final guard: if origin has moved in a way that is
 # no longer a fast-forward, the push is rejected rather than overwriting it.
 if ! out=$(git -C "$FM_ROOT" push origin "$UPSTREAM_REV:refs/heads/$DEFAULT" 2>&1); then
-  # Two very different failures wear the same non-zero exit. Only a ref git
-  # actually refused is a branch problem worth a STUCK; anything else means the
-  # push never got far enough to have an opinion about branches, so it reports as
-  # a skip naming the real cause instead of pointing at history.
-  case "$out" in
-    *'[rejected]'*|*'non-fast-forward'*|*'fetch first'*|*'stale info'*)
-      echo "$LABEL: STUCK: fast-forward push to origin/$DEFAULT was rejected as a non-fast-forward - needs attention" ;;
-    *)
-      echo "$LABEL: skipped: cannot push to origin (network or credentials)" ;;
-  esac
+  # Two very different failures wear the same non-zero exit, and git's own words
+  # for them are translated, so the cause is established from the REFS instead.
+  # Re-reaching origin is the discriminator: a fetch that also fails means the
+  # push never got far enough to have an opinion about branches, which is the
+  # network or credentials skip. If origin is reachable, something about the
+  # branches is wrong and it is reported loudly - including when the exact shape
+  # is unclear, because an unclassifiable refusal downgraded to a benign skip
+  # would silence the one signal this script exists to raise.
+  if ! git -C "$FM_ROOT" fetch origin --quiet >/dev/null 2>&1; then
+    echo "$LABEL: skipped: cannot push to origin (network or credentials)"
+  else
+    NEW_ORIGIN_REV=$(git -C "$FM_ROOT" rev-parse --verify --quiet "$ORIGIN_REF^{commit}" || true)
+    if [ -n "$NEW_ORIGIN_REV" ] && \
+       ! git -C "$FM_ROOT" merge-base --is-ancestor "$NEW_ORIGIN_REV" "$UPSTREAM_REV"; then
+      echo "$LABEL: STUCK: origin/$DEFAULT moved and no longer fast-forwards to $UPSTREAM_REF - needs attention, reconcile it by hand"
+    else
+      echo "$LABEL: STUCK: origin refused the fast-forward push to origin/$DEFAULT - needs attention, see the error below"
+    fi
+  fi
   printf '%s\n' "$out" | sed 's/^/  /' >&2
   exit 1
 fi
