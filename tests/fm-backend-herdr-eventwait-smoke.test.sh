@@ -11,6 +11,9 @@
 # herdr_safe_stop_and_delete on a private fm-lab-* session, never a bare/ambient
 # `herdr server stop`. Every lifecycle op goes through bin/fm-herdr-lab.sh, which
 # refuses the default session and verifies the fleet-state tripwire.
+# relocation-pool-pin: not-needed - this suite only SOURCES bin/fm-watch.sh to reach its
+# functions, and the relocation sits below that file's source guard, so a sourcing shell
+# is never moved and needs no FM_TREEHOUSE_POOL_ROOT pin.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Opt-in credentialed OpenCode continuity regression on an isolated project and
 # FM_HOME. Existing OpenCode credentials stay in their managed store.
+# relocation-pool-pin: not-needed - the launcher runs inside the temporary project the
+# harness is started in, never from this suite's own cwd, so the disposable-cwd guard
+# cannot fire and a FM_TREEHOUSE_POOL_ROOT pin would guard nothing.
 set -u
 
 if [ "${FM_OPENCODE_LIVE_E2E:-0}" != 1 ]; then

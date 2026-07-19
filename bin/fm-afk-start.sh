@@ -35,8 +35,14 @@ set -eu
 FM_AFK_START_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$FM_AFK_START_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
-FM_AFK_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-FM_AFK_LOCK="$FM_AFK_STATE/.supervise-daemon.lock"
+# The single owner of every away-mode path derived from FM_HOME or STATE. It runs
+# here and again after the relocation re-anchors those bases, so a path added to it
+# is re-anchored by construction rather than by a hand-maintained second copy.
+fm_afk_derive_state_paths() {
+  FM_AFK_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+  FM_AFK_LOCK="$FM_AFK_STATE/.supervise-daemon.lock"
+}
+fm_afk_derive_state_paths
 FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
 
 # shellcheck source=bin/fm-wake-lib.sh
@@ -130,8 +136,7 @@ fm_afk_start_main() {
   fi
   # The relocation may re-anchor a relative STATE, so re-derive the paths taken
   # from it. An already-absolute STATE is left byte-identical.
-  FM_AFK_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-  FM_AFK_LOCK="$FM_AFK_STATE/.supervise-daemon.lock"
+  fm_afk_derive_state_paths
 
   mkdir -p "$FM_AFK_STATE"
   if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then

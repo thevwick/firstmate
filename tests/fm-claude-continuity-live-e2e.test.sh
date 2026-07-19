@@ -2,6 +2,9 @@
 # Opt-in credentialed Claude regression for the post-background-completion
 # continuity gate. The project and FM_HOME are isolated; Claude keeps using its
 # existing managed authentication.
+# relocation-pool-pin: not-needed - the launcher runs inside the temporary project the
+# harness is started in, never from this suite's own cwd, so the disposable-cwd guard
+# cannot fire and a FM_TREEHOUSE_POOL_ROOT pin would guard nothing.
 set -u
 
 if [ "${FM_CLAUDE_LIVE_E2E:-0}" != 1 ]; then

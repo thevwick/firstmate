@@ -5,8 +5,19 @@ FM_WAKE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_WAKE_DEFAULT_ROOT="$(cd "$FM_WAKE_LIB_DIR/.." && pwd)"
 # Whether the environment supplied these explicitly, captured once at source time
 # so a re-derivation never silently overwrites a caller's own value.
-FM_WAKE_QUEUE_PINNED="${FM_WAKE_QUEUE:+1}"
-FM_WAKE_QUEUE_LOCK_PINNED="${FM_WAKE_QUEUE_LOCK:+1}"
+#
+# The capture is recorded once per process and never revisited, because it is only
+# meaningful before this lib has derived anything. Sourcing the lib a second time
+# in one process would otherwise see the value the FIRST source derived, record it
+# as caller-supplied, and leave the wake queue pointing at the pre-relocation state
+# directory, so the enqueue and drain paths would silently use different queues.
+# The sentinel is deliberately not exported, so a child process makes its own
+# capture from whatever it genuinely inherited.
+if [ -z "${FM_WAKE_LIB_PINS_CAPTURED:-}" ]; then
+  FM_WAKE_QUEUE_PINNED="${FM_WAKE_QUEUE:+1}"
+  FM_WAKE_QUEUE_LOCK_PINNED="${FM_WAKE_QUEUE_LOCK:+1}"
+  FM_WAKE_LIB_PINS_CAPTURED=1
+fi
 
 # The single owner of every path this lib derives from FM_ROOT, FM_HOME or STATE.
 # It runs at source time and again after a relocation re-anchors the base paths,

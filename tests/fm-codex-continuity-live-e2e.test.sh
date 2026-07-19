@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Opt-in credentialed Codex regression proving the continuity changes preserve
 # Codex's bounded foreground-checkpoint supervision path.
+# relocation-pool-pin: not-needed - the launcher runs inside the temporary project the
+# harness is started in, never from this suite's own cwd, so the disposable-cwd guard
+# cannot fire and a FM_TREEHOUSE_POOL_ROOT pin would guard nothing.
 set -u
 
 if [ "${FM_CODEX_LIVE_E2E:-0}" != 1 ]; then

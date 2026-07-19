@@ -72,16 +72,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
 WATCH="$SCRIPT_DIR/fm-watch.sh"
-WATCH_LOCK="$STATE/.watch.lock"
-BEAT="$STATE/.last-watcher-beat"
+# The single owner of every arm path derived from STATE. It runs here and again
+# after the relocation re-anchors STATE, so a path added to it is re-anchored by
+# construction rather than by a hand-maintained second copy that can drift.
+arm_derive_state_paths() {
+  WATCH_LOCK="$STATE/.watch.lock"
+  BEAT="$STATE/.last-watcher-beat"
+  CYCLE_LOG="$STATE/.watch-cycle-exits.log"
+  CYCLE_LOG_LOCK="$STATE/.watch-cycle-exits.lock"
+}
+arm_derive_state_paths
 # "Fresh" reuses the guard's threshold so there is one definition of liveness.
 GRACE=${FM_GUARD_GRACE:-300}
 # How long to wait for a freshly forked watcher to acquire the lock and beat.
 CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-10}
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
-CYCLE_LOG="$STATE/.watch-cycle-exits.log"
-CYCLE_LOG_LOCK="$STATE/.watch-cycle-exits.lock"
 CYCLE_LOG_MAX_BYTES=${FM_WATCH_CYCLE_LOG_MAX_BYTES:-262144}
 CYCLE_LOG_KEEP_LINES=${FM_WATCH_CYCLE_LOG_KEEP_LINES:-1000}
 ARM_PID=${BASHPID:-$$}
@@ -344,10 +350,7 @@ if ! fm_relocate_from_disposable_cwd \
   echo "watcher: FAILED - $FM_DISPOSABLE_ERROR"
   exit 1
 fi
-WATCH_LOCK="$STATE/.watch.lock"
-BEAT="$STATE/.last-watcher-beat"
-CYCLE_LOG="$STATE/.watch-cycle-exits.log"
-CYCLE_LOG_LOCK="$STATE/.watch-cycle-exits.lock"
+arm_derive_state_paths
 
 if [ "$mode" = restart ]; then
   # Home-scoped stop: only the watcher pid recorded in THIS home's lock.
