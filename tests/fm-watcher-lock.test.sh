@@ -199,6 +199,57 @@ test_relocation_absolutizes_a_relative_fm_home() {
   pass "relocation re-anchors a relative FM_HOME to its resolved path"
 }
 
+# An absolute STATE is never resolved during relocation, so a STATE that has gone
+# missing cannot abort a launcher that never needed the resolved value. Resolving
+# it eagerly used to fail the whole relocation and report the fault under the
+# home-chdir wording, which names the wrong cause.
+test_relocation_ignores_an_unresolvable_absolute_state() {
+  local dir pool slot home out
+  dir=$(make_case relocate-state-absolute)
+  pool="$dir/pool"
+  slot="$pool/firstmate-abc123/10/firstmate"
+  home="$dir/home"
+  mkdir -p "$slot" "$home"
+  out=$(cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="$dir/gone-state" \
+    bash -c '
+      . "$1"
+      rmdir "$STATE"
+      fm_relocate_from_disposable_cwd headline 2>/dev/null || exit 7
+      printf "%s\n%s\n" "$STATE" "$(pwd -P)"
+    ' _ "$LIB") || fail "an unresolvable absolute STATE aborted the relocation"
+  [ "$(printf '%s\n' "$out" | sed -n 1p)" = "$dir/gone-state" ] \
+    || fail "relocation rewrote an absolute STATE away from $dir/gone-state"
+  [ "$(printf '%s\n' "$out" | sed -n 2p)" = "$(cd "$home" && pwd -P)" ] \
+    || fail "relocation did not land in the home"
+  pass "relocation ignores an unresolvable absolute STATE it never needed"
+}
+
+# A relative STATE genuinely must be re-anchored, so its failure is real, but it
+# is a different fault from a failed home chdir and must say so.
+test_relocation_reports_a_state_fault_distinctly() {
+  local dir pool slot home out
+  dir=$(make_case relocate-state-relative)
+  pool="$dir/pool"
+  slot="$pool/firstmate-abc123/11/firstmate"
+  home="$dir/home"
+  mkdir -p "$slot" "$home"
+  out=$(cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="relstate" \
+    bash -c '
+      . "$1"
+      rmdir "$STATE"
+      fm_relocate_from_disposable_cwd headline 2>/dev/null && exit 7
+      printf "%s\n" "$FM_DISPOSABLE_ERROR"
+    ' _ "$LIB") || fail "an unresolvable relative STATE did not fail the relocation"
+  case "$out" in
+    *"state directory"*) ;;
+    *) fail "STATE fault did not name STATE ($out)" ;;
+  esac
+  case "$out" in
+    *"into the home"*) fail "STATE fault reused the home-chdir wording ($out)" ;;
+  esac
+  pass "a STATE re-anchor fault reports its own cause, not the home chdir's"
+}
+
 test_arm_allows_leased_home_cwd() {
   local dir state fakebin pool home armout live armpid status
   dir=$(make_case arm-leased-home)
@@ -1127,6 +1178,8 @@ test_arm_relocates_out_of_disposable_pool_cwd
 test_relocated_watcher_does_not_run_in_condemned_cwd
 test_relocation_preserves_absolute_fm_home_identity
 test_relocation_absolutizes_a_relative_fm_home
+test_relocation_ignores_an_unresolvable_absolute_state
+test_relocation_reports_a_state_fault_distinctly
 test_arm_allows_leased_home_cwd
 test_singleton_start
 test_pid_identity_is_locale_invariant

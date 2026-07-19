@@ -75,7 +75,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # watcher child inherits the relocated cwd rather than a condemned one.
 if ! fm_relocate_from_disposable_cwd \
   'RELOCATED THE WATCHER OUT OF A DISPOSABLE TASK WORKTREE'; then
-  echo "watcher: FAILED - cannot move out of the disposable task worktree ($FM_DISPOSABLE_CWD) into the home ($FM_DISPOSABLE_HOME)"
+  echo "watcher: FAILED - $FM_DISPOSABLE_ERROR"
   exit 1
 fi
 

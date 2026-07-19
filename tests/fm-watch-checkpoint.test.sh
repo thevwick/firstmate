@@ -8,6 +8,15 @@ set -u
 CHECKPOINT="$ROOT/bin/fm-watch-checkpoint.sh"
 TMP_ROOT=$(fm_test_tmproot fm-watch-checkpoint)
 
+# These tests run the checkpoint from the repo checkout while pointing FM_HOME at
+# a temp dir. When the checkout is itself a treehouse pool slot - which it is for
+# any crewmate task worktree - that is exactly the shape the launcher's cwd guard
+# relocates out of, so the suite would behave one way in CI and another inside a
+# task worktree. Point the pool root at a path that does not exist, which makes
+# the guard inert and the suite identical in both places. Any test that IS about
+# the guard sets TREEHOUSE_DIR itself.
+export TREEHOUSE_DIR="$TMP_ROOT/absent-treehouse-pool"
+
 make_home() {
   local name=$1 home
   home="$TMP_ROOT/$name"

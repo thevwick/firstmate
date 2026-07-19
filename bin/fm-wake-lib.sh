@@ -72,7 +72,9 @@ fm_path_age() {
 # and carries no remedy command, because there is nothing left for the operator to
 # do. It stays a warning rather than a silent repair so the condition remains
 # visible. A failed chdir into FM_HOME means a genuinely broken home, and the
-# helper returns non-zero so the caller can fail with its own typed line.
+# helper returns non-zero after setting FM_DISPOSABLE_ERROR to the fault that
+# actually happened, so the caller fails with its own typed prefix and never
+# reports one fault under another one's wording.
 #
 # bin/fm-watch.sh calls it itself, which is the choke point every watcher
 # launcher passes through, so no present or future launcher can miss the guard.
@@ -112,6 +114,11 @@ fm_resolve_dir() {
 # Sets FM_DISPOSABLE_CWD and FM_DISPOSABLE_HOME when the cwd is condemned.
 FM_DISPOSABLE_CWD=
 FM_DISPOSABLE_HOME=
+# Set by fm_relocate_from_disposable_cwd on failure, so each caller reports the
+# fault that actually happened under its own typed prefix. A failed chdir into
+# the home and a STATE that will not resolve are different faults and must never
+# share one error string.
+FM_DISPOSABLE_ERROR=
 fm_cwd_is_disposable_slot() {
   local cwd pool home
   FM_DISPOSABLE_CWD=
@@ -129,27 +136,42 @@ fm_cwd_is_disposable_slot() {
 # Relocates the calling process out of a condemned cwd, if it is in one.
 # Returns 0 when there was nothing to do or the relocation succeeded, and 1 when
 # the cwd is condemned but chdir into FM_HOME failed.
+# shellcheck disable=SC2034  # FM_DISPOSABLE_ERROR is read by the sourcing launchers
 fm_relocate_from_disposable_cwd() {
   local headline=$1 rule state_abs
+  FM_DISPOSABLE_ERROR=
   fm_cwd_is_disposable_slot || return 0
   # Re-anchor only the paths a chdir would actually invalidate, which is the
   # genuinely relative ones. FM_HOME doubles as a byte-exact cross-process
   # identity string, written into the watcher lock and compared verbatim by the
   # guard, the checkpoint and the continuity check, so an already-absolute value
   # must survive relocation unchanged even when a path component is a symlink.
-  state_abs=$(fm_resolve_dir "$STATE") || return 1
-  CDPATH='' cd -- "$FM_HOME" 2>/dev/null || return 1
+  # An already-absolute STATE is never resolved either, so a resolution fault
+  # cannot abort a launcher that never needed the resolved value. A relative one
+  # must be resolved BEFORE the chdir, while it still resolves against the cwd
+  # it was written for.
+  state_abs=
+  case "$STATE" in
+    /*) ;;
+    *)
+      if ! state_abs=$(fm_resolve_dir "$STATE"); then
+        FM_DISPOSABLE_ERROR="the state directory ($STATE) is relative and no longer resolves, so it cannot be re-anchored before leaving the disposable task worktree ($FM_DISPOSABLE_CWD)"
+        return 1
+      fi
+      ;;
+  esac
+  if ! CDPATH='' cd -- "$FM_HOME" 2>/dev/null; then
+    FM_DISPOSABLE_ERROR="cannot move out of the disposable task worktree ($FM_DISPOSABLE_CWD) into the home ($FM_DISPOSABLE_HOME)"
+    return 1
+  fi
   case "$FM_HOME" in
     /*) ;;
     *) FM_HOME=$FM_DISPOSABLE_HOME ;;
   esac
-  case "$STATE" in
-    /*) ;;
-    *)
-      STATE=$state_abs
-      [ -z "${FM_STATE_OVERRIDE:-}" ] || FM_STATE_OVERRIDE=$state_abs
-      ;;
-  esac
+  if [ -n "$state_abs" ]; then
+    STATE=$state_abs
+    [ -z "${FM_STATE_OVERRIDE:-}" ] || FM_STATE_OVERRIDE=$state_abs
+  fi
   rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
   {
     printf '●%s\n' "$rule"

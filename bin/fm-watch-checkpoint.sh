@@ -6,9 +6,6 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECONDS_ARG=${FM_CODEX_WATCH_CHECKPOINT:-180}
 
-# shellcheck source=bin/fm-wake-lib.sh
-. "$SCRIPT_DIR/fm-wake-lib.sh"
-
 usage() {
   cat <<'EOF'
 Usage: fm-watch-checkpoint.sh [--seconds <n>]
@@ -47,6 +44,11 @@ case "$SECONDS_ARG" in
   0) echo "error: --seconds must be greater than zero" >&2; exit 2 ;;
 esac
 
+# Sourced after argument handling on purpose: the lib creates $STATE at source
+# time, and --help plus the argument errors must stay side-effect free.
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+
 OUT=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.out.XXXXXX") || exit 1
 ERR=$(mktemp "${TMPDIR:-/tmp}/fm-watch-checkpoint.err.XXXXXX") || {
   rm -f "$OUT"
@@ -82,7 +84,7 @@ run_with_perl_timeout() {
 # watcher it started was safe.
 if ! fm_relocate_from_disposable_cwd \
   'RELOCATED THE WATCHER CHECKPOINT OUT OF A DISPOSABLE TASK WORKTREE'; then
-  echo "checkpoint: FAILED - cannot move out of the disposable task worktree ($FM_DISPOSABLE_CWD) into the home ($FM_DISPOSABLE_HOME)" >&2
+  echo "checkpoint: FAILED - $FM_DISPOSABLE_ERROR" >&2
   exit 1
 fi
 

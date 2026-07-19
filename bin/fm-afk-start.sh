@@ -125,7 +125,7 @@ fm_afk_start_main() {
   # mode live with no daemon to own it.
   if ! fm_relocate_from_disposable_cwd \
     'RELOCATED AWAY MODE OUT OF A DISPOSABLE TASK WORKTREE'; then
-    echo "afk: FAILED - cannot move out of the disposable task worktree ($FM_DISPOSABLE_CWD) into the home ($FM_DISPOSABLE_HOME)" >&2
+    echo "afk: FAILED - $FM_DISPOSABLE_ERROR" >&2
     return 1
   fi
   # The relocation may re-anchor a relative STATE, so re-derive the paths taken

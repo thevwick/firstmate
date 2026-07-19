@@ -55,7 +55,7 @@ mkdir -p "$STATE"
 # already relocated leaves the cwd undetected here and nothing is printed twice.
 if ! fm_relocate_from_disposable_cwd \
   'RELOCATED THE WATCHER OUT OF A DISPOSABLE TASK WORKTREE'; then
-  echo "watcher: FAILED - cannot move out of the disposable task worktree ($FM_DISPOSABLE_CWD) into the home ($FM_DISPOSABLE_HOME)" >&2
+  echo "watcher: FAILED - $FM_DISPOSABLE_ERROR" >&2
   exit 1
 fi
 # Shared wake classifier (captain-relevant verbs + signal/stale/heartbeat
