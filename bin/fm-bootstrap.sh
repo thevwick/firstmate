@@ -10,6 +10,7 @@
 #                 "BACKEND_INVALID: <name> (known: <names>)",
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
+#                 "UPSTREAM_SYNC: firstmate: behind|STUCK: <detail>",
 #                 "PR_CHECK_MIGRATION: <private remediation>",
 #                 "TANGLE: <remediation>",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
@@ -66,9 +67,15 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the five MUTATING sweeps
+#          UPSTREAM_SYNC lines report this repo's own fork-vs-upstream drift when
+#          it has both an origin and an upstream remote: behind means the fork is
+#          fast-forwardable and names the --push command that advances it, STUCK
+#          means the fork has diverged and is left untouched for a human. A
+#          single-remote install and an already-current fork are both silent.
+#          The sweep never pushes, rebases, or forces anything.
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the six MUTATING sweeps
 #          (PR-check migration, secondmate_sync, secondmate_liveness_sweep,
-#          x_mode_setup, fleet_sync) while still printing every read-only detect line
+#          x_mode_setup, upstream_sync, fleet_sync) while still printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
 #          checkout command. Used by
 #          fm-session-start.sh's read-only path when another live session holds
@@ -149,6 +156,32 @@ fleet_sync_relay_all_output() {
     [ -n "$line" ] || continue
     echo "FLEET_SYNC: $line"
   done < "$tmp"
+}
+
+# Fork-vs-upstream drift for the firstmate repo ITSELF, so a fork silently
+# falling behind the project it tracks surfaces at every session start instead
+# of accumulating until its PRs become unreviewable. Fast-forward only, and the
+# fork is never pushed from here; see bin/fm-upstream-sync.sh.
+# A single-remote install has no upstream remote and stays completely silent, as
+# does a fork that is already current.
+upstream_sync() {
+  # Resolved next to this script (like the sourced libs above), not under
+  # $FM_ROOT/bin: FM_ROOT is the repo being INSPECTED for drift, which is not
+  # necessarily the checkout this bootstrap is running from.
+  [ -x "$SCRIPT_DIR/fm-upstream-sync.sh" ] || return 0
+  local tmp line
+  tmp=$(mktemp "${TMPDIR:-/tmp}/fm-upstream-sync.XXXXXX" 2>/dev/null) || return 0
+  "$SCRIPT_DIR/fm-upstream-sync.sh" >"$tmp" 2>/dev/null || true
+  # Relay only the two ACTIONABLE outcomes. Every skip means the drift could not
+  # be assessed at all (no upstream remote, unreachable, not a repo), which is
+  # the normal state for a non-forked install and is never something the captain
+  # can act on, so it stays silent and keeps "silent = all good" true.
+  while IFS= read -r line; do
+    case "$line" in
+      *': behind: '*|*': STUCK: '*) echo "UPSTREAM_SYNC: $line" ;;
+    esac
+  done < "$tmp"
+  rm -f "$tmp"
 }
 
 fleet_sync() {
@@ -803,6 +836,7 @@ if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   secondmate_sync
   secondmate_liveness_sweep
   x_mode_setup
+  upstream_sync
   fleet_sync
 fi
 exit 0
