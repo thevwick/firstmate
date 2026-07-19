@@ -312,6 +312,51 @@ EOF
   pass "fm-upstream-sync: push refusal is classified from refs, not localized prose"
 }
 
+# The common shape of a push failure on a public fork: fetching is anonymous and
+# succeeds, while pushing needs a write token that is missing, expired, or read
+# only. The refs then prove the push would have been a clean fast-forward, so the
+# branches are fine and calling it STUCK would send the operator to reconcile
+# history over what is actually a key.
+test_unauthorized_push_is_a_credentials_skip_not_stuck() {
+  local c out rc
+  c=$(new_case push-unauthorized)
+  advance_upstream "$c" 2
+  # Refuses the write without moving the fork's own main, exactly as a permission
+  # denial does. Fetching the same repo keeps working.
+  cat > "$c/fork.git/hooks/pre-receive" <<'EOF'
+#!/usr/bin/env bash
+echo "denied: not authorized to push" >&2
+exit 1
+EOF
+  chmod +x "$c/fork.git/hooks/pre-receive"
+
+  out=$(run_sync "$c" --push) && rc=0 || rc=$?
+  assert_contains "$out" "cannot push to origin (network or credentials)" \
+    "a push refused while the branches still fast-forward is a credentials problem"
+  assert_not_contains "$out" "STUCK" \
+    "positive ref evidence that the push was a fast-forward is not ambiguity"
+  [ "${rc:-0}" -ne 0 ] || fail "--push that did not advance the fork must exit non-zero"
+  pass "fm-upstream-sync: an unauthorized push reports credentials, not STUCK"
+}
+
+# The feature is documented as completely inert for a single-remote install, and
+# git would only ever run GIT_SSH_COMMAND on a real connection. A run that exits
+# before contacting any remote must therefore never evaluate that value, whose
+# embedded command substitution would otherwise execute on every session start.
+test_inert_install_never_evaluates_ssh_command() {
+  local c
+  c=$(new_case inert-ssh)
+  git -C "$c/clone" remote remove upstream
+
+  # The substitution is deliberately left unexpanded here: what is under test is
+  # whether the script itself ever evaluates it.
+  FM_ROOT_OVERRIDE="$c/clone" \
+    GIT_SSH_COMMAND="ssh \$(touch $c/evaluated)" "$SYNC" --sweep >/dev/null 2>&1 || true
+  [ ! -e "$c/evaluated" ] \
+    || fail "a run that contacts no remote must not evaluate the operator's GIT_SSH_COMMAND"
+  pass "fm-upstream-sync: an inert install never evaluates GIT_SSH_COMMAND"
+}
+
 # --push was asked to advance the fork. A remote it could not reach means it did
 # not, so a scripted caller must be able to see that without parsing the output.
 # A report-only run was not asked to advance anything, so the same skip is a
@@ -520,6 +565,8 @@ test_report_only_stuck_still_exits_zero
 test_push_fast_forwards_the_fork
 test_push_reports_when_local_branch_could_not_follow
 test_push_rejection_is_classified_without_reading_git_prose
+test_unauthorized_push_is_a_credentials_skip_not_stuck
+test_inert_install_never_evaluates_ssh_command
 test_push_exits_nonzero_when_a_remote_cannot_be_reached
 test_sweep_preserves_a_quoted_ssh_program_path
 test_push_is_idempotent

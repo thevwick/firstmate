@@ -48,18 +48,23 @@
 #   "firstmate: STUCK: <detail>"          diverged; left untouched, needs a human
 #
 # STUCK is reserved for a branch-shaped problem a human must reconcile: a
-# diverged fork, or a push origin refused. A remote that could not be reached or
-# authenticated is NOT stuck - nothing about the branches is wrong - so it
-# reports as a skip naming credentials or the network, which points at the real
-# cause instead of sending the operator to read history.
+# diverged fork, or a push origin refused because the branches actually moved
+# apart. A remote that could not be reached or authenticated is NOT stuck -
+# nothing about the branches is wrong - so it reports as a skip naming
+# credentials or the network, which points at the real cause instead of sending
+# the operator to read history for what is really a key.
 #
 # That distinction is drawn STRUCTURALLY, never by reading git's prose: those
 # strings are translated, so on a non-English machine a genuine non-fast-forward
 # would fall through to the benign arm and invert the one signal this script
-# exists to raise. After a failed push the script re-reaches origin and compares
-# refs instead. Origin unreachable means the push never got an opinion about
-# branches, so it is the network skip; anything else is reported loudly, because
-# an unclassifiable refusal must never be quietly downgraded.
+# exists to raise. After a failed push the script re-reads origin and follows the
+# refs. If origin/<default> is still an ancestor of the upstream commit, the push
+# WOULD have been a clean fast-forward, so the branches are provably fine and the
+# refusal was about reaching or authenticating to origin - a fetch is anonymous
+# while a push needs a write token, so this is the ordinary shape of an expired,
+# missing, or read-only credential. Only refs that positively show the push was
+# no longer a fast-forward are STUCK. Refs that cannot be read at all are the one
+# genuinely ambiguous case, and that is reported loudly rather than downgraded.
 #
 # Exit status, so a scripted caller can tell a refusal from a success without
 # parsing the output:
@@ -87,7 +92,7 @@ PUSH=no
 SWEEP=no
 
 usage() {
-  sed -n '2,74p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,79p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -145,14 +150,15 @@ prepend_ssh_batchmode() {
   export GIT_SSH_COMMAND="$rebuilt"
 }
 
-if [ "$SWEEP" = yes ]; then
+arm_noninteractive_git() {
+  [ "$SWEEP" = yes ] || return 0
   export GIT_TERMINAL_PROMPT=0
   if [ -n "${GIT_SSH_COMMAND:-}" ]; then
     prepend_ssh_batchmode
   else
     export GIT_SSH_COMMAND="ssh -o BatchMode=yes"
   fi
-fi
+}
 
 # An unattended run has no terminal to write to and its caller throws stderr away.
 # A human run gets git's own diagnostic, which is the only place the real cause of
@@ -195,6 +201,12 @@ fetch_remote() {  # <remote>
   fi
   return 0
 }
+
+# Only now, once a remote is actually about to be contacted. The cheap guards
+# above cover every install this feature is inert for, and on those runs the
+# operator's own GIT_SSH_COMMAND must never be evaluated at all - git itself
+# would only have run it on a real connection, which never happens there.
+arm_noninteractive_git
 
 fetch_remote "$UPSTREAM_REMOTE" || exit "$REFUSED_EXIT"
 # origin too, because the whole classification below is read off origin/<default>.
@@ -256,21 +268,24 @@ fi
 if ! out=$(git -C "$FM_ROOT" push origin "$UPSTREAM_REV:refs/heads/$DEFAULT" 2>&1); then
   # Two very different failures wear the same non-zero exit, and git's own words
   # for them are translated, so the cause is established from the REFS instead.
-  # Re-reaching origin is the discriminator: a fetch that also fails means the
-  # push never got far enough to have an opinion about branches, which is the
-  # network or credentials skip. If origin is reachable, something about the
-  # branches is wrong and it is reported loudly - including when the exact shape
-  # is unclear, because an unclassifiable refusal downgraded to a benign skip
-  # would silence the one signal this script exists to raise.
+  # Re-read origin and let its ref decide: still an ancestor of the commit we
+  # tried to push means the push would have been a clean fast-forward, so nothing
+  # about the branches is wrong and the refusal was about reaching or
+  # authenticating to origin - the common case, since fetching a public fork is
+  # anonymous while pushing to it needs a write token. Only a ref that positively
+  # moved out from under us is STUCK. A ref that cannot be read at all is the
+  # genuinely ambiguous case and stays loud, because an unclassifiable refusal
+  # downgraded to a benign skip would silence the one signal this script raises.
   if ! git -C "$FM_ROOT" fetch origin --quiet >/dev/null 2>&1; then
     echo "$LABEL: skipped: cannot push to origin (network or credentials)"
   else
     NEW_ORIGIN_REV=$(git -C "$FM_ROOT" rev-parse --verify --quiet "$ORIGIN_REF^{commit}" || true)
-    if [ -n "$NEW_ORIGIN_REV" ] && \
-       ! git -C "$FM_ROOT" merge-base --is-ancestor "$NEW_ORIGIN_REV" "$UPSTREAM_REV"; then
+    if [ -z "$NEW_ORIGIN_REV" ]; then
+      echo "$LABEL: STUCK: cannot read $ORIGIN_REF after origin refused the push - needs attention, see the error below"
+    elif ! git -C "$FM_ROOT" merge-base --is-ancestor "$NEW_ORIGIN_REV" "$UPSTREAM_REV"; then
       echo "$LABEL: STUCK: origin/$DEFAULT moved and no longer fast-forwards to $UPSTREAM_REF - needs attention, reconcile it by hand"
     else
-      echo "$LABEL: STUCK: origin refused the fast-forward push to origin/$DEFAULT - needs attention, see the error below"
+      echo "$LABEL: skipped: cannot push to origin (network or credentials); $ORIGIN_REF would still fast-forward, so the branches are fine"
     fi
   fi
   printf '%s\n' "$out" | sed 's/^/  /' >&2
