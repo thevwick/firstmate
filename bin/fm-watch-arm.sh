@@ -12,6 +12,16 @@
 # child is reaped when the call returns, leaving NO watcher running and a false
 # "already running" off the dying process. That exact mistake silently took
 # supervision down for ~30 minutes.
+#
+# A SECOND, distinct reaping hazard is the working directory the arm runs from.
+# bin/fm-wake-lib.sh's fm_cwd_is_disposable_slot owns that contract; this script
+# REFUSES to arm when it fires, naming the offending cwd and the fix. The primary
+# shell's cwd persists across tool calls, so one `cd` into a task worktree
+# silently condemns everything armed afterwards.
+# The refusal deliberately does NOT relocate the cwd itself. The arm process is
+# not the only process that has to survive: the harness's own wrapper shell is the
+# arm's parent and keeps the condemned cwd, so an internal `cd` would produce a
+# watcher that still dies while looking safe.
 # On a harness with a PreToolUse-equivalent hook, bin/fm-arm-pretool-check.sh
 # applies the command-position policy before the command runs; see
 # docs/arm-pretool-check.md for the blessed tree and deny reason codes. It is a
@@ -58,6 +68,16 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+
+# The cwd guard runs before any watcher work: a watcher armed from a disposable
+# pool slot is condemned, so refuse rather than start one that will be reaped.
+if fm_cwd_is_disposable_slot; then
+  fm_disposable_cwd_banner \
+    'REFUSING TO ARM THE WATCHER - CWD IS A DISPOSABLE TASK WORKTREE' \
+    'bin/fm-watch-arm.sh'
+  echo "watcher: FAILED - refusing to arm from a disposable task worktree ($FM_DISPOSABLE_CWD)"
+  exit 1
+fi
 
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 WATCH_LOCK="$STATE/.watch.lock"

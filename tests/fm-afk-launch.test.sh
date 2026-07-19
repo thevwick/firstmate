@@ -41,6 +41,47 @@ GLOBAL_CLEANUP() {
 trap GLOBAL_CLEANUP EXIT
 
 # ---------------------------------------------------------------------------
+# UNIT 0: the away-mode daemon is long-lived, so starting it from a treehouse
+# pool slot that is not this home is refused before any state is touched. A cwd
+# inside the home is not refused, even when the home is itself a leased slot.
+# ---------------------------------------------------------------------------
+unit_disposable_cwd_refused() {
+  local st pool slot home out status
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-cwd.XXXXXX")
+  pool="$st/pool"
+  slot="$pool/firstmate-abc123/3/firstmate"
+  home="$st/home"
+  out="$st/out"
+  mkdir -p "$slot" "$home/state"
+  ( cd "$slot" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    "$START" ) > "$out" 2>&1
+  status=$?
+  if [ "$status" -ne 0 ] && grep -qF 'REFUSING TO START AWAY MODE' "$out"; then
+    pass "disposable-cwd: refuses to start the daemon from a foreign pool slot"
+  else
+    fail "disposable-cwd: did not refuse a foreign pool slot (status $status)"
+  fi
+  if [ ! -e "$home/state/.afk" ]; then
+    pass "disposable-cwd: refuses before entering away mode"
+  else
+    fail "disposable-cwd: entered away mode despite refusing to start the daemon"
+  fi
+
+  # A leased home is under the pool but IS this home, so the guard must let it by.
+  home="$pool/firstmate-abc123/4/firstmate"
+  out="$st/out-home"
+  mkdir -p "$home/state"
+  ( cd "$home" && TREEHOUSE_DIR="$pool" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+    FM_AFK_STATE_PREPARED=1 "$START" ) > "$out" 2>&1
+  if ! grep -qF 'REFUSING TO START AWAY MODE' "$out"; then
+    pass "disposable-cwd: does not refuse a cwd inside its own leased home"
+  else
+    fail "disposable-cwd: refused its own leased home"
+  fi
+  rm -rf "$st"
+}
+
+# ---------------------------------------------------------------------------
 # UNIT 1: fm_afk_clear_stale_artifacts removes exactly the three stale artifacts.
 # ---------------------------------------------------------------------------
 unit_clear_stale() {
@@ -883,6 +924,7 @@ unit_malformed_record_fails_closed
 unit_stop_malformed_record_fails_closed
 unit_tmux_planned_record_and_collision
 unit_stop_validates_before_signal
+unit_disposable_cwd_refused
 unit_lock_requires_complete_metadata
 unit_stop_surfaces_afk_removal_failure
 unit_stop_confirms_daemon_exit

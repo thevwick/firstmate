@@ -117,6 +117,18 @@ fm_afk_start_main() {
     * ) echo "usage: $(basename "${BASH_SOURCE[1]:-fm-afk-start.sh}")" >&2; return 2 ;;
   esac
 
+  # The daemon is long-lived and carries supervision while nobody is watching, so
+  # it has the same disposable-cwd hazard as the watcher (bin/fm-wake-lib.sh's
+  # fm_cwd_is_disposable_slot). Refuse before touching state, so away mode is
+  # never entered without a daemon that can survive to own it.
+  if fm_cwd_is_disposable_slot; then
+    fm_disposable_cwd_banner \
+      'REFUSING TO START AWAY MODE - CWD IS A DISPOSABLE TASK WORKTREE' \
+      'bin/fm-afk-start.sh'
+    echo "afk: FAILED - refusing to start from a disposable task worktree ($FM_DISPOSABLE_CWD)" >&2
+    return 1
+  fi
+
   mkdir -p "$FM_AFK_STATE"
   if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
     [ -f "$FM_AFK_STATE/.afk" ] || { echo "afk: launcher-prepared state is missing" >&2; return 1; }

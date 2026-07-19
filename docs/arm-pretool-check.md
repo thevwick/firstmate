@@ -12,6 +12,8 @@ A firstmate primary must arm `bin/fm-watch-arm.sh` or run `bin/fm-watch-checkpoi
 A shell background operator, pipeline, redirection, wrapper, or unrelated command list can hide failure or let the watcher child die with the tool call.
 The seatbelt rejects those command shapes before execution.
 
+This policy classifies command text only and never inspects the environment the command would run in, so the working directory a watcher would be armed from is out of scope here and is owned by `bin/fm-watch-arm.sh`.
+
 This policy is not a post-arm liveness guarantee.
 `bin/fm-guard.sh`, `bin/fm-turnend-guard.sh`, the watcher lock, and the watcher beacon still prove whether supervision is healthy after an allowed call.
 

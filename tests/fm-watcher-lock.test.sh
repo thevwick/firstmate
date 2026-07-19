@@ -15,6 +15,14 @@ LIB="$ROOT/bin/fm-wake-lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-watcher-lock-tests)
 
+# These tests arm from the repo checkout while pointing FM_HOME at a temp dir.
+# When the checkout is itself a treehouse pool slot - which it is for any crewmate
+# task worktree - that is exactly the shape fm-watch-arm.sh's cwd guard refuses,
+# so the suite would pass in CI and fail in a task worktree. Point the pool root
+# at a path that does not exist, which makes the guard inert for every test that
+# is not about it. The two tests that ARE about it set TREEHOUSE_DIR themselves.
+export TREEHOUSE_DIR="$TMP_ROOT/absent-treehouse-pool"
+
 mark_pr_check_migration_complete() {
   local state=$1
   printf '%s\n' fm-pr-check-migration-scan-v1 > "$state/.pr-check-migration-scan-v1"
@@ -22,6 +30,75 @@ mark_pr_check_migration_complete() {
   chmod 0600 "$state/.pr-check-migration-scan-v1" "$state/.pr-check-migration-v1"
 }
 
+
+# The treehouse lingering-process sweep kills by working directory, so a watcher
+# armed from a pool slot that is not this home is condemned. The guard must refuse
+# that arm loudly, and must NOT refuse an arm from a durably leased home, which is
+# itself a pool slot but is stable for that home's lifetime.
+test_arm_refuses_disposable_pool_cwd() {
+  local dir state fakebin pool slot slot_real home armout armpid status
+  dir=$(make_case arm-pool-cwd)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  pool="$dir/pool"
+  slot="$pool/firstmate-abc123/3/firstmate"
+  # The home must sit OUTSIDE the pool, or it would legitimately contain the slot.
+  home="$dir/home"
+  armout="$dir/arm.out"
+  mark_pr_check_migration_complete "$state"
+  mkdir -p "$slot" "$home"
+  # The banner reports the resolved cwd, so compare against the resolved slot.
+  slot_real=$(cd "$slot" && pwd -P)
+  ( cd "$slot" && PATH="$fakebin:$PATH" TREEHOUSE_DIR="$pool" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=3 "$WATCH_ARM" ) > "$armout" 2>&1 &
+  armpid=$!
+  wait_for_exit "$armpid" 120
+  status=$?
+  [ "$status" -ne 124 ] || fail "arm blocked instead of refusing a disposable pool cwd"
+  [ "$status" -ne 0 ] || fail "arm exited zero from a disposable pool cwd"
+  grep -F 'REFUSING TO ARM' "$armout" >/dev/null || fail "arm did not print the refusal banner"
+  grep -F "$slot_real" "$armout" >/dev/null || fail "arm refusal did not name the offending cwd"
+  grep -F 'watcher: FAILED' "$armout" >/dev/null || fail "arm did not print a typed FAILED line"
+  [ ! -e "$state/.watch.lock" ] || fail "refused arm still took the watcher lock"
+  pass "arm refuses a cwd under a treehouse pool slot that is not this home"
+}
+
+test_arm_allows_leased_home_cwd() {
+  local dir state fakebin pool home armout live armpid status
+  dir=$(make_case arm-leased-home)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  pool="$dir/pool"
+  # A leased secondmate home lives under the pool but is this home, so it passes.
+  home="$pool/firstmate-abc123/4/firstmate"
+  armout="$dir/arm.out"
+  mark_pr_check_migration_complete "$state"
+  mkdir -p "$home"
+  # Borrow the unconfirmable-watcher setup so the arm returns promptly instead of
+  # blocking on a live cycle: a live non-watcher holds the lock and the beacon is
+  # stale, so the arm must reach its ordinary FAILED path. Getting there at all
+  # proves the cwd guard let it past.
+  sleep 300 >/dev/null 2>&1 &
+  live=$!
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$live" > "$state/.watch.lock/pid"
+  touch -t 200001010000 "$state/.last-watcher-beat"
+  ( cd "$home" && PATH="$fakebin:$PATH" TREEHOUSE_DIR="$pool" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=3 "$WATCH_ARM" ) > "$armout" 2>&1 &
+  armpid=$!
+  wait_for_exit "$armpid" 120
+  status=$?
+  [ "$status" -ne 124 ] || fail "arm never returned from its own leased home"
+  ! grep -qF 'REFUSING TO ARM' "$armout" || fail "arm refused its own leased home"
+  ! grep -qF 'refusing to arm' "$armout" || fail "arm printed the refusal line for its own home"
+  grep -E '^watcher: ' "$armout" >/dev/null \
+    || fail "arm did not reach its ordinary status contract from its own home ($(cat "$armout"))"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "arm does not refuse a cwd inside its own leased home"
+}
 
 test_singleton_start() {
   local dir state fakebin out1 out2 pid1 pid2 live i
@@ -909,6 +986,8 @@ test_pid_identity_is_locale_invariant() {
   pass "fm_pid_identity is locale-invariant across LC_ALL/LC_TIME"
 }
 
+test_arm_refuses_disposable_pool_cwd
+test_arm_allows_leased_home_cwd
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_stale_watch_lock_reclaimed

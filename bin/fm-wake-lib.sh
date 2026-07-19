@@ -50,6 +50,73 @@ fm_path_age() {
   echo $(( $(date +%s) - m ))
 }
 
+# Disposable-cwd guard for long-lived firstmate processes.
+#
+# treehouse's lingering-process sweep, which fires on every `treehouse return` and
+# on the exit of an interactive `treehouse get` shell, kills every process whose
+# working directory resolves under the worktree being returned. It matches on
+# filesystem path, not on process ancestry, so anything long-lived started from a
+# per-task pool slot dies when ANY session returns that slot, whoever started it.
+# The observed signal is SIGURG, surfacing as exit 144.
+#
+# A durably leased secondmate home is itself a pool slot (bin/fm-home-seed.sh) but
+# is stable for that home's lifetime, so a cwd inside FM_HOME is always safe. Only
+# a pool slot that is NOT this home is refused. TREEHOUSE_DIR is treehouse's own
+# pool-root variable and defaults to ~/.treehouse; a pool root that does not
+# resolve leaves the guard inert.
+#
+# Callers detect with fm_cwd_is_disposable_slot, render the shared banner with
+# fm_disposable_cwd_banner, then emit their own typed failure line and exit.
+fm_path_under() {
+  local child=$1 parent=$2
+  [ -n "$parent" ] || return 1
+  [ "$child" = "$parent" ] && return 0
+  case "$child" in
+    "$parent"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+fm_resolve_dir() {
+  local path=$1
+  [ -n "$path" ] || return 1
+  CDPATH='' cd -- "$path" 2>/dev/null && pwd -P
+}
+
+# Sets FM_DISPOSABLE_CWD and FM_DISPOSABLE_HOME on a refusal.
+FM_DISPOSABLE_CWD=
+FM_DISPOSABLE_HOME=
+fm_cwd_is_disposable_slot() {
+  local cwd pool home
+  FM_DISPOSABLE_CWD=
+  FM_DISPOSABLE_HOME=
+  cwd=$(pwd -P 2>/dev/null) || return 1
+  pool=$(fm_resolve_dir "${TREEHOUSE_DIR:-${HOME:-}/.treehouse}") || return 1
+  fm_path_under "$cwd" "$pool" || return 1
+  home=$(fm_resolve_dir "$FM_HOME") || home=$FM_HOME
+  fm_path_under "$cwd" "$home" && return 1
+  FM_DISPOSABLE_CWD=$cwd
+  FM_DISPOSABLE_HOME=$home
+  return 0
+}
+
+fm_disposable_cwd_banner() {
+  local headline=$1 restart_command=$2 rule
+  rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+  {
+    printf '●%s\n' "$rule"
+    printf '●  %s\n' "$headline"
+    printf '●  cwd:     %s\n' "$FM_DISPOSABLE_CWD"
+    printf '●  home:    %s\n' "$FM_DISPOSABLE_HOME"
+    printf '●  A long-lived process started from a treehouse pool slot is killed by\n'
+    printf '●  signal 16 (exit 144) the moment any session returns that slot, because\n'
+    printf '●  the sweep matches on working directory, not on who started the process.\n'
+    printf '●  Start it from this home instead:\n'
+    printf '●      cd %s && %s\n' "$FM_DISPOSABLE_HOME" "$restart_command"
+    printf '●%s\n' "$rule"
+  } >&2
+}
+
 fm_watcher_lock_matches_pid() {
   local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity
   lockdir="$state/.watch.lock"
