@@ -71,14 +71,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
-# The cwd guard runs before any watcher work, and well before the fork, so the
-# watcher child inherits the relocated cwd rather than a condemned one.
-if ! fm_relocate_from_disposable_cwd \
-  'RELOCATED THE WATCHER OUT OF A DISPOSABLE TASK WORKTREE'; then
-  echo "watcher: FAILED - $FM_DISPOSABLE_ERROR"
-  exit 1
-fi
-
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 WATCH_LOCK="$STATE/.watch.lock"
 BEAT="$STATE/.last-watcher-beat"
@@ -341,6 +333,21 @@ case "${1:-}" in
   --restart) mode=restart ;;
   *) echo "usage: $(basename "$0") [--restart]" >&2; exit 2 ;;
 esac
+
+# The cwd guard runs after argument handling, so usage errors stay side-effect
+# free, and before any watcher work or the fork, so the watcher child inherits
+# the relocated cwd rather than a condemned one. The STATE-derived paths are
+# re-derived afterwards because a relative STATE is re-anchored by the
+# relocation.
+if ! fm_relocate_from_disposable_cwd \
+  'RELOCATED THE WATCHER OUT OF A DISPOSABLE TASK WORKTREE'; then
+  echo "watcher: FAILED - $FM_DISPOSABLE_ERROR"
+  exit 1
+fi
+WATCH_LOCK="$STATE/.watch.lock"
+BEAT="$STATE/.last-watcher-beat"
+CYCLE_LOG="$STATE/.watch-cycle-exits.log"
+CYCLE_LOG_LOCK="$STATE/.watch-cycle-exits.lock"
 
 if [ "$mode" = restart ]; then
   # Home-scoped stop: only the watcher pid recorded in THIS home's lock.

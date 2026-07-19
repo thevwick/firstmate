@@ -76,8 +76,10 @@ fm_path_age() {
 # actually happened, so the caller fails with its own typed prefix and never
 # reports one fault under another one's wording.
 #
-# bin/fm-watch.sh calls it itself, which is the choke point every watcher
-# launcher passes through, so no present or future launcher can miss the guard.
+# bin/fm-watch.sh calls it itself, below its source guard, which is the choke
+# point every launcher that EXECUTES the watcher passes through, so no present or
+# future launcher can miss the guard. Sourcing the watcher for unit tests does not
+# relocate the sourcing shell.
 # A launcher that also BLOCKS for the watcher's lifetime - bin/fm-watch-arm.sh
 # while it waits on its child, bin/fm-watch-checkpoint.sh for the whole bounded
 # checkpoint, bin/fm-afk-start.sh before the daemon exec - calls it on its own

@@ -49,15 +49,6 @@ mkdir -p "$STATE"
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
-# The one choke point every watcher launcher must pass through, so the
-# disposable-cwd relocation covers all present and future launchers by
-# construction rather than per entry point. It is idempotent: a launcher that
-# already relocated leaves the cwd undetected here and nothing is printed twice.
-if ! fm_relocate_from_disposable_cwd \
-  'RELOCATED THE WATCHER OUT OF A DISPOSABLE TASK WORKTREE'; then
-  echo "watcher: FAILED - $FM_DISPOSABLE_ERROR" >&2
-  exit 1
-fi
 # Shared wake classifier (captain-relevant verbs + signal/stale/heartbeat
 # predicates), the SAME library the away-mode daemon uses, so the triage policy
 # has one definition.
@@ -89,12 +80,13 @@ fi
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
 WATCHER_STALE_GRACE=${FM_WATCHER_STALE_GRACE:-${FM_GUARD_GRACE:-300}}
-# The singleton-lock acquisition, EXIT trap, and the blocking supervision loop
-# all live below the source guard at the very bottom of this file (see "Main
-# entry"). Sourcing this file for unit tests therefore loads the functions -
-# including the event-wait splice below - and returns before acquiring the lock
-# or starting the loop. Running it as a script executes the runtime exactly as
-# before, byte-for-byte.
+# The disposable-cwd relocation, singleton-lock acquisition, EXIT trap, and the
+# blocking supervision loop all live below the source guard at the very bottom of
+# this file (see "Main entry"). Sourcing this file for unit tests therefore loads
+# the functions - including the event-wait splice below - and returns without
+# relocating the sourcing shell, acquiring the lock, or starting the loop.
+# Running it as a script executes the runtime exactly as before, byte-for-byte,
+# apart from the relocation.
 
 # Portable stat. macOS (BSD) stat uses `-f <fmt>`; Linux (GNU) stat uses `-c <fmt>`.
 # Do NOT use the `stat -f <fmt> ... || stat -c <fmt> ...` fallback form: on Linux
@@ -702,6 +694,20 @@ handle_push_transition() {  # <backend> <session> <record>
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
 fi
+
+# The one choke point every launcher that EXECUTES the watcher must pass through,
+# so the disposable-cwd relocation covers all present and future launchers by
+# construction rather than per entry point. It sits below the source guard so a
+# unit test that only sources this file keeps its own cwd. It is idempotent: a
+# launcher that already relocated leaves the cwd undetected here and nothing is
+# printed twice. WATCH_LOCK is re-derived afterwards because a relative STATE is
+# re-anchored by the relocation.
+if ! fm_relocate_from_disposable_cwd \
+  'RELOCATED THE WATCHER OUT OF A DISPOSABLE TASK WORKTREE'; then
+  echo "watcher: FAILED - $FM_DISPOSABLE_ERROR" >&2
+  exit 1
+fi
+WATCH_LOCK="$STATE/.watch.lock"
 
 # Before acquiring the watcher lock or enumerating any runnable check, replace
 # or quarantine checks created by older versions. The migration compares bytes

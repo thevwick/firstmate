@@ -19,16 +19,42 @@ TMP_ROOT=$(fm_test_tmproot fm-watcher-lock-tests)
 # is stranded by every failing assertion after it was forked. A leaked watcher
 # keeps polling forever against a state dir the cleanup has already removed, so
 # register each real process for teardown at the moment it is launched.
+# Most tracked pids are already dead by the time the trap fires, and on a busy
+# host a recycled pid belongs to an unrelated process, so each pid is recorded
+# alongside its identity at track time and only signalled when it is still alive
+# AND still that same process. This mirrors fm_pid_identity rather than calling
+# it, because sourcing bin/fm-wake-lib.sh at suite scope would rewrite the
+# suite's FM_HOME/STATE and create a state directory under the repo checkout.
 FM_TEST_PIDS=()
 
+pid_identity() {
+  local pid=$1 out
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  out=$(LC_ALL=C ps -p "$pid" -o lstart= -o command= 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out" | sed 's/^[[:space:]]*//'
+}
+
 track_pid() {
-  FM_TEST_PIDS+=("$1")
+  local pid=$1 ident
+  [ -n "$pid" ] || return 0
+  ident=$(pid_identity "$pid") || ident=
+  FM_TEST_PIDS+=("$pid|$ident")
 }
 
 fm_watcher_lock_test_cleanup() {
-  local p
-  for p in "${FM_TEST_PIDS[@]:-}"; do
-    [ -n "$p" ] && kill "$p" 2>/dev/null
+  local entry pid ident now
+  for entry in "${FM_TEST_PIDS[@]:-}"; do
+    [ -n "$entry" ] || continue
+    pid=${entry%%|*}
+    ident=${entry#*|}
+    [ -n "$pid" ] || continue
+    [ -n "$ident" ] || continue
+    now=$(pid_identity "$pid") || continue
+    [ "$now" = "$ident" ] || continue
+    kill "$pid" 2>/dev/null
   done
   fm_test_cleanup
 }
