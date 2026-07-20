@@ -1137,6 +1137,10 @@ fm_lab_scratch_fleet() {
   chmod +x "$clone/node_modules/.bin/react-native"
   git -C "$clone" add -A >/dev/null 2>&1
   git -C "$clone" -c user.email=t@t -c user.name=t commit -qm init >/dev/null 2>&1
+  # Name the branch explicitly: `git init` honours the host's init.defaultBranch,
+  # so a machine defaulting to master would leave the 'main' builds below with no
+  # branch to resolve. -M is the portable form (git init -b is newer).
+  git -C "$clone" branch -M main >/dev/null 2>&1
   local cfg="$dir/config/mobile-lab.json"; mkdir -p "$(dirname "$cfg")"
   echo '{ "repos": { "demo": { "clone":"demo","metro_port_base":8300,"pool_size":4,"run_command":"react-native run-ios" } } }' > "$cfg"
   local fakebin="$dir/fakebin"; mkdir -p "$fakebin"
