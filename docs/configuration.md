@@ -67,7 +67,8 @@ A selector containing `:` is passed through as an explicit backend endpoint esca
 Otherwise an exact task id matching `state/<id>.meta` wins before the legacy `fm-<id>` label fallback, so task ids that themselves start with `fm-` route to their own metadata instead of being stripped.
 A metadata-routed selector returns the recorded backend target (`terminal=` for Orca, otherwise `window=`), and matching explicit targets can still recover the recorded backend when metadata contains the same endpoint.
 Only metadata-routed task selectors carry secondmate-marker and Codex-harness context; explicit endpoint escape hatches do not.
-These five sentences are the single owner of the task-selector vocabulary; backend guides and other documents point here instead of restating the resolution order.
+A metaless target, one with no matching `state/<id>.meta` such as firstmate's own primary pane, does not fall back to `tmux`: its backend resolves from the live runtime through `FM_BACKEND`, then `config/backend`, then runtime auto-detection, and a target none of those resolve refuses loudly instead of being dispatched at a tmux socket that may not exist.
+These six sentences are the single owner of the task-selector vocabulary; backend guides and other documents point here instead of restating the resolution order.
 `fm-teardown.sh <id>` takes a task id directly and uses the same recorded backend target fields after loading `state/<id>.meta`.
 By default, Herdr workspaces are derived from `FM_HOME`: the primary home uses `firstmate`, and a secondmate home marked by `.fm-secondmate-home` uses `2ndmate-<secondmate-id>`.
 The default-container spawn, list-live, and recovery paths read that label from the active home, so a secondmate's own crewmates stay inside that secondmate home's herdr space.
@@ -260,6 +261,13 @@ If bootstrap kills a timed-out refresh, it replays any completed `fm-fleet-sync.
 A killed refresh (or a teardown process kill) can leave an orphaned `.git/packed-refs.lock` in a clone, which makes the next refresh's fetch fail with Git's `Unable to create '...packed-refs.lock': File exists`.
 On that signature only, `fm-fleet-sync.sh` retries the fetch with a bounded wait for the lock to self-clear, then removes the lock and retries once more only when it can prove the lock stale, exactly like the `fm-teardown.sh` `index.lock` recovery.
 It never removes a live lock, leaves any other failure shape untouched, and prints every wait, retry, and removal to stderr plus a one-line `recovered:` summary to stdout on success so that this session-start relay still surfaces the recovery.
+The locked session-start bootstrap step also checks the firstmate repo's own fork-vs-upstream drift through `fm-upstream-sync.sh --sweep`, which is relevant only when the repo has both an `origin` (the fork) and an `upstream` remote.
+It emits `UPSTREAM_SYNC:` for the two actionable outcomes only: `behind:` when the fork is a clean fast-forward behind upstream, naming the `bin/fm-upstream-sync.sh --push` command that advances it, and `STUCK:` when the fork is both ahead of and behind upstream, in which case it is left completely untouched for a human to reconcile.
+A fork that is only ahead of upstream is the normal resting state of a fork carrying its own work and reports as current, not as drift.
+A current fork, a single-remote install with no upstream remote, and every other skip that merely means drift could not be assessed all stay silent, so this check is inert for anyone who has not forked.
+The one relayed skip is a timeout, because an unreachable remote spends that whole budget at every session start until it is fixed; the sweep's own budget is the fleet-sync bootstrap timeout capped at 20 seconds.
+The sweep only reports and never pushes, rebases, forces, or moves a branch; `--push` is a human-invoked command that fast-forwards the fork and is never run from bootstrap.
+Because `/updatefirstmate` pulls from `origin`, on a fork it can only deliver what the fork already holds, so a `behind:` fork has to be brought forward before a self-update carries upstream work.
 The locked session-start bootstrap step also runs the guarded local secondmate sync for recorded live secondmate homes, then propagates declared inherited local material into each validated live home.
 It emits `SECONDMATE_SYNC:` only when a home was skipped for an actionable sync reason, inheritance failed, or a divergent shared captain-preference copy was quarantined.
 When a running home advances and its loaded instruction surface (`AGENTS.md`, `bin/`, or `.agents/skills/`) changed, bootstrap sends the re-read nudge itself through the stable `fm-<id>` selector and reports the exact completed send as `BOOTSTRAP_INFO:`.
@@ -380,6 +388,7 @@ FM_CHECK_INTERVAL=300   # seconds between slow checks (authenticated merge polls
 FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
 FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in Codex primary supervision
 FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-crew-state.sh
+FM_SNAPSHOT_CREW_STATE_TIMEOUT=8   # seconds allowed per task's fm-crew-state.sh read inside fm-fleet-snapshot.sh; a timeout degrades that one task to an unknown state instead of blanking the fleet, and the bound needs timeout or gtimeout on PATH
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes runs rows scanned when cross-branch attribution falls back from axi status
 FM_CREW_STATE_BIN=bin/fm-crew-state.sh   # test override for the current-state reader used by working/paused watcher triage
 FMX_PAIRING_TOKEN=      # X mode pairing token; .env opt-in authorizes replies and eligible lifecycle actions

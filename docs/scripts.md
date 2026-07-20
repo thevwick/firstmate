@@ -17,6 +17,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-bearings-snapshot.sh` | Project the fleet snapshot to the compact TOON bearings view; local-only unless `--include-prs` |
 | `fm-update.sh`           | Fast-forward-only self-update of firstmate and secondmate homes from origin          |
 | `fm-upstream-sync.sh`    | Report this repo's fork-vs-upstream drift, fast-forward-only; `--push` advances the fork |
+| `fm-mobile-lab.sh`       | Build and run a React Native branch on a simulator or device from a warm worktree slot; `ls`, `stop`, `gc`, and `doctor` subcommands (docs/mobile-lab.md) |
 | `fm-backlog-handoff.sh`  | Validate and delegate queued backlog-item moves into a secondmate home               |
 | `fm-decision-hold.sh`    | Create, verify, complete, and resolve durable captain-held decisions                 |
 | `fm-brief.sh`            | Scaffold ship, scout, secondmate-charter, and Herdr-lab briefs                       |

@@ -47,6 +47,12 @@
 #     landed-work roll-up derived from secondmate_current.
 #   secondmate_guidance: return-channel action note for renderers and bearings.
 #
+# FM_SNAPSHOT_CREW_STATE_TIMEOUT (default 8) bounds each task's
+# bin/fm-crew-state.sh read, so one slow or wedged no-mistakes query degrades
+# that single task to an unknown state instead of blanking the whole fleet. The
+# bound needs `timeout` or `gtimeout` on PATH; without either the read is
+# unbounded.
+#
 # Compatibility: JSON is the primary machine-readable surface.
 # Human views must render this output instead of parsing state files again.
 set -u

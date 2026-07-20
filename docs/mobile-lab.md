@@ -174,6 +174,8 @@ The engine refuses a multi-GB clone or install when free disk is below `FM_MOBIL
 | `FM_MOBILE_LAB_HEARTBEAT_SECS` | `10` | Heartbeat cadence (seconds) for a long build phase and the minimum status-file refresh interval. |
 | `FM_MOBILE_LAB_LOCK_WAIT` | `0` | Seconds to wait for a busy slot's build lock before failing. |
 | `FM_MOBILE_LAB_NO_METRO` | unset | When `1`, report the Metro port but do not start Metro. |
+| `FM_MOBILE_LAB_NO_PODS` | unset | When `1`, report the `pod install` that would run but do not run it. |
+| `FM_MOBILE_LAB_LIB` | unset | When `1`, sourcing the script defines its functions without running `main`; the test hook. |
 | `FM_MOBILE_LAB_X86_SIM_MAX_MAJOR` | `18` | Highest iOS major version whose simulator runtime still runs x86_64 apps under Rosetta. The x86_64-via-Rosetta sim path targets a runtime at or below this; raise it only if a future iOS restores x86_64 simulator support. |
 | `FM_MOBILE_LAB_FORCE_ROSETTA` | unset | Test-only override for the Rosetta probe: `1` forces "Rosetta available", `0` forces "not available", unset probes with `arch -x86_64`. |
 

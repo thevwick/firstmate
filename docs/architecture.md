@@ -243,6 +243,12 @@ The update is fast-forward only: dirty, diverged, offline, and off-default targe
 The origin-based updater and the local secondmate sync share the same guarded fast-forward helper; only the origin mode fetches.
 The mechanics are owned by the `/updatefirstmate` skill and firstmate's operating manual in [`AGENTS.md`](../AGENTS.md) (self-update).
 
+When the firstmate repo is a fork, `origin` is the fork rather than the upstream project, so the updater can only deliver what the fork itself already holds.
+`bin/fm-upstream-sync.sh` closes that gap: the locked session-start bootstrap step runs it read-only and surfaces drift as an `UPSTREAM_SYNC:` line, and a human runs it with `--push` to fast-forward the fork.
+It is fast-forward only, like the clone refresh above: a fork that has diverged, being both ahead of and behind upstream, is reported as `STUCK:` and left untouched, because reconciling a divergence needs a rebase and a force push and stays a deliberate human operation.
+A fork that is only ahead of upstream is healthy and reports as current, and a single-remote install has no upstream remote and stays silent.
+[configuration.md](configuration.md#toolchain) owns the reporting details.
+
 ## Restart-proof
 
 Fleet state lives in each task's session-provider backend (tmux by hard default, herdr or cmux when selected or auto-detected, zellij/orca when explicitly selected), no-mistakes run records, status event logs, local markdown under `data/` including `data/captain.md`, `data/captain-shared.md`, and `data/learnings.md`, and persistent secondmate homes.
