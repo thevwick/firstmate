@@ -148,7 +148,7 @@ fleet_sync_bootstrap_timeout() {
 # hung, or credential-prompting remote can never hold up session start.
 BOOTSTRAP_BOUNDED_ELAPSED=0
 bootstrap_run_bounded() {  # <timeout> <outfile> <cmd> [args...]
-  local timeout=$1 out=$2 monitor_was_on=0 pid start elapsed
+  local timeout=$1 out=$2 monitor_was_on=0 pid start elapsed ticks interval
   shift 2
   case $- in *m*) monitor_was_on=1 ;; esac
   set -m 2>/dev/null || true
@@ -156,6 +156,12 @@ bootstrap_run_bounded() {  # <timeout> <outfile> <cmd> [args...]
   pid=$!
 
   start=$SECONDS
+  # Poll finely for the first second, then once a second. A child that exits in
+  # milliseconds - the drift check on a single-remote install, which is the
+  # install this whole feature is meant to be free for - must not cost a full
+  # second of session start just to be noticed.
+  ticks=0
+  interval=0.05
   while jobs -r -p | grep -qx "$pid"; do
     elapsed=$((SECONDS - start))
     if [ "$elapsed" -ge "$timeout" ]; then
@@ -165,7 +171,11 @@ bootstrap_run_bounded() {  # <timeout> <outfile> <cmd> [args...]
       BOOTSTRAP_BOUNDED_ELAPSED=$elapsed
       return 1
     fi
-    sleep 1
+    ticks=$((ticks + 1))
+    [ "$ticks" -lt 20 ] || interval=1
+    # A shell whose sleep rejects a fractional argument falls back to a full
+    # second rather than spinning without a delay.
+    sleep "$interval" 2>/dev/null || sleep 1
   done
   wait "$pid" 2>/dev/null || true
   [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true

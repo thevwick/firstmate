@@ -168,8 +168,14 @@ run_bootstrap_timeout_case() {
   (
     # shellcheck disable=SC2317,SC2329 # Exported and invoked by the bootstrap subprocess.
     sleep() {
-      local inc=${1:-1}
-      SECONDS=$((SECONDS + inc))
+      local inc=${1:-1} total whole
+      # The bounded runner polls sub-second before settling into one-second
+      # ticks, so fractions have to accumulate rather than truncate to zero,
+      # which would leave the simulated clock frozen and the timeout unreachable.
+      total=$(awk -v c="${FM_FAKE_SLEEP_CARRY:-0}" -v i="$inc" 'BEGIN { printf "%.4f", c + i }')
+      whole=${total%%.*}
+      FM_FAKE_SLEEP_CARRY=$(awk -v t="$total" -v w="$whole" 'BEGIN { printf "%.4f", t - w }')
+      [ "$whole" -eq 0 ] || SECONDS=$((SECONDS + whole))
       # Advance fake time quickly, but yield on every tick so the background
       # fleet-sync process can deterministically write its partial output before
       # the simulated timeout kills it, even on a busy full-suite runner.

@@ -396,6 +396,37 @@ test_sweep_preserves_a_quoted_ssh_program_path() {
   pass "fm-upstream-sync: the sweep preserves a quoted ssh program path"
 }
 
+# GitHub's "Sync fork" button and a concurrent --push from another machine both
+# land origin on a DESCENDANT of the commit this run tried to push. The fork
+# already carries everything the push would have delivered, so there is nothing
+# for a human to reconcile and STUCK would be a false alarm on the exact workflow
+# this feature supports.
+test_origin_moved_ahead_is_current_not_stuck() {
+  local c out rc
+  c=$(new_case push-origin-ahead)
+  advance_upstream "$c" 2
+  # Advances the fork past the pushed commit and then rejects, which is what a
+  # push losing the race against another sync looks like from this side.
+  cat > "$c/fork.git/hooks/pre-receive" <<EOF
+#!/usr/bin/env bash
+unset GIT_QUARANTINE_PATH GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+git fetch -q "$c/upstream.git" main
+up=\$(git rev-parse FETCH_HEAD)
+ahead=\$(git commit-tree "\$up^{tree}" -p "\$up" -m "synced elsewhere")
+git update-ref refs/heads/main "\$ahead"
+exit 1
+EOF
+  chmod +x "$c/fork.git/hooks/pre-receive"
+
+  out=$(run_sync "$c" --push) && rc=0 || rc=$?
+  assert_contains "$out" "firstmate: current" \
+    "a fork already advanced past the pushed commit has nothing to reconcile"
+  assert_not_contains "$out" "STUCK" \
+    "origin moving to a descendant is not a divergence"
+  [ "${rc:-1}" -eq 0 ] || fail "an already-advanced fork must not exit as a failure"
+  pass "fm-upstream-sync: origin moved ahead reports current, not STUCK"
+}
+
 test_push_is_idempotent() {
   local c out
   c=$(new_case push-idem)
@@ -569,6 +600,7 @@ test_unauthorized_push_is_a_credentials_skip_not_stuck
 test_inert_install_never_evaluates_ssh_command
 test_push_exits_nonzero_when_a_remote_cannot_be_reached
 test_sweep_preserves_a_quoted_ssh_program_path
+test_origin_moved_ahead_is_current_not_stuck
 test_push_is_idempotent
 test_sweep_prepends_batchmode_ahead_of_operator_options
 test_manual_run_stays_interactive_and_shows_git_errors

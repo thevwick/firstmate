@@ -24,9 +24,12 @@
 #             behind. No branch is moved and nothing is pushed. This is what the
 #             session-start sweep runs, and a routine sweep must never mutate a
 #             branch nobody asked it to move.
-#   --push    fast-forward the FORK by pushing the upstream commit to origin,
-#             then fast-forward the local default branch to match. Refuses on a
-#             diverged fork. Run this when the report says the fork is behind.
+#   --push    fast-forward the FORK by pushing the upstream commit to origin. On
+#             a run that actually advanced the fork it then tries to bring the
+#             local default branch along; a run that found the fork already level
+#             with upstream reports current and moves nothing, because the
+#             ordinary local pull belongs to /updatefirstmate, not here.
+#             Refuses on a diverged fork. Run this when the report says behind.
 #             This is an outward-facing write to a shared default branch, so it
 #             is a human-invoked command, never something an agent or a sweep
 #             runs on its own.
@@ -66,6 +69,12 @@
 # no longer a fast-forward are STUCK. Refs that cannot be read at all are the one
 # genuinely ambiguous case, and that is reported loudly rather than downgraded.
 #
+# One more ref shape is benign: origin may have moved to a DESCENDANT of the
+# commit we tried to push, which is what GitHub's "Sync fork" button and a
+# concurrent --push on another machine both produce. The fork already contains
+# everything the push carried, so there is nothing for a human to reconcile and
+# an immediate re-run would say current. That reports as current, not as STUCK.
+#
 # Exit status, so a scripted caller can tell a refusal from a success without
 # parsing the output:
 #   report-only  always 0. It was asked to say what it found and it did, whether
@@ -92,7 +101,7 @@ PUSH=no
 SWEEP=no
 
 usage() {
-  sed -n '2,79p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,88p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -282,6 +291,13 @@ if ! out=$(git -C "$FM_ROOT" push origin "$UPSTREAM_REV:refs/heads/$DEFAULT" 2>&
     NEW_ORIGIN_REV=$(git -C "$FM_ROOT" rev-parse --verify --quiet "$ORIGIN_REF^{commit}" || true)
     if [ -z "$NEW_ORIGIN_REV" ]; then
       echo "$LABEL: STUCK: cannot read $ORIGIN_REF after origin refused the push - needs attention, see the error below"
+    elif git -C "$FM_ROOT" merge-base --is-ancestor "$UPSTREAM_REV" "$NEW_ORIGIN_REV"; then
+      # Origin already contains the commit we tried to push, so someone else got
+      # there first - GitHub's "Sync fork" button, or a --push from another
+      # machine. The fork is at or past where this run wanted it; there is
+      # nothing to reconcile, so this is the goal reached, not a divergence.
+      echo "$LABEL: current: $ORIGIN_REF already contains $UPSTREAM_REF; the fork was advanced elsewhere"
+      exit 0
     elif ! git -C "$FM_ROOT" merge-base --is-ancestor "$NEW_ORIGIN_REV" "$UPSTREAM_REV"; then
       echo "$LABEL: STUCK: origin/$DEFAULT moved and no longer fast-forwards to $UPSTREAM_REF - needs attention, reconcile it by hand"
     else
