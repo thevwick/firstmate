@@ -152,10 +152,16 @@ run_destroy() {
 # per slot as "<n>  <state>  <path>", optionally followed by indented process
 # lines for an in-use slot; those continuation lines have no state token in
 # field 2 and are skipped. The upgrade banner and any blank lines are ignored.
+# The path is taken as everything after the state token rather than as field 3,
+# so a pool path containing spaces is not silently truncated into a DIFFERENT,
+# possibly existing path that would then be handed to destroy.
 parse_status() {
   awk '
-    /^[0-9]+[[:space:]]+(available|dirty|in-use)[[:space:]]+/ {
-      printf "%s\t%s\n", $2, $3
+    match($0, /^[0-9]+[[:space:]]+(available|dirty|in-use)[[:space:]]+/) {
+      state = $2
+      path = substr($0, RSTART + RLENGTH)
+      sub(/[[:space:]]+$/, "", path)
+      if (path != "") printf "%s\t%s\n", state, path
     }
   '
 }

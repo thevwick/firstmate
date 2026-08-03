@@ -274,6 +274,30 @@ test_in_use_continuation_lines_are_not_parsed_as_slots() {
   pass "in-use process continuation lines are not parsed as pool slots"
 }
 
+test_paths_with_spaces_are_not_truncated() {
+  set_floor 0
+  # Regression: parsing the path as awk field 3 truncated "~/.treehouse/my
+  # demo/3/demo" to "~/.treehouse/my" and handed THAT to destroy - a different,
+  # possibly existing path. The path must survive whole or not be targeted.
+  cat > "$STATUS_STUB" <<'SH'
+#!/usr/bin/env bash
+printf '1     available    ~/.treehouse/my demo/1/demo\n'
+printf '2     available    ~/.treehouse/my demo/2/demo\n'
+SH
+  chmod +x "$STATUS_STUB"
+  run_reap >/dev/null
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      *"/my demo/"*) : ;;
+      *) fail "a pool path containing spaces was truncated before destroy: '$line'" ;;
+    esac
+  done < "$DESTROY_LOG"
+  [ "$(grep -c '^--yes ' "$DESTROY_LOG")" -eq 2 ] \
+    || fail "both space-containing slots should be reaped, got: $(cat "$DESTROY_LOG")"
+  pass "pool paths containing spaces are passed to destroy intact"
+}
+
 test_dry_run_destroys_nothing() {
   set_floor 0
   write_status_stub "$STATUS_STUB" 1:available 2:available
@@ -392,6 +416,7 @@ test_dirty_and_in_use_slots_are_never_targeted
 test_dirty_slots_are_surfaced_with_paths
 test_dirty_slots_surface_even_when_nothing_is_reaped
 test_in_use_continuation_lines_are_not_parsed_as_slots
+test_paths_with_spaces_are_not_truncated
 test_dry_run_destroys_nothing
 test_status_failure_is_non_fatal
 test_unparseable_status_is_non_fatal
