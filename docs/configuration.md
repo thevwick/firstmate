@@ -107,6 +107,25 @@ An absent file means `auto`, i.e. default-on on macOS: the alarm exists precisel
 A missing or failing channel logs and falls through to the next, never crashing the daemon.
 See [`wedge-alarm.md`](wedge-alarm.md) for the channel reference and macOS verification evidence, and [`examples/wedge-alarm`](examples/wedge-alarm) for a copyable config.
 
+## Idle worktree reaping (config/worktree-reap)
+
+`bin/fm-teardown.sh` returns a task worktree to its treehouse pool instead of deleting it, so a pool grows to the high-water mark of concurrent crews and never shrinks.
+A returned slot keeps its full checkout, `node_modules`, and build artifacts, which on a mobile project runs 5.5-6 GiB per slot.
+Teardown therefore ends by calling `bin/fm-worktree-reap.sh <project>`, which reaps idle slots above a floor.
+
+`config/worktree-reap` (local, gitignored) holds the floor on its first non-empty, non-comment line.
+An absent file means the default floor of `2`, `off` (any case) disables reaping entirely, and a non-negative integer sets the floor explicitly.
+An unparseable value is reported once and falls back to the default rather than disabling housekeeping or reaping the pool to zero.
+
+The floor exists because keeping slots pre-warmed is the point of the pool: re-cloning a large project costs several GiB and minutes.
+`treehouse prune` has no floor and reclaims every disposable slot at once, so the reaper drives per-slot `treehouse destroy` under its own floor instead.
+It never passes any `--include-*` flag, so treehouse's own refusal to remove a dirty, unlanded, in-use, or leased worktree always stands.
+Only slots that `treehouse status` reports `available` are candidates, highest-numbered first.
+
+A slot holding uncommitted changes is never reaped and would otherwise sit invisible, holding both disk and un-rescued work, so the reaper reports each such slot and its path on every run and never auto-commits or auto-rescues it.
+Reaping is best-effort housekeeping: every failure path exits `0` with one report line, so it can never fail a teardown, block a spawn, or abort a session start.
+See the script header for exact mechanics and the `FM_TREEHOUSE_STATUS_CMD`/`FM_TREEHOUSE_DESTROY_CMD` test seams.
+
 ## Gate defaults (.no-mistakes.yaml)
 
 The tracked `.no-mistakes.yaml` keeps test evidence outside the repo and defines `commands.test` so no-mistakes runs firstmate's bash behavior suite directly.

@@ -1140,5 +1140,13 @@ rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.meta" "$STATE/$ID.
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi
+# Reap idle pool slots above the configured floor. The worktree was RETURNED to
+# the pool above, not removed, so this is the moment a slot becomes idle and the
+# pool can be trimmed back. Best-effort housekeeping only: fm-worktree-reap.sh
+# always exits 0, and `|| true` keeps even an exec failure from failing teardown.
+# Skipped for a secondmate, whose home is a leased slot removed by its own path.
+if [ "$KIND" != secondmate ]; then
+  "$FM_ROOT/bin/fm-worktree-reap.sh" "$PROJ" || true
+fi
 echo "teardown $ID complete (window $T, worktree $WT)"
 backlog_refresh_reminder

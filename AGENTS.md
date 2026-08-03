@@ -70,6 +70,7 @@ config/backlog-backend  backlog backend override; LOCAL, gitignored; absent or "
 config/backend  runtime session-provider backend override for new tasks; LOCAL, gitignored; absent = falls through to runtime auto-detection (the runtime firstmate itself is executing inside), then tmux; tmux is the verified reference backend (docs/tmux-backend.md), while herdr, zellij, orca, and cmux are experimental spawn backends (docs/herdr-backend.md, docs/zellij-backend.md, docs/orca-backend.md, docs/cmux-backend.md) - herdr and cmux can also be selected by runtime auto-detection, zellij and orca never are (always explicit), and codex-app is not accepted; see docs/codex-app-backend.md; not inherited into secondmate homes
 config/herdr-workspace-label  optional per-home herdr workspace label for a PRIMARY home; LOCAL, gitignored; first non-empty line overrides the constant "firstmate" so several primary homes on one machine keep their task tabs in separate herdr workspaces; absent or empty = "firstmate" byte-for-byte, secondmate homes ignore it (their 2ndmate-<id> labels are already unique), whitespace/colon/reserved-"2ndmate-*" values are rejected with a warning; per-home, not inherited (docs/herdr-backend.md "Label derivation")
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
+config/worktree-reap  idle pool-slot reaping floor; LOCAL, gitignored; absent = keep 2 idle slots per project pool and reap the excess at teardown, "off" = never reap, "<n>" = keep n; see bin/fm-worktree-reap.sh (section 7)
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
 data/                personal fleet records; LOCAL, gitignored as a whole
@@ -294,6 +295,7 @@ Tear down a ship task only after landing is confirmed.
 A teardown refusal for uncommitted or unlanded work is a stop-and-investigate result, never an obstacle to bypass.
 Never force teardown without explicit discard authority.
 After successful teardown, record completion, retain only the configured recent Done history, and re-evaluate queued work whose blockers and time gates have cleared.
+Teardown returns the worktree to its pool rather than deleting it, so it then reaps idle pool slots above a per-project floor through `bin/fm-worktree-reap.sh`; that reaping is best-effort housekeeping that never fails a teardown, never touches a slot holding uncommitted or unlanded work, and reports any such slot instead.
 
 A secondmate is persistent and an empty queue is healthy.
 Retire one only on an explicit captain or main-firstmate decision, after loading `secondmate-provisioning`; its home must contain no work under way, and forced discard still requires explicit captain authority.
