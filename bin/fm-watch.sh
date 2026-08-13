@@ -195,6 +195,14 @@ window_kind() {
   echo unknown
 }
 
+# window_no_pane_watch: 1 when the task's meta opts out of pane-staleness capture.
+window_no_pane_watch() {
+  local w=$1 meta
+  meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null || true)
+  [ -n "$meta" ] || { echo 0; return 0; }
+  grep -q '^no_pane_watch=1' "$meta" && echo 1 || echo 0
+}
+
 # window_backend: the backend recorded in the meta whose window= matches <w>.
 # A matching meta with an absent backend= means tmux (the P1 compatibility
 # contract). A METALESS window (no matching meta) falls through to the honest
@@ -490,6 +498,10 @@ EOF
     # A secondmate idling on its own watcher is healthy. Its parent supervises
     # it through status writes and heartbeats, not pane-idle staleness.
     [ "$(window_kind "$w")" = secondmate ] && continue
+    # A crewmate the captain is talking to directly opts out the same way: the pane
+    # capture below scrolls the pane it reads, which is disruptive mid-conversation, and
+    # its idleness is visible to him anyway. Set no_pane_watch=1 in the task's meta.
+    [ "$(window_no_pane_watch "$w")" = 1 ] && continue
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
     key=$(printf '%s' "$w" | tr ':/.' '___')
