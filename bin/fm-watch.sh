@@ -195,12 +195,16 @@ window_kind() {
   echo unknown
 }
 
-# window_no_pane_watch: 1 when the task's meta opts out of pane-staleness capture.
+# window_no_pane_watch: 1 when this window's pane must not be captured.
+#
+# DEFAULT ON. The capture SCROLLS the pane it reads, and the captain works in these panes
+# directly - a jumping view mid-conversation is worse than losing wedge detection on an
+# agent he is looking at. Set pane_watch=1 in a task's meta to opt back in.
 window_no_pane_watch() {
   local w=$1 meta
   meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null || true)
-  [ -n "$meta" ] || { echo 0; return 0; }
-  grep -q '^no_pane_watch=1' "$meta" && echo 1 || echo 0
+  [ -n "$meta" ] || { echo 1; return 0; }
+  grep -q '^pane_watch=1' "$meta" && echo 0 || echo 1
 }
 
 # window_backend: the backend recorded in the meta whose window= matches <w>.
