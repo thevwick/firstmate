@@ -50,23 +50,30 @@ function is_comment_line(line, lang,   t) {
   return 0
 }
 
-# TODO/FIXME/HACK/XXX/NOTE and prose naming an ordering constraint, an invariant,
-# a sparse-index condition, or a non-obvious API contract. Load-bearing: these
-# are reported KEEP and never MUST GO, per the standard.
+# Deliberately NARROW: KEEP bypasses the budget, so a bare common word never
+# qualifies - it counts only inside a phrase stating an actual constraint.
 function is_marker(text,   t) {
-  if (text ~ /(TODO|FIXME|HACK|XXX|NOTE|WARNING|CAUTION|SAFETY|IMPORTANT)/) return 1
+  if (text ~ /(^|[^A-Za-z])(TODO|FIXME|HACK|XXX|NOTE|WARNING|CAUTION|SAFETY|IMPORTANT)([^A-Za-z]|$)/) return 1
+  # Caps BEFORE/AFTER/ORDER are an author shouting about sequencing.
+  if (text ~ /(^|[^A-Za-z])(BEFORE|AFTER|ORDER|MUST|NEVER|ALWAYS)([^A-Za-z]|$)/) return 1
   t = tolower(text)
-  # Ordering and sequencing.
-  if (t ~ /order|ordering|sequenc|before |after |precede|follow|first |last |already |until |once /) return 1
-  # Invariants and safety conditions. "only safe to X once Y" reads as prose, not
-  # as an ordering keyword, so match the safe/must/never family directly.
-  if (t ~ /invariant|idempotent|must |must not|never |always |assumes|assumption|only safe|safe to|guarantee/) return 1
-  if (t ~ /sparse (index|gsi)|gsi[0-9]|partial index/) return 1
-  if (t ~ /(api|contract|upstream|library|sdk|undocumented|quirk|bug in |workaround|verified|pending confirmation)/) return 1
-  if (t ~ /race|deadlock|thread|atomic|lock/) return 1
+  # Explicit ordering constraints, not the words "before"/"after" alone.
+  if (t ~ /do not reorder|don't reorder|order matters|ordering matters|keep this order|in this order/) return 1
+  if (t ~ /must (run|come|happen|be called|be set|be written|be drained|precede|follow)/) return 1
+  if (t ~ /must (be|stay|remain) (before|after|first|last)/) return 1
+  if (t ~ /(before|after) (the|this|any|it|that|every) [a-z]+ (is|are|has|have|runs|lands|writes)/) return 1
+  if (t ~ /only safe (to|once|after)|not safe (to|until)|safe to (remove|delete|drop) (once|after)/) return 1
+  # Invariants and concurrency hazards.
+  if (t ~ /invariant|idempoten|must not|never (call|mutate|reorder|remove|delete|assume)/) return 1
+  if (t ~ /race condition|data race|deadlock|livelock|atomic(ally)?|thread-safe|not thread/) return 1
+  # Storage and index conditions.
+  if (t ~ /sparse (index|gsi)|gsi[0-9]|partial index|covering index|index only/) return 1
+  # Non-obvious external contracts, named as such.
+  if (t ~ /api contract|wire format|upstream bug|bug in [a-z]|workaround for|undocumented|quirk/) return 1
+  if (t ~ /eslint-disable|ts-ignore|ts-expect-error|shellcheck disable|noqa|pragma/) return 1
   # A discriminator between two paths that look alike is load-bearing: losing it
   # is how a retry gets mistaken for an edit.
-  if (t ~ /rather than|instead of|not the |distinguish|discriminat|tells? an? .* from|otherwise/) return 1
+  if (t ~ /tells? (an?|the) [a-z]+ from|distinguish(es)? (an?|the)|discriminat/) return 1
   return 0
 }
 

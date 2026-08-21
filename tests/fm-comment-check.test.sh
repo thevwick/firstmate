@@ -143,6 +143,71 @@ contains "TODO is in the KEEP tier" "TODO" "$OUT"
 contains "ordering constraint is in the KEEP tier" "must be drained before" "$OUT"
 rm -rf "$R"
 
+# --- KEEP must never mask an over-budget non-marker block -------------------
+
+# Prose using first/after/always with no marker token must still be MUST GO.
+
+R=$(newrepo)
+cat > "$R/a.ts" <<'EOF'
+export const x = 1;
+
+// The first line of this paragraph explains the
+// design at length, and after that it keeps going
+// with more prose that is always just narrative
+// and carries nothing a reader could not deduce.
+export function f() { return 2; }
+EOF
+git -C "$R" add -A && git -C "$R" commit -qm prose
+OUT=$("$CHECK" --repo "$R" --base HEAD~1 2>&1); RC=$?
+check "prose with first/after/always exits non-zero" 1 "$RC"
+contains "prose with common words is MUST GO" "MUST GO (1)" "$OUT"
+lacks "prose with common words is not KEEP" "KEEP (" "$OUT"
+rm -rf "$R"
+
+# Bare common words must not reach KEEP on their own, one word at a time.
+for word in order before after first last already until once must never always "safe to" otherwise; do
+  R=$(newrepo)
+  {
+    echo 'export const x = 1;'
+    echo
+    echo "// a four line paragraph of ordinary narrative prose"
+    echo "// that happens to contain the word $word somewhere in"
+    echo "// it, while stating no constraint of any kind at all,"
+    echo "// and so must be charged against the comment budget."
+    echo 'export function f() { return 2; }'
+  } > "$R/a.ts"
+  git -C "$R" add -A && git -C "$R" commit -qm "word-$word"
+  OUT=$("$CHECK" --repo "$R" --base HEAD~1 2>&1); RC=$?
+  check "bare word '$word' does not earn KEEP" 1 "$RC"
+  rm -rf "$R"
+done
+
+# Genuine constraint phrasing still earns KEEP even over budget.
+R=$(newrepo)
+cat > "$R/a.ts" <<'EOF'
+export const x = 1;
+
+// An edit saves as a new row in the same series, so the row it
+// replaces is only safe to remove once the replacement has landed.
+// A failure here leaves the superseded row hidden behind the new
+// one rather than failing the save the worker just made.
+export const y = 2;
+
+// The queue must be drained before the activity row is written,
+// or the GSI7 sparse index misses the record entirely.
+export const z = 3;
+
+// Do not reorder: the attachment upload must come before the photo
+// record is written, or the record points at nothing.
+export const w = 4;
+EOF
+git -C "$R" add -A && git -C "$R" commit -qm constraints
+OUT=$("$CHECK" --repo "$R" --base HEAD~1 2>&1); RC=$?
+check "genuine constraints exit 0 even over budget" 0 "$RC"
+contains "all three constraints are KEEP" "KEEP (3)" "$OUT"
+lacks "no constraint is MUST GO" "MUST GO" "$OUT"
+rm -rf "$R"
+
 # --- JUSTIFY: every other added comment ------------------------------------
 
 R=$(newrepo)
