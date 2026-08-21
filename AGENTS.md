@@ -144,6 +144,8 @@ A lock-refused session must not spawn, steer, merge, drain the wake queue, repai
 Bootstrap detects first, asks for consent, and installs only after the captain approves in the current session.
 Do not dispatch until the required tools are present and GitHub authentication is good.
 Use `gh-axi` for GitHub, `chrome-devtools-axi` for browser work, and `lavish-axi` for structured decisions or reports; consult current help rather than memorizing flags.
+Raw `gh` is not a general substitute for `gh-axi`: one `gh pr view` returned 22,653 bytes against `gh-axi`'s 916.
+The single exception is a line-level inline PR review comment, which goes through `bin/fm-pr-inline-comment.sh`, because `gh-axi api --method POST --input` silently returns `[]` and posts nothing.
 A silent bootstrap section needs no action; for any printed actionable diagnostic line, load `bootstrap-diagnostics` and follow its owner procedure.
 `BOOTSTRAP_INFO:` lines are completed no-action facts and do not require loading a skill.
 `secondmate-provisioning` owns startup secondmate sync, liveness, and inherited local-material convergence.

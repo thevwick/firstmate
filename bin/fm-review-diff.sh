@@ -152,6 +152,15 @@ if git -C "$WT" diff --quiet "$BASE...$COMPARE_REF" --; then
 fi
 
 git -C "$WT" diff --stat "$BASE...$COMPARE_REF" --
+
+# Comment-standard backstop ahead of the diff, so an over-budget block is named
+# before the full diff scrolls it out of view. Advisory here: review continues
+# whatever the audit finds.
+if [ -x "$FM_ROOT/bin/fm-comment-check.sh" ]; then
+  echo
+  "$FM_ROOT/bin/fm-comment-check.sh" --repo "$WT" --base "$BASE" --head "$COMPARE_REF" || true
+fi
+
 if ! "$STAT_ONLY"; then
   echo
   git -C "$WT" diff "$BASE...$COMPARE_REF" --

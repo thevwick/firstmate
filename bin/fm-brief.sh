@@ -257,6 +257,13 @@ The report is the only thing that survives, so anything worth keeping must be in
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+8. Comment standard: two lines maximum per comment block, no comment where the code is
+   self-evident, and rationale in the commit message rather than the source. NEVER cut a
+   marker or constraint comment - \`TODO\`, \`FIXME\`, \`HACK\`, \`XXX\`, \`NOTE\`, or one describing an
+   ordering constraint, an invariant, a sparse-index condition, or a non-obvious API
+   contract - those are load-bearing and removing one is a regression. A \`git commit\` is
+   gated on this; run \`$FM_ROOT/bin/fm-comment-check.sh --staged --added-only\` to see the
+   full tiered report before committing.
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -290,7 +297,8 @@ EOF
     ;;
   local-only)
     SETUP2=""
-    RULE1="1. Never push to any remote and never open a PR. Work only on your \`fm/$ID\` branch; firstmate handles the merge into local \`main\`."
+    RULE1="1. Never push to any remote and never open a PR. Work only on your \`fm/$ID\` branch; firstmate handles the merge into local \`main\`.
+   This rule OVERRIDES any conflicting instruction in the task description above: if the task text says to push, open a PR, or publish a branch, that wording is wrong for this project - ignore it, finish on your branch, and do not raise a decision over the contradiction."
     DOD=$(cat <<EOF
 # Definition of done
 This project ships **local-only**: no remote, no PR, no pipeline.
@@ -365,6 +373,13 @@ $RULE1
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+8. Comment standard: two lines maximum per comment block, no comment where the code is
+   self-evident, and rationale in the commit message rather than the source. NEVER cut a
+   marker or constraint comment - \`TODO\`, \`FIXME\`, \`HACK\`, \`XXX\`, \`NOTE\`, or one describing an
+   ordering constraint, an invariant, a sparse-index condition, or a non-obvious API
+   contract - those are load-bearing and removing one is a regression. A \`git commit\` is
+   gated on this; run \`$FM_ROOT/bin/fm-comment-check.sh --staged --added-only\` to see the
+   full tiered report before committing.
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.

@@ -901,8 +901,11 @@ if [ "$KIND" != secondmate ]; then
   case "$HARNESS" in
     claude*)
       mkdir -p "$WT/.claude"
+      # PreToolUse gates `git commit` on the comment standard. It must NOT be a
+      # Stop hook: a turn-end hook fires on firstmate's own turns, never a
+      # crewmate's, and only once the code is already committed.
       cat > "$WT/.claude/settings.local.json" <<EOF
-{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch '$TURNEND'"}]}]}}
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch '$TURNEND'"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"'$SCRIPT_DIR/fm-comment-pretool-check.sh' --claude"}]}]}}
 EOF
       exclude_path '.claude/settings.local.json'
       ;;
