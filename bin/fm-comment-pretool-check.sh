@@ -77,9 +77,8 @@ fi
 [ -n "$CMD" ] || exit 0
 [ -n "$REPO" ] || REPO=$PWD
 
-# Transport-level prefilter: only a command that can still contain `git commit`
-# after the cheap byte strip is worth running the checker for. Stripping these
-# non-alphanumeric bytes can never destroy an existing `git commit`.
+# Prefilter only; stripping these bytes can never destroy a real `git commit`,
+# so a command that still cannot contain one is safe to fast-allow.
 PREFILTER=$CMD
 PREFILTER=${PREFILTER//\\/}
 PREFILTER=${PREFILTER//\"/}

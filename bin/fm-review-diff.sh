@@ -153,9 +153,8 @@ fi
 
 git -C "$WT" diff --stat "$BASE...$COMPARE_REF" --
 
-# Comment-standard backstop ahead of the diff, so an over-budget block is named
-# before the full diff scrolls it out of view. Advisory here: review continues
-# whatever the audit finds.
+# Named ahead of the diff so it is not scrolled away. Advisory: review
+# continues whatever the audit finds.
 if [ -x "$FM_ROOT/bin/fm-comment-check.sh" ]; then
   echo
   "$FM_ROOT/bin/fm-comment-check.sh" --repo "$WT" --base "$BASE" --head "$COMPARE_REF" || true

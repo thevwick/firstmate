@@ -14,9 +14,10 @@
 #
 # Blocks are measured as the file READS, by walking up and down from each added
 # line, so a stack of individually-legal pieces that assemble into an essay is
-# still caught. A file's header/licence block is exempt, identified from the file
-# itself (a -U0 diff carries no context lines, so diff position cannot identify
-# a header). Every touched file is scanned whole, not only its changed lines.
+# still caught. Only a GENUINE licence/copyright or shebang-adjacent header is
+# exempt, judged by content from the file itself - position alone would let any
+# essay bypass the budget by sitting at line 1 of a new file.
+# Every touched file is scanned whole, not only its changed lines.
 #
 # Exit status: non-zero when MUST GO is non-empty, zero otherwise.
 #
@@ -159,10 +160,8 @@ if [ ! -s "$TMP/files" ]; then
   exit 0
 fi
 
-# Head- and base-side content for every touched file, so blocks are measured as
-# the file reads and a comment already on the base is recognized as pre-existing.
-# Extracted in bulk: a per-file `git show` costs two subprocesses per file and
-# does not finish on a large branch (951 files).
+# Extracted in bulk: a per-file `git show` costs two subprocesses each and does
+# not finish on a large branch (951 files).
 mkdir -p "$TMP/head" "$TMP/base"
 if [ "$STAGED" -eq 1 ]; then
   git -C "$REPO" checkout-index --prefix="$TMP/head/" -a 2>/dev/null || true

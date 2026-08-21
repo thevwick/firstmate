@@ -47,6 +47,18 @@ newrepo() {
   printf '%s' "$d"
 }
 
+HASH_BANNER=$(printf '%s\n%s\n%s\n%s' \
+  '# a four line banner of ordinary descriptive text' \
+  '# that runs past the two-line budget and states' \
+  '# nothing load-bearing, used to check whether the' \
+  '# header exemption applies to this file or not')
+
+hookcall() {
+  local repo=$1 cmd=$2
+  printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s"}' "$cmd" "$repo" \
+    | "$HOOK" --claude 2>&1
+}
+
 # --- basic contract ---------------------------------------------------------
 
 for s in "$CHECK" "$HOOK" "$INLINE"; do
@@ -78,9 +90,8 @@ contains "essay block names file:line" "a.ts:3" "$OUT"
 rm -rf "$R"
 
 # --- the assemble-an-essay case --------------------------------------------
-# Two separately-added, individually-legal 2-line pieces form one 4-line block
-# in the file. Measuring diff hunks alone would pass both; measuring the block
-# as the file reads must flag it.
+
+# Two legal 2-line pieces form one 4-line block; per-hunk measurement misses it.
 
 R=$(newrepo)
 cat > "$R/a.ts" <<'EOF'
@@ -102,9 +113,8 @@ export function f() { return 2; }
 EOF
 git -C "$R" add -A && git -C "$R" commit -qm piece2
 
-# The second commit adds only two comment lines, so a hunk-only auditor sees a
-# legal 2-line addition. Measuring the block as the FILE reads must instead
-# charge the whole assembled 4-line block, from either base.
+# The second commit adds only 2 comment lines, so a hunk-only auditor passes it;
+# measuring as the file reads must charge the whole 4-line block, from any base.
 OUT=$(git -C "$R" diff -U0 HEAD~1 HEAD -- | grep -c '^+.*//')
 check "second commit adds only 2 comment lines" 2 "$OUT"
 
@@ -244,6 +254,95 @@ check "a new file's header block exits 0" 0 "$RC"
 lacks "header block is not MUST GO" "MUST GO" "$OUT"
 rm -rf "$R"
 
+# --- the header exemption must not become a bypass -------------------------
+# Position alone must not exempt a block. A new file's line 1 is exactly where
+# an essay gets written, so exempting any top-of-file comment let the gate be
+# bypassed by moving the essay upwards.
+
+R=$(newrepo)
+cat > "$R/b.ts" <<'EOF'
+// This paragraph of ordinary narrative prose sits
+// at the very top of a brand new file, where it is
+// the natural place to write it, and it carries
+// nothing a reader could not deduce from the code.
+export const y = 2;
+EOF
+git -C "$R" add -A
+OUT=$("$CHECK" --repo "$R" --staged --added-only 2>&1); RC=$?
+check "essay at line 1 of a new staged file exits non-zero" 1 "$RC"
+contains "essay at line 1 is MUST GO" "MUST GO (1)" "$OUT"
+contains "essay at line 1 is named at b.ts:1" "b.ts:1" "$OUT"
+
+# The enforcement path the gate actually runs.
+OUT=$(hookcall "$R" "git commit -m wip"); RC=$?
+check "pretool hook blocks a line-1 essay in a new file" 2 "$RC"
+contains "hook deny names b.ts:1" "b.ts:1" "$OUT"
+
+# The identical block lower in the file must behave the same way.
+cat > "$R/b.ts" <<'EOF'
+export const z = 0;
+
+// This paragraph of ordinary narrative prose sits
+// at the very top of a brand new file, where it is
+// the natural place to write it, and it carries
+// nothing a reader could not deduce from the code.
+export const y = 2;
+EOF
+git -C "$R" add -A
+OUT=$("$CHECK" --repo "$R" --staged --added-only 2>&1); RC=$?
+check "same block at line 3 exits non-zero too" 1 "$RC"
+rm -rf "$R"
+
+# A genuine licence/copyright header stays exempt.
+R=$(newrepo)
+cat > "$R/lic.ts" <<'EOF'
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Example Pty Ltd. All rights reserved.
+// Licensed under the Apache License, Version 2.0; you may not
+// use this file except in compliance with the License.
+export const y = 2;
+EOF
+git -C "$R" add -A
+OUT=$("$CHECK" --repo "$R" --staged --added-only 2>&1); RC=$?
+check "an SPDX/copyright licence header stays exempt" 0 "$RC"
+lacks "licence header is not MUST GO" "MUST GO" "$OUT"
+OUT=$(hookcall "$R" "git commit -m wip"); RC=$?
+check "pretool hook allows a licence header" 0 "$RC"
+rm -rf "$R"
+
+# A script banner directly under a shebang stays exempt (firstmate's own style).
+R=$(newrepo)
+{ echo '#!/usr/bin/env bash'
+  printf '%s\n' "$HASH_BANNER"
+  echo 'echo hi'; } > "$R/s2.sh"
+git -C "$R" add -A
+OUT=$("$CHECK" --repo "$R" --staged --added-only 2>&1); RC=$?
+check "a shebang-adjacent script banner stays exempt" 0 "$RC"
+rm -rf "$R"
+
+# ... but a shebang-less file gets no such pass for plain prose.
+R=$(newrepo)
+{ printf '%s\n' "$HASH_BANNER"
+  echo 'echo hi'; } > "$R/p2.sh"
+git -C "$R" add -A
+OUT=$("$CHECK" --repo "$R" --staged --added-only 2>&1); RC=$?
+check "prose at line 1 with no shebang is MUST GO" 1 "$RC"
+rm -rf "$R"
+
+# A dash in prose must not fake a "file.ext - purpose" banner.
+R=$(newrepo)
+cat > "$R/d.ts" <<'EOF'
+// wallet - this is not really a file banner but a
+// paragraph of narrative prose that keeps going on
+// for four lines with nothing load-bearing in it
+// at all, so the budget must still be enforced.
+export const y = 2;
+EOF
+git -C "$R" add -A
+OUT=$("$CHECK" --repo "$R" --staged --added-only 2>&1); RC=$?
+check "a dash in prose does not fake a file banner" 1 "$RC"
+rm -rf "$R"
+
 # --- pre-existing comments are filtered out --------------------------------
 
 R=$(newrepo)
@@ -286,12 +385,6 @@ contains "python essay flagged" "p.py:" "$OUT"
 rm -rf "$R"
 
 # --- the PreToolUse commit gate -------------------------------------------
-
-hookcall() {
-  local repo=$1 cmd=$2
-  printf '{"tool_name":"Bash","tool_input":{"command":"%s"},"cwd":"%s"}' "$cmd" "$repo" \
-    | "$HOOK" --claude 2>&1
-}
 
 R=$(newrepo)
 cat > "$R/a.ts" <<'EOF'
