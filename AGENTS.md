@@ -322,6 +322,8 @@ At the start of every wake-handling turn, drain the durable wake queue before pe
 Session start is the only exception because its one-shot digest already drained while locked or deliberately left the queue untouched in lock-refused read-only mode.
 A status line is a wake event, not current state; use `bin/fm-crew-state.sh` when current state matters, especially before re-escalating an old decision, blocker, or pause.
 A declared `paused:` event means a bounded external wait expected to clear on its own, while `blocked:` means firstmate action is needed.
+Pane staleness is suppressed for two deliberate cases only: a `kind=secondmate` endpoint, and a task explicitly marked as awaiting a dependency outside the fleet through `bin/fm-await-external.sh`.
+That marker suppresses nothing but the pane-staleness wake, so a status write or any other genuine signal from a marked task still wakes supervision; set it only for a real external wait, clear it as soon as the wait ends, and read it from the structured fleet view so a marked task is never mistaken for a healthy working one.
 
 Handle actionable wakes as follows:
 

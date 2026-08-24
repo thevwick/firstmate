@@ -1118,6 +1118,173 @@ test_afk_paused_changed_pane_hands_off_plain_stale() {
   pass "AFK changed paused panes hand off plain stale identities for daemon-owned pause triage"
 }
 
+
+# --- awaiting-external exemption (bin/fm-await-external.sh) ------------------
+# A task deliberately marked as awaiting an external dependency has no useful
+# pane state: a harness footer that redraws while the agent idles moves the
+# captured bytes, so every poll hashes differently and the plain stale path would
+# surface a brand-new stale event forever. These tests drive that exact churn.
+
+# Rewrite <capture-file> with a tail that differs on every call, reproducing the
+# redrawing-footer failure mode (a spinner, an update notice, an agent counter).
+churn_capture() {  # <capture-file> <nonce>
+  printf 'crew idle at its prompt\n%s esc to nothing · %s agents\n' "$2" "$2" > "$1"
+}
+
+test_awaiting_external_stale_suppressed_while_pane_churns() {
+  local dir state fakebin out capture_file statusf window key i pid
+  dir=$(make_case awaiting-external-churn); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/awaiting.status"
+  window="test:fm-awaiting"
+  churn_capture "$capture_file" start
+  printf 'window=%s\nkind=scout\nawaiting_external=Bitrise build + on-device test\n' "$window" \
+    > "$state/awaiting.meta"
+  # A `blocked:` last line is the real live case: it is captain-relevant, so
+  # without the marker this pane takes the terminal-stale path and re-surfaces.
+  printf 'blocked: needs a Bitrise build and an on-device test\n' > "$statusf"
+  printf '%s' "$(seen_sig "$statusf")" > "$state/.seen-awaiting_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "$(cat "$capture_file")")" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  # Churn the captured tail under the running watcher, so each poll sees new bytes.
+  i=0
+  while [ "$i" -lt 6 ]; do
+    churn_capture "$capture_file" "nonce$i"
+    sleep 0.4
+    i=$((i + 1))
+  done
+  if ! wait_live "$pid" 10; then
+    reap "$pid"; fail "watcher surfaced a stale wake for an awaiting-external task: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "awaiting-external task printed a wake reason: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "awaiting-external task enqueued a stale wake"; }
+  [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "awaiting-external task started a wedge timer"; }
+  [ ! -e "$state/.wedge-escalations-$key" ] || { reap "$pid"; fail "awaiting-external task recorded a wedge escalation"; }
+  reap "$pid"
+  grep -F "awaiting external" "$state/.watch-triage.log" >/dev/null \
+    || fail "the awaiting-external skip was not recorded in the triage log"
+  pass "an awaiting-external task produces no stale wake even while its pane tail churns every poll"
+}
+
+# The exemption must be narrow: only the pane-hash stale path is suppressed, so a
+# genuine signal from the SAME marked task still wakes supervision normally.
+test_awaiting_external_still_wakes_on_status_write() {
+  local dir state fakebin out drain_out capture_file statusf window pid
+  dir=$(make_case awaiting-external-signal); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
+  statusf="$state/awaiting-signal.status"; window="test:fm-awaiting-signal"
+  churn_capture "$capture_file" start
+  printf 'window=%s\nkind=scout\nawaiting_external=Bitrise build\n' "$window" \
+    > "$state/awaiting-signal.meta"
+  printf 'blocked: waiting on the build\n' > "$statusf"
+  printf '%s' "$(seen_sig "$statusf")" > "$state/.seen-awaiting-signal_status"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  sleep 1
+  printf 'done: the build came back green\n' >> "$statusf"
+  wait_for_exit "$pid" 60 || fail "a status write from an awaiting-external task did not wake supervision"
+  grep -F "signal:" "$out" >/dev/null || fail "the status write did not surface as a signal wake: $(cat "$out")"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null \
+    || fail "drain after an awaiting-external status write failed"
+  grep -F "signal:" "$drain_out" >/dev/null || fail "the status write was not queued durably"
+  pass "an awaiting-external task still wakes supervision on a status write"
+}
+
+# The unparked path must be untouched: the same churning pane WITHOUT the marker
+# still surfaces, which is what proves the exemption is doing the work.
+test_unmarked_churning_pane_still_surfaces_stale() {
+  local dir state fakebin out capture_file statusf window key pid
+  dir=$(make_case awaiting-external-control); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/unmarked.status"
+  window="test:fm-unmarked"
+  printf 'crew idle at its prompt\nsteady tail\n' > "$capture_file"
+  printf 'window=%s\nkind=scout\n' "$window" > "$state/unmarked.meta"
+  printf 'blocked: needs a Bitrise build and an on-device test\n' > "$statusf"
+  printf '%s' "$(seen_sig "$statusf")" > "$state/.seen-unmarked_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "$(cat "$capture_file")")" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake default'
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { unset FM_FAKE_CREW_STATE; fail "an unmarked stale pane did not surface"; }
+  grep -F "stale: $window" "$out" >/dev/null \
+    || { unset FM_FAKE_CREW_STATE; fail "unmarked stale pane did not print a stale wake: $(cat "$out")"; }
+  unset FM_FAKE_CREW_STATE
+  pass "an unmarked task's stale behaviour is unchanged - the same pane still surfaces"
+}
+
+# Clearing the marker must restore full supervision, and must not hand the pane an
+# inherited wedge timer from the period it was exempt.
+test_awaiting_external_cleared_restores_stale_wakes() {
+  local dir state fakebin out capture_file statusf window key pid
+  dir=$(make_case awaiting-external-cleared); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/cleared.status"
+  window="test:fm-cleared"
+  printf 'crew idle at its prompt\nsteady tail\n' > "$capture_file"
+  printf 'window=%s\nkind=scout\nawaiting_external=Bitrise build\n' "$window" > "$state/cleared.meta"
+  printf 'blocked: waiting on the build\n' > "$statusf"
+  printf '%s' "$(seen_sig "$statusf")" > "$state/.seen-cleared_status"
+  FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-await-external.sh" status cleared \
+    | grep -F "awaiting-external: Bitrise build" >/dev/null \
+    || fail "the marked task did not report awaiting-external"
+  FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-await-external.sh" clear cleared >/dev/null \
+    || fail "clearing the awaiting-external marker failed"
+  FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-await-external.sh" status cleared \
+    | grep -F "supervised" >/dev/null || fail "the cleared task did not report supervised"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "$(cat "$capture_file")")" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake default'
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { unset FM_FAKE_CREW_STATE; fail "a cleared task did not resume stale wakes"; }
+  grep -F "stale: $window" "$out" >/dev/null \
+    || { unset FM_FAKE_CREW_STATE; fail "cleared task did not print a stale wake: $(cat "$out")"; }
+  unset FM_FAKE_CREW_STATE
+  pass "clearing the awaiting-external marker restores normal stale wakes"
+}
+
+# kind=secondmate suppression is a separate carve-out and must keep working: a
+# paused secondmate still re-surfaces on its own cadence with the new field present.
+test_awaiting_external_leaves_secondmate_carveout_intact() {
+  local dir state fakebin out capture_file statusf window key pid
+  dir=$(make_case awaiting-external-secondmate); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/sm.status"
+  window="test:fm-sm"
+  printf 'secondmate idle at its prompt\n' > "$capture_file"
+  printf 'window=%s\nkind=secondmate\n' "$window" > "$state/sm.meta"
+  printf 'paused: awaiting an upstream landing\n' > "$statusf"
+  # Backdate the status past the re-surface window so the paused secondmate is due
+  # for its bounded recheck, then prime .seen-* so the signal scan does not pre-empt it.
+  touch -t 200001010000 "$statusf"
+  printf '%s' "$(seen_sig "$statusf")" > "$state/.seen-sm_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  printf '%s' "$(hash_text "$(cat "$capture_file")")" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · paused: awaiting an upstream landing'
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 60 || { unset FM_FAKE_CREW_STATE; fail "a paused secondmate did not re-surface on its cadence"; }
+  grep -F "declared pause" "$out" >/dev/null \
+    || { unset FM_FAKE_CREW_STATE; fail "paused secondmate did not re-surface as a declared pause: $(cat "$out")"; }
+  unset FM_FAKE_CREW_STATE
+  pass "the kind=secondmate carve-out and declared-pause cadence still work alongside the new marker"
+}
+
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
@@ -1146,6 +1313,11 @@ test_nonterminal_paused_rechecks_authoritative_state
 test_paused_authoritative_working_preserves_wedge_timer
 test_nonterminal_stale_repairs_missing_or_corrupt_timer
 test_triage_log_size_cap_accepts_spaced_wc_counts
+test_awaiting_external_stale_suppressed_while_pane_churns
+test_awaiting_external_still_wakes_on_status_write
+test_unmarked_churning_pane_still_surfaces_stale
+test_awaiting_external_cleared_restores_stale_wakes
+test_awaiting_external_leaves_secondmate_carveout_intact
 test_heartbeat_no_change_absorbed
 test_heartbeat_backstop_surfaces_unsurfaced_status
 test_beacon_stays_fresh_while_absorbing
