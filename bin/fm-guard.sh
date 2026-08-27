@@ -60,6 +60,39 @@ if [ -n "$tangle_branch" ]; then
   } >&2
 fi
 
+# A crewmate left standing after it reported done keeps tripping stale detection
+# on every watcher poll, so the noise reads as a wedge when the work is finished.
+# Teardown reliably loses to whatever the captain asks next, so surface it here
+# rather than trusting it to be remembered.
+if [ "$READ_ONLY" -ne 1 ]; then
+  done_ids=()
+  for meta in "$STATE"/*.meta; do
+    [ -e "$meta" ] || continue
+    id="$(basename "$meta" .meta)"
+    # Only crewmates firstmate spawned itself; cpt-* are the captain's to retire.
+    case "$id" in fm-*) ;; *) continue ;; esac
+    status_file="$STATE/$id.status"
+    [ -s "$status_file" ] || continue
+    if tail -n 1 "$status_file" 2>/dev/null | grep -Eq '^[[:space:]]*done:'; then
+      done_ids+=("$id")
+    fi
+  done
+  if [ "${#done_ids[@]}" -gt 0 ]; then
+    drule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+    {
+      printf '●%s\n' "$drule"
+      printf '●  FINISHED CREW STILL STANDING - TEAR DOWN NOW\n'
+      printf '●  %s crew reported done and still holds a worktree; it will keep waking you as stale.\n' "${#done_ids[@]}"
+      for id in "${done_ids[@]}"; do
+        printf '●      bin/fm-teardown.sh %s\n' "$id"
+      done
+      printf '●  Do this in THIS turn, before relaying findings or taking the next request.\n'
+      printf '●  Reports under data/<id>/ survive teardown; teardown refuses if work is unlanded.\n'
+      printf '●%s\n' "$drule"
+    } >&2
+  fi
+fi
+
 # Compute in-flight count and watcher-beacon freshness via the shared
 # grace-based predicate (bin/fm-supervision-lib.sh). Only act with tasks in
 # flight; count them so the banner can say how much is riding on an absent
