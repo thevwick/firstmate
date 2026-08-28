@@ -51,6 +51,8 @@ problems=0
 # code that already says it is the shape the captain rejects.
 printf '%s\n' "$diff" | awk -v max="$MAX_RUN" '
   /^\+\+\+ b\// { file=substr($0,7); run=0; start=0; next }
+  # Bare block delimiters carry no prose, so counting them would fail a two-line JSDoc.
+  /^\+[[:space:]]*(\/\*\*?|\*\/)[[:space:]]*$/ { next }
   /^\+[[:space:]]*(\/\/|\*|\/\*)/ {
     run++; if (run==1) first=$0
     next
