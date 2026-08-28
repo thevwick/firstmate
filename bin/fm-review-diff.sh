@@ -134,6 +134,14 @@ if git -C "$WT" diff --quiet "$BASE...$COMPARE_REF" --; then
 fi
 
 git -C "$WT" diff --stat "$BASE...$COMPARE_REF" --
+
+# Comment bloat reads as ordinary diff noise, so reviewing for correctness misses it and it
+# reaches the PR. Reported against the same base the review uses, before the diff itself.
+if [ -x "$SCRIPT_DIR/fm-comment-check.sh" ]; then
+  echo
+  ( cd "$WT" && "$SCRIPT_DIR/fm-comment-check.sh" "$BASE" "$COMPARE_REF" ) || true
+fi
+
 if ! "$STAT_ONLY"; then
   echo
   git -C "$WT" diff "$BASE...$COMPARE_REF" --

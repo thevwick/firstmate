@@ -233,6 +233,10 @@ The report is the only thing that survives, so anything worth keeping must be in
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
+7. Comments: two lines maximum, and none where the code is self-evident. Explain WHY,
+   never what the line already says. Rationale, background and alternatives belong in the
+   commit message, not above the code. Before you report done, run
+   \`$FM_ROOT/bin/fm-comment-check.sh <base-ref>\` in the worktree and trim until it passes.
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -332,6 +336,10 @@ $RULE1
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions, ask-user findings),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
+7. Comments: two lines maximum, and none where the code is self-evident. Explain WHY,
+   never what the line already says. Rationale, background and alternatives belong in the
+   commit message, not above the code. Before you report done, run
+   \`$FM_ROOT/bin/fm-comment-check.sh <base-ref>\` in the worktree and trim until it passes.
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
