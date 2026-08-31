@@ -19,6 +19,13 @@ set -uo pipefail
 MAX_RUN=${FM_COMMENT_MAX_RUN:-2}          # longest allowed consecutive comment run
 MAX_RATIO=${FM_COMMENT_MAX_RATIO:-15}     # percent of added lines that may be comments
 
+# Reasoning notes are the failure the length thresholds miss: a two-line comment
+# explaining WHY the code is the way it is passes both checks and still violates
+# the rule. These phrasings are how an AI narrates its thinking - they describe
+# the author's reasoning, the history, or the bug, none of which belong above a
+# line of code. Tuned to flag prose, not the rare genuine hazard warning.
+REASONING_RE=${FM_COMMENT_REASONING_RE:-'(so its mere|proves nothing|which is why|the reason|rationale|note that|we (need|want|must|deliberately|intentionally)|this (is|was) (because|why)|turns out|it seems|apparently|for backwards|historically|used to|previously|originally|would (otherwise|reproduce)|falls back to|in other words|that is why|explains why|keep in mind|remember that|be aware|worth noting|as (a|an) (result|aside)|avoid(s|ed)? .* because|prevents .* from|ensures? that)'}
+
 usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 [ $# -ge 1 ] || usage
@@ -71,6 +78,19 @@ if [ -s /tmp/fm-comment-runs.$$ ]; then
 fi
 rm -f /tmp/fm-comment-runs.$$
 
+# Reasoning notes: the check the length thresholds cannot make. A comment that
+# explains the author's thinking is out regardless of how short it is.
+reasoning=$(printf '%s\n' "$diff" \
+  | grep -E '^\+[[:space:]]*(//|\*|#)' \
+  | grep -inE "$REASONING_RE" \
+  | head -20 || true)
+
+if [ -n "$reasoning" ]; then
+  echo "comment-check: comments that explain reasoning rather than warn of a hazard"
+  printf '%s\n' "$reasoning" | sed 's/^/  /'
+  problems=1
+fi
+
 if [ "$ratio" -gt "$MAX_RATIO" ]; then
   echo "comment-check: $comments of $added added lines are comments (${ratio}%, over ${MAX_RATIO}%)"
   problems=1
@@ -83,7 +103,15 @@ fi
 
 cat <<'EOF'
 
-The rule: two lines maximum, none where the code is self-evident. Rationale
-belongs in the commit message, not above the line. Trim before pushing.
+The rule: two lines maximum, and none where the code is self-evident.
+
+The test that matters is not length. Ask why the comment exists: if it is there
+because you were reasoning about the problem and wrote the thought down, cut it -
+that belongs in the commit message. Keep a comment only when it warns of a hazard
+a reader cannot see from the code: a non-obvious ordering constraint, a platform
+quirk, a deliberate deviation that looks like a mistake.
+
+A well-named function or variable removes the need for most comments. Reach for
+the name first.
 EOF
 exit 1
