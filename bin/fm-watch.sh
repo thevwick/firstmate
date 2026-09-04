@@ -31,6 +31,13 @@
 #                          wake payload itself, not just repetition, forces a
 #                          closer look instead of another routine supervision
 #                          resume. Unless afk is active.
+#                          A task explicitly marked as awaiting an external
+#                          dependency (bin/fm-await-external.sh) is skipped here
+#                          entirely: its pane carries no usable signal because the
+#                          harness footer redraws while the agent idles, so every
+#                          poll would hash differently and surface anew. Only this
+#                          pane-hash path is suppressed; the task's status, check,
+#                          and heartbeat wakes are unaffected.
 #   check: <script>: <out> authenticated check output, always actionable
 #   check: rejected unauthenticated state checks: <paths>
 #                          unsafe state checks were refused without execution
@@ -209,6 +216,16 @@ window_kind() {
     return 0
   fi
   echo unknown
+}
+
+# window_awaits_external: 0 iff this task carries a deliberate awaiting_external=
+# marker (bin/fm-await-external.sh). Suppresses ONLY the pane-hash stale path
+# below; every other wake source for the task is untouched.
+window_awaits_external() {
+  local w=$1 meta
+  meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null || true)
+  [ -n "$meta" ] || return 1
+  [ -n "$(fm_meta_get "$meta" awaiting_external)" ]
 }
 
 # window_backend: the backend recorded in the meta whose window= matches <w>.
@@ -853,6 +870,12 @@ EOF
       clear_pause_tracking "$w"
     fi
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
+      continue
+    fi
+    # Skip BEFORE the capture, leaving .hash-* frozen, so clearing the marker
+    # starts a fresh comparison instead of inheriting a stale escalation.
+    if window_awaits_external "$w"; then
+      triage_log "skipped stale (awaiting external, deliberately marked): $w"
       continue
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue

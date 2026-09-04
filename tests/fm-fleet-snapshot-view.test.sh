@@ -392,6 +392,31 @@ test_view_renders_snapshot() {
   pass "fleet view renders the snapshot without secondmate peek guidance"
 }
 
+test_view_renders_awaiting_external_task() {
+  local home fakebin view json
+  home=$(make_home awaiting-external)
+  write_fixture "$home"
+  # Mark one fixture task as deliberately waiting on a dependency outside the fleet.
+  FM_STATE_OVERRIDE="$home/state" "$ROOT/bin/fm-await-external.sh" \
+    set ship-task "Bitrise build + on-device test" >/dev/null \
+    || fail "could not mark the fixture task as awaiting external"
+  fakebin=$(make_fakebin "$home")
+  json=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$VIEW" --json)
+  assert_contains "$(printf '%s' "$json" | jq -r '.tasks[] | select(.id == "ship-task") | .awaiting_external')" \
+    "Bitrise build + on-device test" "snapshot should expose the awaiting_external reason"
+  assert_contains "$(printf '%s' "$json" | jq -r '.tasks[] | select(.id == "scout-task") | .awaiting_external')" \
+    "null" "an unmarked task should report a null awaiting_external"
+  view=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$VIEW")
+  assert_contains "$view" "| ship-task | awaiting-external / Bitrise build + on-device test | ship |" \
+    "view should render the awaiting-external state and reason in the Current column"
+  FM_STATE_OVERRIDE="$home/state" "$ROOT/bin/fm-await-external.sh" clear ship-task >/dev/null \
+    || fail "could not clear the awaiting-external marker"
+  view=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$VIEW")
+  assert_not_contains "$view" "| ship-task | awaiting-external" \
+    "a cleared task must no longer render as awaiting-external"
+  pass "fleet view surfaces an awaiting-external task and returns to normal once cleared"
+}
+
 test_view_renders_dead_secondmate_agent_status() {
   local home fakebin view
   home=$(make_home dead-secondmate)
@@ -598,4 +623,5 @@ test_parked_scout_decision_stays_pending
 test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
+test_view_renders_awaiting_external_task
 test_view_renders_dead_secondmate_agent_status

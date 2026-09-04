@@ -22,6 +22,8 @@
 #     state, source, detail, and raw line separately.
 #     model and effort are the meta fields recorded by fm-spawn.sh, empty
 #     string when the task ran on the harness/effort default.
+#     awaiting_external is the deliberate external-wait reason recorded by
+#     bin/fm-await-external.sh, null when the task is normally supervised.
 #     paths.status_log.last_event is historical wake-event data only, never
 #     current state.
 #     hints.open_decisions is the keyed open-decision set returned by
@@ -394,6 +396,7 @@ backlog_json() {  # [<backlog-path>] - defaults to this home's $BACKLOG
 
 task_json_lines() {
   local meta id kind harness model effort mode yolo project worktree home projects backend target status_log report_path
+  local awaiting_external
   local pr pr_source event_json current_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json
   local last_event_raw current_state current_source pending_decision blocked_event report_present=0 pr_from_status
   local open_decisions_tsv open_decisions_json
@@ -408,6 +411,7 @@ task_json_lines() {
     effort=$(meta_value "$meta" effort)
     mode=$(meta_value "$meta" mode)
     yolo=$(meta_value "$meta" yolo)
+    awaiting_external=$(meta_value "$meta" awaiting_external)
     project=$(meta_value "$meta" project)
     worktree=$(meta_value "$meta" worktree)
     home=$(meta_value "$meta" home)
@@ -492,6 +496,7 @@ task_json_lines() {
       --arg effort "$effort" \
       --arg mode "$mode" \
       --arg yolo "$yolo" \
+      --arg awaiting_external "$awaiting_external" \
       --arg project "$project" \
       --arg worktree "$worktree" \
       --arg home "$home" \
@@ -522,6 +527,7 @@ task_json_lines() {
         effort:($effort // ""),
         mode:($mode // ""),
         yolo:($yolo // ""),
+        awaiting_external:($awaiting_external | if . == "" then null else . end),
         project:($project // ""),
         backend:$backend,
         paths:{
