@@ -220,6 +220,18 @@ This is a SCOUT task: the deliverable is a written report, not a PR.
 The worktree is your laboratory - install, run, edit, and make scratch commits freely; all of it is discarded at teardown.
 The report is the only thing that survives, so anything worth keeping must be in it.
 
+# Loading work onto a device or simulator (React Native)
+Default to NOT building. A native build is only needed when native code actually changed
+(ios/, android/, a new native dependency, a Podfile or gradle change). A JS/TS-only change
+- including a different branch of a shared JS library - needs no build and no install.
+To show JS-only work on a device that already has the app: start Metro from your worktree
+on a spare port (\`pnpm start -- --reset-cache --client-logs --port <port>\`), then have the
+tester shake the device or press \`d\`, open the bundler-target menu and point it at your port.
+Report the exact bundler URL. A fresh \`pnpm install\` in a worktree costs ~2GB and many minutes;
+node_modules is per-worktree and hoisted (node-linker=hoisted), so it is NOT shared or
+hardlinked between worktrees. Never run one to "be safe".
+Metro holds 1.5-2GB per server: run one, and kill it the moment you are done.
+
 # Rules
 1. Never push to any remote and never open a PR.
 2. Stay inside this worktree; the only files you may write outside it are the report and the status file below.
@@ -321,6 +333,18 @@ The path check is authoritative: \`git rev-parse --git-dir\` and \`git rev-parse
 If the top-level path is the primary checkout or not the worktree you were launched in, STOP - do not branch or commit here - append \`blocked: launched in primary checkout, not an isolated worktree\` to the status file and stop.
 
 1. First action: create your branch: \`git checkout -b fm/$ID\`$SETUP2
+
+# Loading work onto a device or simulator (React Native)
+Default to NOT building. A native build is only needed when native code actually changed
+(ios/, android/, a new native dependency, a Podfile or gradle change). A JS/TS-only change
+- including a different branch of a shared JS library - needs no build and no install.
+To show JS-only work on a device that already has the app: start Metro from your worktree
+on a spare port (\`pnpm start -- --reset-cache --client-logs --port <port>\`), then have the
+tester shake the device or press \`d\`, open the bundler-target menu and point it at your port.
+Report the exact bundler URL. A fresh \`pnpm install\` in a worktree costs ~2GB and many minutes;
+node_modules is per-worktree and hoisted (node-linker=hoisted), so it is NOT shared or
+hardlinked between worktrees. Never run one to "be safe".
+Metro holds 1.5-2GB per server: run one, and kill it the moment you are done.
 
 # Rules
 $RULE1
