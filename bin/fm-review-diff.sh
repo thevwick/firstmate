@@ -124,6 +124,17 @@ else
   BASE="$DEFAULT"
 fi
 
+# A stacked branch forked from something other than the default: diffing against the
+# default counts the parent branch's work as this crew's, inflating the diff and
+# misreporting its comments. Prefer the recorded upstream when it is not the default.
+UPSTREAM=$(git -C "$WT" rev-parse --abbrev-ref --symbolic-full-name "$BRANCH@{upstream}" 2>/dev/null || true)
+if [ -n "$UPSTREAM" ] && [ "$UPSTREAM" != "$BASE" ] && [ "$UPSTREAM" != "origin/$DEFAULT" ]; then
+  git -C "$WT" fetch origin "+refs/heads/${UPSTREAM#origin/}:refs/remotes/$UPSTREAM" --quiet 2>/dev/null || true
+  if git -C "$WT" rev-parse --verify --quiet "$UPSTREAM^{commit}" >/dev/null; then
+    BASE="$UPSTREAM"
+  fi
+fi
+
 git -C "$WT" rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || { echo "error: base $BASE does not exist in $WT" >&2; exit 1; }
 git -C "$WT" rev-parse --verify --quiet "$COMPARE_REF^{commit}" >/dev/null || { echo "error: compare ref $COMPARE_REF does not resolve in $WT" >&2; exit 1; }
 
@@ -139,7 +150,14 @@ git -C "$WT" diff --stat "$BASE...$COMPARE_REF" --
 # reaches the PR. Reported against the same base the review uses, before the diff itself.
 if [ -x "$SCRIPT_DIR/fm-comment-check.sh" ]; then
   echo
-  ( cd "$WT" && "$SCRIPT_DIR/fm-comment-check.sh" "$BASE" "$COMPARE_REF" ) || true
+  if ! ( cd "$WT" && "$SCRIPT_DIR/fm-comment-check.sh" "$BASE" "$COMPARE_REF" ); then
+    # The counter only counts. Judging which comments earn their place is a call
+    # firstmate has got wrong repeatedly on its own recall, so a reviewer crewmate
+    # makes it and firstmate blocks on the verdict.
+    if [ -x "$SCRIPT_DIR/fm-comment-review.sh" ]; then
+      "$SCRIPT_DIR/fm-comment-review.sh" "$WT" "$BASE" "$COMPARE_REF" "$(basename "$WT")" || true
+    fi
+  fi
 fi
 
 if ! "$STAT_ONLY"; then
