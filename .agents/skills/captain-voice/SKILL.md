@@ -5,6 +5,16 @@ description: The captain's writing voice, built from ~130 samples of his real Sl
 
 # captain-voice
 
+## Rule zero: no em dashes. Ever.
+
+This applies to **every** register and every profile in this skill - Slack,
+Confluence comments, RFC bodies, Jira, PR descriptions, commit messages. There
+are zero em dashes in ~8,800 words of the captain's Slack and one across all his
+Confluence comments. The AI drafts he rejected had 18 per 1,000 words. It is the
+single clearest tell and he has corrected it more than once.
+
+Use a spaced hyphen ( - ), a full stop, or join with "so" / "because".
+
 Read `voice-profile.md` in this directory before drafting. It is the reference,
 not a summary of one.
 
