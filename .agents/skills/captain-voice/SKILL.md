@@ -15,8 +15,22 @@ single clearest tell and he has corrected it more than once.
 
 Use a spaced hyphen ( - ), a full stop, or join with "so" / "because".
 
-Read `voice-profile.md` in this directory before drafting. It is the reference,
-not a summary of one.
+## Two profiles
+
+- **`voice-profile.md`** - Slack, Confluence comments, Jira. Use for review
+  replies, ticket comments, messages.
+- **`rfc-profile.md`** - RFC and decision-log **bodies**. Built from 25 RFCs
+  with a trust grading: his hand-written pages outrank the agent-co-written
+  ones.
+
+A reply to an RFC review comment is a **Confluence comment**, not RFC body.
+
+Read the right one in full before drafting. They are the reference, not a
+summary of one.
+
+**The strongest RFC marker:** he writes "we" 17.6 times per 1,000 words. The
+agent-drafted RFC scored 0.8. If a draft proposal has no "we" as its subject,
+it is not in his voice yet.
 
 ## When this applies
 
