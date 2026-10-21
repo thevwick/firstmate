@@ -508,10 +508,39 @@ cleanup_stale_lock_for_safety_check() {
 # (the owning process may be exiting), then - only if the lock is provably
 # stale - remove it and retry once more. A lock that is not provably stale is
 # left untouched and the original failure is surfaced to the caller.
+# teardown_clear_build_trees: delete the regenerable trees inside a worktree
+# whose treehouse lease has just been returned. `treehouse return` frees the
+# SLOT but leaves every file on disk, so without this each finished task leaves
+# gigabytes of node_modules and build output behind. Twenty such slots had
+# accumulated before this existed, and a crew blocked on 2.1GB free.
+# Only ever called after a successful return, and only on paths a fresh install
+# rebuilds. Never touches source, git state, or anything outside the worktree.
+teardown_clear_build_trees() {
+  local dir=$1 label=$2 before after freed junk
+
+  [ -n "$dir" ] || return 0
+  [ -d "$dir" ] || return 0
+  case "$dir" in
+    "$HOME"|/|/*/) return 0 ;;
+  esac
+
+  before=$(du -sk "$dir" 2>/dev/null | cut -f1) || before=0
+
+  for junk in node_modules ios/Pods ios/build android/build android/app/build .gradle common/temp; do
+    [ -e "$dir/$junk" ] && rm -rf "${dir:?}/${junk:?}"
+  done
+
+  after=$(du -sk "$dir" 2>/dev/null | cut -f1) || after=0
+  freed=$(( (before - after) / 1024 ))
+  [ "$freed" -gt 0 ] && echo "teardown: cleared ${freed}MB of build output from $label" >&2
+  return 0
+}
+
 teardown_treehouse_return() {
   local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=${4:-} lock
 
   if ( cd "$cd_dir" && treehouse return --force "$dir" ); then
+    teardown_clear_build_trees "$dir" "$label"
     return 0
   fi
 
@@ -525,6 +554,7 @@ teardown_treehouse_return() {
 
   if ( cd "$cd_dir" && treehouse return --force "$dir" ); then
     echo "teardown: $label return succeeded on retry; lock cleared on its own" >&2
+    teardown_clear_build_trees "$dir" "$label"
     return 0
   fi
 
@@ -540,6 +570,7 @@ teardown_treehouse_return() {
       fi
       if ( cd "$cd_dir" && treehouse return --force "$dir" ); then
         echo "teardown: $label return succeeded after stale-lock cleanup" >&2
+        teardown_clear_build_trees "$dir" "$label"
         return 0
       fi
       echo "teardown: $label return still failing after stale-lock cleanup" >&2
