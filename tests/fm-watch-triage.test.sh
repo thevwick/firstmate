@@ -377,7 +377,7 @@ test_terminal_stale_surfaced() {
   window="test:fm-done"
   printf 'finished, awaiting review' > "$capture_file"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/done.meta"
-  printf 'done: PR https://example.test/pr/3\n' > "$state/done.status"
+  printf 'failed: pipeline gave up\n' > "$state/done.status"
   sig=$(seen_sig "$state/done.status"); printf '%s' "$sig" > "$state/.seen-done_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "finished, awaiting review")
@@ -391,6 +391,43 @@ test_terminal_stale_surfaced() {
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the terminal stale failed"
   grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "terminal stale was not queued"
   pass "a stale pane sitting on a terminal status is surfaced (queue + exit)"
+}
+
+# --- stale pane parked on blocked:/done: is skipped; the done: signal still surfaces ---
+
+test_parked_stale_skipped_and_done_signal_surfaces() {
+  local dir state fakebin out drain_out capture_file window key status pid
+  window="test:fm-parked"; key=$(printf '%s' "$window" | tr ':/.' '___')
+  for status in 'done: PR https://example.test/pr/3' 'blocked: needs creds'; do
+    dir=$(make_case "parked-stale-${status%%:*}"); state="$dir/state"; fakebin="$dir/fakebin"
+    out="$dir/watch.out"; capture_file="$dir/pane.txt"
+    printf 'idle footer 1' > "$capture_file"
+    printf 'window=%s\nkind=ship\n' "$window" > "$state/parked.meta"
+    printf '%s\n' "$status" > "$state/parked.status"
+    printf '%s' "$(seen_sig "$state/parked.status")" > "$state/.seen-parked_status"
+    printf '%s' "$(hash_text "idle footer 0")" > "$state/.hash-$key"
+    printf '1\n' > "$state/.count-$key"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+    pid=$!
+    if ! wait_live "$pid" 30; then
+      reap "$pid"; fail "watcher surfaced a stale wake for a window parked on '${status%%:*}:': $(cat "$out")"
+    fi
+    [ ! -s "$state/.wake-queue" ] || fail "parked '${status%%:*}:' window enqueued a stale wake"
+    reap "$pid"
+  done
+
+  dir=$(make_case parked-done-signal); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/parked.meta"
+  printf 'working: x\ndone: PR https://example.test/pr/3\n' > "$state/parked.status"
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not surface a fresh done: signal"
+  grep -F "signal: $state/parked.status" "$out" >/dev/null || fail "fresh done: signal was not printed"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the done: signal failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "parked.status" >/dev/null || fail "done: signal was not queued"
+  pass "stale scan skips windows parked on done:/blocked:, while a fresh done: still surfaces as a signal"
 }
 
 # --- stale pane, STALE terminal status overridden by an active run: absorbed ---
@@ -413,7 +450,7 @@ test_stale_terminal_status_overridden_by_active_run() {
   # The crew reported done BEFORE firstmate triggered no-mistakes validation;
   # this line never gets superseded by a newer status-log entry while the
   # pipeline itself runs.
-  printf 'done: implementation complete, ready to validate\n' > "$state/validating.status"
+  printf 'failed: first attempt, revalidating\n' > "$state/validating.status"
   sig=$(seen_sig "$state/validating.status"); printf '%s' "$sig" > "$state/.seen-validating_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "no-mistakes axi run: validating...")
@@ -1132,6 +1169,7 @@ test_turn_ended_not_working_surfaced
 test_working_note_not_working_surfaced
 test_actionable_signal_surfaced
 test_terminal_stale_surfaced
+test_parked_stale_skipped_and_done_signal_surfaces
 test_stale_terminal_status_overridden_by_active_run
 test_nonterminal_stale_provably_working_absorbed_then_escalated
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
