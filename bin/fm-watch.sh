@@ -211,6 +211,21 @@ window_kind() {
   echo unknown
 }
 
+# window_is_parked_blocked: 0 when this window's task last reported blocked:.
+# A pane's harness status line keeps ticking while the agent sits idle, so its
+# hash changes every poll and each poll reads as a brand-new stale event. For a
+# task parked on an external dependency that firstmate has already acknowledged
+# as blocked, that is an unactionable wake on a loop; the blocked: status is the
+# durable signal, and a real change there still surfaces as a signal wake.
+window_is_parked_blocked() {
+  local w=$1 meta id
+  meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null || true)
+  [ -n "$meta" ] || return 1
+  id=$(basename "$meta" .meta)
+  [ -s "$STATE/$id.status" ] || return 1
+  tail -n 1 "$STATE/$id.status" 2>/dev/null | grep -Eq '^[[:space:]]*blocked:'
+}
+
 # window_backend: the backend recorded in the meta whose window= matches <w>.
 # A matching meta with an absent backend= means tmux (the P1 compatibility
 # contract). A METALESS window (no matching meta) falls through to the honest
@@ -855,6 +870,9 @@ EOF
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
       continue
     fi
+    # A task parked on an acknowledged blocker re-hashes its idle pane every poll
+    # with nothing new to act on.
+    window_is_parked_blocked "$w" && continue
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
     key=$(printf '%s' "$w" | tr ':/.' '___')
