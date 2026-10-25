@@ -12,7 +12,10 @@
 #      binaries and fixtures as the REFACTORED versions in this checkout, then
 #      diffs the two command logs byte-for-byte - the report's P1 checklist
 #      item "run current main scripts and refactored scripts against the same
-#      fake tools and compare command logs".
+#      fake tools and compare command logs". The teardown old-vs-new case also
+#      overlays a content-historical permissive tmux kill fixture: after the
+#      exact-selector change lands on the default branch, merge-base with main
+#      collapses to HEAD and can no longer supply that baseline.
 #   3. Asserts the `--backend`/`FM_BACKEND` selection refuses unknown backends
 #      and the blocked `codex-app` backend loudly.
 #
@@ -30,10 +33,28 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 fm_git_identity fmtest fmtest@example.invalid
 
-# shellcheck source=bin/fm-backend.sh
+# shellcheck source=/dev/null
 . "$ROOT/bin/fm-backend.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-backend-tests)
+# A claude spawn writes workspace trust into the launching user's own store,
+# and the script resolves it as ${CLAUDE_CONFIG_DIR:-${HOME:-}}, so the value
+# is pinned EMPTY beside the throwaway HOME: an inherited one would beat that
+# HOME and reach the developer's real store, while empty falls through to it
+# and adds no launch prefix, since fm-spawn only prefixes a non-empty value.
+SPAWN_HOME="$TMP_ROOT/user-home"
+mkdir -p "$SPAWN_HOME"
+
+write_spawn_brief() {  # <file> <id>
+  cat > "$1" <<EOF
+# Task
+## Captain's intent
+Exercise backend dispatch for $2.
+
+## Firstmate spec
+Verify backend selection without changing task intent.
+EOF
+}
 
 # fm_backend_detect's cmux fallback (bundle id + process ancestry,
 # docs/cmux-backend.md "Runtime auto-detection") consults uname, lsappinfo,
@@ -80,6 +101,9 @@ SH
 }
 
 # The commit this branch started from - the P1 "current main" baseline.
+# Suitable for byte-identical old-vs-new checks while a branch still diverges
+# from main. After a squash lands, merge-base(HEAD, main) collapses to HEAD, so
+# callers that need a true pre-change fixture must not rely on this alone.
 resolve_base_ref() {
   local ref base
   for ref in main refs/heads/main origin/main refs/remotes/origin/main origin/HEAD refs/remotes/origin/HEAD; do
@@ -92,40 +116,64 @@ resolve_base_ref() {
   done
   return 1
 }
-BASE_REF=$(resolve_base_ref) \
-  || fail "fm-backend baseline requires local main or origin/main; fetch the default branch before running this test"
+BASE_REF=
+
+backend_base_ref() {
+  if [ -z "${BASE_REF:-}" ]; then
+    BASE_REF=$(resolve_base_ref) \
+      || fail "fm-backend baseline requires local main or origin/main; fetch the default branch before running this test"
+  fi
+  printf '%s\n' "$BASE_REF"
+}
+
+# Newest first-parent revision whose bin/backends/tmux.sh still uses the
+# pre-exact permissive kill-window target. Content-addressed from history so the
+# fixture stays historical on default-branch CI and on branches cut after the
+# exact-selector change, where merge-base with main is self-referential.
+resolve_permissive_tmux_kill_ref() {
+  local commit body
+  while IFS= read -r commit; do
+    [ -n "$commit" ] || continue
+    body=$(git -C "$ROOT" show "$commit:bin/backends/tmux.sh" 2>/dev/null) || continue
+    # shellcheck disable=SC2016
+    case "$body" in
+      *'tmux kill-window -t "=$session:=$window"'*) continue ;;
+    esac
+    # shellcheck disable=SC2016
+    case "$body" in
+      *'tmux kill-window -t "$1"'*|*'tmux kill-window -t "$target"'*)
+        printf '%s\n' "$commit"
+        return 0
+        ;;
+    esac
+  done < <(git -C "$ROOT" log --first-parent --format='%H' HEAD -- bin/backends/tmux.sh)
+  return 1
+}
 
 # --- shared: a pre-refactor bin/ shim --------------------------------------
 #
-# build_old_bin echoes a directory whose bin/ subdir holds the PRE-REFACTOR
-# fm-send.sh, fm-peek.sh, fm-watch.sh, fm-spawn.sh, and fm-teardown.sh
-# (extracted from BASE_REF), plus symlinks to every OTHER sibling script those
-# five source - all unchanged by this task, so the real files are exactly
-# what BASE_REF would have used too. FM_ROOT_OVERRIDE pointed at this dir's
-# root makes "$FM_ROOT/bin/fm-project-mode.sh" (etc.) resolve correctly.
-# fm-backend.sh (and its bin/backends/ adapters) is the dispatcher every one
-# of the five REFACTORED scripts sources; it must be a real, reachable file in
-# the old bin/ too or `. "$SCRIPT_DIR/fm-backend.sh"` aborts under set -eu -
-# hence it is a symlinked sibling, not an extracted-from-BASE_REF file: for a
-# tmux-only conformance run the tmux adapter's behavior is what is under test,
-# and that is unchanged by any later (e.g. non-tmux backend) addition to
-# fm-backend.sh's own dispatch surface.
-OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-lock-lib.sh fm-tasks-axi-lib.sh fm-pr-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-marker-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-supervision-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-decision-hold.sh fm-backend.sh"
-OLD_BIN_REFACTORED="fm-send.sh fm-peek.sh fm-watch.sh fm-spawn.sh fm-teardown.sh"
+# build_old_bin echoes a directory whose bin/ subdir is the complete bin/ tree
+# from BASE_REF.
+# Materializing the whole historical tree keeps every entrypoint and sourced
+# sibling on the same revision, while avoiding a hand-maintained dependency
+# list that can omit a newly sourced helper and make the old process abort
+# before it reaches the behavior under test.
+# FM_ROOT_OVERRIDE pointed at this dir's root makes
+# "$FM_ROOT/bin/fm-project-mode.sh" (etc.) resolve correctly.
+# The teardown conformance case applies its explicitly historical tmux adapter
+# after this complete baseline has been materialized.
 
 build_old_bin() {  # <name> -> echoes root dir (root/bin/<script> is the entry point)
-  local name=$1 root bin f
+  local name=$1 root archive base_ref
   root="$TMP_ROOT/$name"
-  bin="$root/bin"
-  mkdir -p "$bin"
-  for f in $OLD_BIN_UNCHANGED_SIBLINGS; do
-    ln -s "$ROOT/bin/$f" "$bin/$f"
-  done
-  ln -s "$ROOT/bin/backends" "$bin/backends"
-  for f in $OLD_BIN_REFACTORED; do
-    git -C "$ROOT" show "$BASE_REF:bin/$f" > "$bin/$f"
-    chmod +x "$bin/$f"
-  done
+  archive="$root/bin.tar"
+  mkdir -p "$root"
+  base_ref=$(backend_base_ref)
+  git -C "$ROOT" archive --format=tar "$base_ref" bin > "$archive" \
+    || fail "old-bin shim: could not archive bin/ from $base_ref"
+  tar -xf "$archive" -C "$root" \
+    || fail "old-bin shim: could not extract bin/ from $base_ref"
+  rm -f "$archive"
   printf '%s\n' "$root"
 }
 
@@ -144,14 +192,14 @@ test_backend_name_precedence() {
   # source time, from FM_CONFIG_OVERRIDE); a later FM_CONFIG_OVERRIDE=... prefix
   # on the function call itself does not re-bind it, so these calls set
   # FM_BACKEND_CONFIG_DIR directly.
-  [ "$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier; PATH="$FAKE_NONDARWIN_BIN:$PATH" FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name)" = tmux ] \
+  [ "$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier PASEO_AGENT_ID; PATH="$FAKE_NONDARWIN_BIN:$PATH" FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name)" = tmux ] \
     || fail "fm_backend_name should default to tmux with no env/config/detection markers"
 
   printf 'tmux\n' > "$cfg/backend"
-  [ "$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID; FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name)" = tmux ] \
+  [ "$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name)" = tmux ] \
     || fail "fm_backend_name should read config/backend"
 
-  [ "$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID; FM_BACKEND=tmux FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name)" = tmux ] \
+  [ "$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; FM_BACKEND=tmux FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name)" = tmux ] \
     || fail "FM_BACKEND env should win over config/backend"
 
   pass "fm_backend_name: FM_BACKEND env > config/backend > default tmux"
@@ -163,41 +211,60 @@ test_backend_name_precedence() {
 # cmux fallback inputs (__CFBundleIdentifier plus a non-Darwin uname fake) -
 # so results never depend on the ambient shell this suite runs inside (a real
 # tmux pane or cmux tab, both normal cases for a captain's session).
+test_backend_detect_t3_explicit_only() (
+  FM_BACKEND_CONFIG_DIR="$TMP_ROOT/t3-detect-config"
+  mkdir -p "$FM_BACKEND_CONFIG_DIR"
+  FM_HOME="$TMP_ROOT/t3-home"
+  mkdir -p "$FM_HOME"
+  unset TMUX HERDR_ENV CMUX_WORKSPACE_ID FM_BACKEND
+  # shellcheck disable=SC2329 # Called by the sourced backend detector.
+  fm_backend_detect_cmux_fallback() { return 1; }
+  if fm_backend_detect; then fail 'T3 must not auto-detect without its bearer'; fi
+  printf 'test-bearer\n' > "$FM_BACKEND_CONFIG_DIR/t3code-token"
+  if fm_backend_detect; then fail 'T3 must not auto-detect with its bearer'; fi
+  printf 't3code\n' > "$FM_BACKEND_CONFIG_DIR/backend"
+  [ "$(fm_backend_name)" = t3code ] || fail 'configured T3 must be selected explicitly'
+  # shellcheck disable=SC2034 # Read by the sourced backend selector.
+  FM_BACKEND=orca
+  [ "$(fm_backend_name)" = orca ] || fail 'explicit Orca remains selectable ahead of T3'
+  pass 'T3 requires explicit backend selection even with a configured server'
+)
+
 test_backend_detect_precedence() {
   local out
 
-  if out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier; PATH="$FAKE_NONDARWIN_BIN:$PATH" fm_backend_detect); then
+  if out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier PASEO_AGENT_ID; PATH="$FAKE_NONDARWIN_BIN:$PATH" fm_backend_detect); then
     fail "fm_backend_detect should return 1 (undetected) with no markers set, got '$out'"
   fi
 
-  out=$(unset TMUX CMUX_WORKSPACE_ID; HERDR_ENV=1 fm_backend_detect) \
+  out=$(unset TMUX CMUX_WORKSPACE_ID PASEO_AGENT_ID; HERDR_ENV=1 fm_backend_detect) \
     || fail "fm_backend_detect should succeed when HERDR_ENV=1"
   [ "$out" = herdr ] || fail "fm_backend_detect should report herdr for HERDR_ENV=1 alone, got '$out'"
 
-  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID; TMUX='fake,1,0' fm_backend_detect) \
+  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; TMUX='fake,1,0' fm_backend_detect) \
     || fail "fm_backend_detect should succeed when \$TMUX is set"
   [ "$out" = tmux ] || fail "fm_backend_detect should report tmux for \$TMUX alone, got '$out'"
 
-  out=$(unset TMUX HERDR_ENV; CMUX_WORKSPACE_ID='fake-uuid' fm_backend_detect) \
+  out=$(unset TMUX HERDR_ENV PASEO_AGENT_ID; CMUX_WORKSPACE_ID='fake-uuid' fm_backend_detect) \
     || fail "fm_backend_detect should succeed when CMUX_WORKSPACE_ID is set"
   [ "$out" = cmux ] || fail "fm_backend_detect should report cmux for CMUX_WORKSPACE_ID alone, got '$out'"
 
   # Nesting: tmux started inside a herdr pane carries BOTH markers. Innermost
   # (tmux) must win, since that is the surface firstmate is actually running on.
-  out=$(unset CMUX_WORKSPACE_ID; TMUX='fake,1,0' HERDR_ENV=1 fm_backend_detect) \
+  out=$(unset CMUX_WORKSPACE_ID PASEO_AGENT_ID; TMUX='fake,1,0' HERDR_ENV=1 fm_backend_detect) \
     || fail "fm_backend_detect should succeed with both markers present"
   [ "$out" = tmux ] || fail "fm_backend_detect should resolve nesting innermost-first (tmux over herdr), got '$out'"
 
   # Nesting: tmux started inside a cmux-provided shell carries BOTH markers.
   # cmux is a terminal application, not a nestable multiplexer, so the
   # innermost multiplexer (tmux) must still win.
-  out=$(unset HERDR_ENV; TMUX='fake,1,0' CMUX_WORKSPACE_ID='fake-uuid' fm_backend_detect) \
+  out=$(unset HERDR_ENV PASEO_AGENT_ID; TMUX='fake,1,0' CMUX_WORKSPACE_ID='fake-uuid' fm_backend_detect) \
     || fail "fm_backend_detect should succeed with tmux and cmux markers present"
   [ "$out" = tmux ] || fail "fm_backend_detect should resolve nesting innermost-first (tmux over cmux), got '$out'"
 
   # Nesting: herdr started inside a cmux-provided shell carries BOTH markers.
   # Same reasoning: herdr (the innermost multiplexer) must win over cmux.
-  out=$(unset TMUX; HERDR_ENV=1 CMUX_WORKSPACE_ID='fake-uuid' fm_backend_detect) \
+  out=$(unset TMUX PASEO_AGENT_ID; HERDR_ENV=1 CMUX_WORKSPACE_ID='fake-uuid' fm_backend_detect) \
     || fail "fm_backend_detect should succeed with herdr and cmux markers present"
   [ "$out" = herdr ] || fail "fm_backend_detect should resolve nesting innermost-first (herdr over cmux), got '$out'"
 
@@ -220,18 +287,18 @@ test_backend_detect_cmux_fallback_bundle_id() {
   dir="$TMP_ROOT/detect-fallback-bundle"; mkdir -p "$dir"
   fb=$(make_cmux_fallback_fakebin "$dir")
 
-  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID; PATH="$fb:$PATH" __CFBundleIdentifier='com.cmuxterm.app' fm_backend_detect) \
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; PATH="$fb:$PATH" __CFBundleIdentifier='com.cmuxterm.app' fm_backend_detect) \
     || fail "fm_backend_detect should fall back to the cmux bundle id when CMUX_WORKSPACE_ID is absent"
   [ "$out" = cmux ] || fail "bundle-id fallback should report cmux, got '$out'"
 
   (
-    unset TMUX HERDR_ENV CMUX_WORKSPACE_ID
+    unset TMUX HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID
     PATH="$fb:$PATH" __CFBundleIdentifier='com.cmuxterm.app' fm_backend_detect >/dev/null || exit 1
     [ "$FM_BACKEND_DETECT_SIGNAL" = bundle-id ] || exit 2
   ) || fail "bundle-id fallback should set FM_BACKEND_DETECT_SIGNAL=bundle-id (subshell exit $?)"
 
   # A foreign bundle id (an ordinary terminal app) must not match.
-  if out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID; PATH="$fb:$PATH" FM_FAKE_PS_TABLE="$dir/no-table" __CFBundleIdentifier='com.apple.Terminal' fm_backend_detect); then
+  if out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; PATH="$fb:$PATH" FM_FAKE_PS_TABLE="$dir/no-table" __CFBundleIdentifier='com.apple.Terminal' fm_backend_detect); then
     fail "a non-cmux __CFBundleIdentifier should not detect cmux, got '$out'"
   fi
 
@@ -240,7 +307,7 @@ test_backend_detect_cmux_fallback_bundle_id() {
 
 test_backend_detect_cmux_fallback_requires_darwin() {
   local out
-  if out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID; PATH="$FAKE_NONDARWIN_BIN:$PATH" __CFBundleIdentifier='com.cmuxterm.app' fm_backend_detect); then
+  if out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; PATH="$FAKE_NONDARWIN_BIN:$PATH" __CFBundleIdentifier='com.cmuxterm.app' fm_backend_detect); then
     fail "the cmux fallback must be macOS-only (cmux itself is), got '$out' on a non-Darwin uname"
   fi
   pass "fm_backend_detect: the cmux fallback signals are macOS-only (inert on a non-Darwin uname)"
@@ -257,11 +324,11 @@ test_backend_detect_cmux_fallback_tmux_nested_false_positive() {
   dir="$TMP_ROOT/detect-fallback-nested"; mkdir -p "$dir"
   fb=$(make_cmux_fallback_fakebin "$dir")
 
-  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID; PATH="$fb:$PATH" TMUX='fake,1,0' __CFBundleIdentifier='com.cmuxterm.app' fm_backend_detect) \
+  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; PATH="$fb:$PATH" TMUX='fake,1,0' __CFBundleIdentifier='com.cmuxterm.app' fm_backend_detect) \
     || fail "fm_backend_detect should still succeed with \$TMUX plus an inherited cmux bundle id"
   [ "$out" = tmux ] || fail "\$TMUX must win over an inherited cmux bundle id (tmux-inside-cmux pane), got '$out'"
 
-  out=$(unset TMUX CMUX_WORKSPACE_ID; PATH="$fb:$PATH" HERDR_ENV=1 __CFBundleIdentifier='com.cmuxterm.app' fm_backend_detect) \
+  out=$(unset TMUX CMUX_WORKSPACE_ID PASEO_AGENT_ID; PATH="$fb:$PATH" HERDR_ENV=1 __CFBundleIdentifier='com.cmuxterm.app' fm_backend_detect) \
     || fail "fm_backend_detect should still succeed with HERDR_ENV=1 plus an inherited cmux bundle id"
   [ "$out" = herdr ] || fail "HERDR_ENV=1 must win over an inherited cmux bundle id (herdr-inside-cmux pane), got '$out'"
 
@@ -276,10 +343,10 @@ test_backend_detect_cmux_fallback_ancestry_pid_match() {
   # $$ is this test script's own pid - the walk starts there. The cmux app
   # pid (66666) is matched via the lsappinfo bundle-id resolution, with a
   # deliberately non-standard install path so only the pid can match.
-  printf '%s\t77777\t/bin/zsh\n77777\t66666\t/usr/bin/login\n66666\t1\t/Users/x/Custom.app/Contents/MacOS/custom\n' "$$" > "$table"
+  printf '%s\t77777\t/bin/zsh\n77777\t66666\t/usr/bin/login\n66666\t1\t/home/x/Custom.app/Contents/MacOS/custom\n' "$$" > "$table"
 
   (
-    unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier
+    unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier PASEO_AGENT_ID
     PATH="$fb:$PATH" FM_FAKE_PS_TABLE="$table" FM_FAKE_LSAPPINFO_OUT='"pid"=66666' fm_backend_detect >/dev/null || exit 1
     [ "$FM_BACKEND_DETECTED" = cmux ] || exit 2
     [ "$FM_BACKEND_DETECT_SIGNAL" = ancestry ] || exit 3
@@ -296,10 +363,10 @@ test_backend_detect_cmux_fallback_ancestry_comm_match() {
   # lsappinfo resolves nothing (empty output, like the real one for a
   # non-running or non-GUI-visible app); the bundle-shaped comm path is the
   # remaining match, at a non-/Applications install location on purpose.
-  printf '%s\t77777\t/bin/zsh\n77777\t66666\t/usr/bin/login\n66666\t1\t/Users/x/Applications/cmux.app/Contents/MacOS/cmux\n' "$$" > "$table"
+  printf '%s\t77777\t/bin/zsh\n77777\t66666\t/usr/bin/login\n66666\t1\t/home/x/Applications/cmux.app/Contents/MacOS/cmux\n' "$$" > "$table"
 
   (
-    unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier FM_FAKE_LSAPPINFO_OUT
+    unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier FM_FAKE_LSAPPINFO_OUT PASEO_AGENT_ID
     PATH="$fb:$PATH" FM_FAKE_PS_TABLE="$table" fm_backend_detect >/dev/null || exit 1
     [ "$FM_BACKEND_DETECTED" = cmux ] || exit 2
     [ "$FM_BACKEND_DETECT_SIGNAL" = ancestry ] || exit 3
@@ -319,7 +386,7 @@ test_backend_detect_cmux_fallback_ancestry_stops_at_launchd() {
   table="$dir/ps-table"
   printf '%s\t77777\t/bin/zsh\n77777\t1\ttmux\n' "$$" > "$table"
 
-  if out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier FM_FAKE_LSAPPINFO_OUT; PATH="$fb:$PATH" FM_FAKE_PS_TABLE="$table" fm_backend_detect); then
+  if out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier FM_FAKE_LSAPPINFO_OUT PASEO_AGENT_ID; PATH="$fb:$PATH" FM_FAKE_PS_TABLE="$table" fm_backend_detect); then
     fail "ancestry fallback should stop undetected at a launchd-reparented chain, got '$out'"
   fi
   pass "fm_backend_detect: ancestry fallback stops undetected at launchd (a reparented tmux server never reaches cmux)"
@@ -335,7 +402,7 @@ test_backend_name_cmux_fallback_notice() {
   errfile="$dir/err.txt"
 
   : > "$errfile"
-  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID; PATH="$fb:$PATH" __CFBundleIdentifier='com.cmuxterm.app' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; PATH="$fb:$PATH" __CFBundleIdentifier='com.cmuxterm.app' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
   [ "$out" = cmux ] || fail "fm_backend_name should auto-detect cmux via the bundle-id fallback, got '$out'"
   assert_contains "$(cat "$errfile")" "FALLBACK signal __CFBundleIdentifier" \
     "the fallback-detected cmux notice did not name the bundle-id fallback signal"
@@ -347,7 +414,7 @@ test_backend_name_cmux_fallback_notice() {
   # The primary-marker notice is unchanged: it names CMUX_WORKSPACE_ID and
   # carries no FALLBACK wording.
   : > "$errfile"
-  out=$(unset TMUX HERDR_ENV; CMUX_WORKSPACE_ID='fake-uuid' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
+  out=$(unset TMUX HERDR_ENV PASEO_AGENT_ID; CMUX_WORKSPACE_ID='fake-uuid' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
   [ "$out" = cmux ] || fail "fm_backend_name should auto-detect cmux from CMUX_WORKSPACE_ID, got '$out'"
   assert_contains "$(cat "$errfile")" "(CMUX_WORKSPACE_ID)" \
     "the primary-marker cmux notice no longer names CMUX_WORKSPACE_ID"
@@ -360,9 +427,9 @@ test_backend_name_cmux_fallback_notice() {
 
 # fm_backend_name's auto-detect step: fires only when FM_BACKEND/config/backend
 # are both absent, selects between the three markers exactly as
-# fm_backend_detect does, and is loud only when it selects herdr or cmux -
-# never when it selects tmux (today's default-path behavior must stay
-# byte-for-byte silent).
+# fm_backend_detect does, and is loud only when it selects experimental cmux -
+# never when it selects verified herdr or tmux (today's default-path behavior
+# must stay byte-for-byte silent).
 test_backend_name_autodetect_notice() {
   local dir cfg out errfile
 
@@ -370,25 +437,22 @@ test_backend_name_autodetect_notice() {
   errfile="$dir/err.txt"
 
   : > "$errfile"
-  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier; PATH="$FAKE_NONDARWIN_BIN:$PATH" FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier PASEO_AGENT_ID; PATH="$FAKE_NONDARWIN_BIN:$PATH" FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
   [ "$out" = tmux ] || fail "fm_backend_name should default to tmux with no detection markers, got '$out'"
   [ -s "$errfile" ] && fail "fm_backend_name must stay silent with no detection markers"$'\n'"$(cat "$errfile")"
 
   : > "$errfile"
-  out=$(unset TMUX CMUX_WORKSPACE_ID; HERDR_ENV=1 FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
+  out=$(unset TMUX CMUX_WORKSPACE_ID PASEO_AGENT_ID; HERDR_ENV=1 FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
   [ "$out" = herdr ] || fail "fm_backend_name should auto-detect herdr from HERDR_ENV=1, got '$out'"
-  assert_contains "$(cat "$errfile")" "EXPERIMENTAL herdr backend" \
-    "fm_backend_name did not print a loud notice when auto-detecting herdr"
-  assert_contains "$(cat "$errfile")" "config/backend" \
-    "fm_backend_name's auto-detect notice did not name the opt-out"
+  [ ! -s "$errfile" ] || fail "fm_backend_name must keep verified Herdr auto-detection silent"$'\n'"$(cat "$errfile")"
 
   : > "$errfile"
-  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID; TMUX='fake,1,0' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
+  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; TMUX='fake,1,0' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
   [ "$out" = tmux ] || fail "fm_backend_name should auto-detect tmux from \$TMUX, got '$out'"
   [ -s "$errfile" ] && fail "auto-detecting tmux must stay silent (today's unchanged default-path behavior)"$'\n'"$(cat "$errfile")"
 
   : > "$errfile"
-  out=$(unset TMUX HERDR_ENV; CMUX_WORKSPACE_ID='fake-uuid' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
+  out=$(unset TMUX HERDR_ENV PASEO_AGENT_ID; CMUX_WORKSPACE_ID='fake-uuid' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
   [ "$out" = cmux ] || fail "fm_backend_name should auto-detect cmux from CMUX_WORKSPACE_ID, got '$out'"
   assert_contains "$(cat "$errfile")" "EXPERIMENTAL cmux backend" \
     "fm_backend_name did not print a loud notice when auto-detecting cmux"
@@ -398,16 +462,97 @@ test_backend_name_autodetect_notice() {
     "fm_backend_name's cmux auto-detect notice did not name the --backend tmux opt-out"
 
   : > "$errfile"
-  out=$(unset CMUX_WORKSPACE_ID; TMUX='fake,1,0' HERDR_ENV=1 FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
+  out=$(unset CMUX_WORKSPACE_ID PASEO_AGENT_ID; TMUX='fake,1,0' HERDR_ENV=1 FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
   [ "$out" = tmux ] || fail "nested tmux-in-herdr should auto-detect tmux (innermost first), got '$out'"
   [ -s "$errfile" ] && fail "nested tmux-in-herdr auto-detect (result tmux) must stay silent"$'\n'"$(cat "$errfile")"
 
   : > "$errfile"
-  out=$(unset HERDR_ENV; TMUX='fake,1,0' CMUX_WORKSPACE_ID='fake-uuid' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
+  out=$(unset HERDR_ENV PASEO_AGENT_ID; TMUX='fake,1,0' CMUX_WORKSPACE_ID='fake-uuid' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
   [ "$out" = tmux ] || fail "nested tmux-in-cmux should auto-detect tmux (innermost first), got '$out'"
   [ -s "$errfile" ] && fail "nested tmux-in-cmux auto-detect (result tmux) must stay silent"$'\n'"$(cat "$errfile")"
 
-  pass "fm_backend_name: auto-detect selects herdr or cmux (loud notice) or tmux (silent, including nested tmux-in-herdr/tmux-in-cmux)"
+  pass "fm_backend_name: verified Herdr and tmux stay silent while experimental cmux remains loud"
+}
+
+# Paseo is explicit-only (docs/paseo-backend.md "Selection is explicit"):
+# its ambient markers (PASEO_AGENT_ID, the sh.paseo.desktop bundle id) leak
+# into every descendant process, so they must never select it. Only
+# FM_BACKEND, config/backend, or --backend reach paseo.
+test_backend_paseo_is_never_autodetected() {
+  local dir cfg cfg_paseo out errfile
+
+  dir="$TMP_ROOT/paseo-explicit-only"; cfg="$dir/config-empty"; cfg_paseo="$dir/config-paseo"
+  mkdir -p "$cfg" "$cfg_paseo"; printf 'paseo\n' > "$cfg_paseo/backend"
+  errfile="$dir/err.txt"
+
+  if out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier; PATH="$FAKE_NONDARWIN_BIN:$PATH" PASEO_AGENT_ID=agent-1 fm_backend_detect); then
+    fail "fm_backend_detect must not report a backend from PASEO_AGENT_ID alone, got '$out'"
+  fi
+  if out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; PATH="$FAKE_NONDARWIN_BIN:$PATH" __CFBundleIdentifier=sh.paseo.desktop fm_backend_detect); then
+    fail "fm_backend_detect must not report a backend from the sh.paseo.desktop bundle id, got '$out'"
+  fi
+  if out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID; PATH="$FAKE_NONDARWIN_BIN:$PATH" PASEO_AGENT_ID=agent-1 PASEO_TERMINAL_ID=t-1 PASEO_WORKSPACE_ID=wks_1 __CFBundleIdentifier=sh.paseo.desktop fm_backend_detect); then
+    fail "fm_backend_detect must not report a backend from any combination of Paseo markers, got '$out'"
+  fi
+
+  : > "$errfile"
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID; PATH="$FAKE_NONDARWIN_BIN:$PATH" PASEO_AGENT_ID=agent-1 __CFBundleIdentifier=sh.paseo.desktop FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
+  [ "$out" = tmux ] || fail "fm_backend_name inside a Paseo environment with nothing configured must default to tmux, got '$out'"
+  [ -s "$errfile" ] && fail "the tmux default inside Paseo must stay silent"$'\n'"$(cat "$errfile")"
+
+  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID; TMUX='fake,1,0' PASEO_AGENT_ID=agent-1 fm_backend_detect)
+  [ "$out" = tmux ] || fail "tmux started from a Paseo tab still detects tmux, got '$out'"
+
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier; FM_BACKEND=paseo FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name)
+  [ "$out" = paseo ] || fail "FM_BACKEND=paseo must select paseo, got '$out'"
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier; FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg_paseo" fm_backend_name)
+  [ "$out" = paseo ] || fail "config/backend=paseo must select paseo, got '$out'"
+
+  pass "fm_backend_detect/fm_backend_name: paseo is never auto-detected from PASEO_* markers or its bundle id (tmux default stays silent); only FM_BACKEND or config/backend select it"
+}
+
+# Rex auto-detection (docs/rex-backend.md "Auto-detection"): TERM_PROGRAM=rex
+# with REX_BLOCK selects rex silently; tmux and herdr nested inside a Rex block
+# win (innermost first), and a nested tmux keeps the inherited REX_BLOCK while
+# rewriting TERM_PROGRAM, so REX_BLOCK alone must never select rex.
+test_backend_rex_autodetect() {
+  local dir cfg cfg_tmux out errfile rex_block
+  dir="$TMP_ROOT/rex-autodetect"; cfg="$dir/config-empty"; cfg_tmux="$dir/config-tmux"
+  mkdir -p "$cfg" "$cfg_tmux"; printf 'tmux\n' > "$cfg_tmux/backend"
+  errfile="$dir/err.txt"
+  rex_block='block:01a161a0-3364-72a7-8f87-97e42e4e5ea6'
+
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; TERM_PROGRAM=rex REX_BLOCK="$rex_block" fm_backend_detect) \
+    || fail "fm_backend_detect should succeed inside a Rex block"
+  [ "$out" = rex ] || fail "fm_backend_detect should report rex for TERM_PROGRAM=rex with REX_BLOCK, got '$out'"
+
+  : > "$errfile"
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; TERM_PROGRAM=rex REX_BLOCK="$rex_block" FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name 2>"$errfile")
+  [ "$out" = rex ] || fail "fm_backend_name should auto-detect rex, got '$out'"
+  [ -s "$errfile" ] && fail "Rex auto-detection must stay silent"$'\n'"$(cat "$errfile")"
+
+  if out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier PASEO_AGENT_ID; PATH="$FAKE_NONDARWIN_BIN:$PATH" TERM_PROGRAM=tmux REX_BLOCK="$rex_block" fm_backend_detect); then
+    fail "an inherited REX_BLOCK without TERM_PROGRAM=rex must not detect a backend, got '$out'"
+  fi
+  if out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier PASEO_AGENT_ID REX_BLOCK; PATH="$FAKE_NONDARWIN_BIN:$PATH" TERM_PROGRAM=rex fm_backend_detect); then
+    fail "TERM_PROGRAM=rex without REX_BLOCK must not detect rex, got '$out'"
+  fi
+
+  out=$(unset HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; TMUX='fake,1,0' TERM_PROGRAM=rex REX_BLOCK="$rex_block" fm_backend_detect)
+  [ "$out" = tmux ] || fail "tmux nested in a Rex block should detect tmux, got '$out'"
+  out=$(unset TMUX CMUX_WORKSPACE_ID PASEO_AGENT_ID; HERDR_ENV=1 TERM_PROGRAM=rex REX_BLOCK="$rex_block" fm_backend_detect)
+  [ "$out" = herdr ] || fail "herdr nested in a Rex block should detect herdr, got '$out'"
+  out=$(unset TMUX HERDR_ENV PASEO_AGENT_ID; CMUX_WORKSPACE_ID='fake-uuid' TERM_PROGRAM=rex REX_BLOCK="$rex_block" fm_backend_detect)
+  [ "$out" = rex ] || fail "Rex running inside a cmux shell should detect rex (the innermost multiplexer), got '$out'"
+
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; TERM_PROGRAM=rex REX_BLOCK="$rex_block" FM_BACKEND=tmux FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name)
+  [ "$out" = tmux ] || fail "FM_BACKEND must win over Rex auto-detection, got '$out'"
+  out=$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID PASEO_AGENT_ID; TERM_PROGRAM=rex REX_BLOCK="$rex_block" FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg_tmux" fm_backend_name)
+  [ "$out" = tmux ] || fail "config/backend must win over Rex auto-detection, got '$out'"
+
+  fm_backend_validate_spawn rex 2>/dev/null || fail "rex must be a known spawn-capable backend"
+
+  pass "fm_backend_detect/fm_backend_name: TERM_PROGRAM=rex + REX_BLOCK -> rex (silent); nested tmux/herdr win; REX_BLOCK alone never selects rex; explicit config wins"
 }
 
 # Explicit configuration (FM_BACKEND env or config/backend) always wins over
@@ -432,10 +577,10 @@ test_backend_name_explicit_beats_detection() {
   # The same opt-out must work for an ambient cmux auto-detect marker: a
   # captain who is running firstmate inside a cmux terminal but explicitly
   # wants tmux is never overridden by CMUX_WORKSPACE_ID.
-  out=$(unset TMUX HERDR_ENV; CMUX_WORKSPACE_ID='fake-uuid' FM_BACKEND=tmux FM_BACKEND_CONFIG_DIR="$dir/config-empty" fm_backend_name)
+  out=$(unset TMUX HERDR_ENV PASEO_AGENT_ID; CMUX_WORKSPACE_ID='fake-uuid' FM_BACKEND=tmux FM_BACKEND_CONFIG_DIR="$dir/config-empty" fm_backend_name)
   [ "$out" = tmux ] || fail "FM_BACKEND=tmux should win over an ambient CMUX_WORKSPACE_ID auto-detect marker, got '$out'"
 
-  out=$(unset TMUX HERDR_ENV; CMUX_WORKSPACE_ID='fake-uuid' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name)
+  out=$(unset TMUX HERDR_ENV PASEO_AGENT_ID; CMUX_WORKSPACE_ID='fake-uuid' FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name)
   [ "$out" = tmux ] || fail "config/backend=tmux should win over an ambient CMUX_WORKSPACE_ID auto-detect marker, got '$out'"
 
   pass "fm_backend_name: an explicit FM_BACKEND or config/backend setting always wins over runtime auto-detection, including an ambient cmux marker"
@@ -457,17 +602,32 @@ test_backend_validate_refuses_unknown() {
 }
 
 test_backend_source_shell_portable() {
-  local out status
+  local out status stub probe
   # zsh does not word-split unquoted expansions; sourcing fm-backend.sh from
   # an interactive zsh session must still recognize known backend names.
+  # The claim is name matching and the sibling precheck only: the adapters
+  # find their own siblings through BASH_SOURCE, so zsh is not a full load.
   if command -v zsh >/dev/null 2>&1; then
-    zsh -c "cd '$ROOT' && source bin/fm-backend.sh && fm_backend_source herdr && whence -w fm_backend_herdr_capture >/dev/null" 2>/dev/null \
-      || fail "zsh: fm_backend_source herdr should load the adapter when sourced"
+    zsh -c "cd '$ROOT' && source bin/fm-backend.sh && fm_backend_source herdr" >/dev/null 2>&1 \
+      || fail "zsh: fm_backend_source herdr should accept the known backend name and find its sibling libraries"
     out=$(zsh -c "cd '$ROOT' && source bin/fm-backend.sh && fm_backend_source bogus" 2>&1) \
       && fail "zsh: fm_backend_source bogus should fail"
     assert_contains "$out" "unknown backend 'bogus'" \
       "zsh: fm_backend_source did not reject bogus with the expected error"
     pass "zsh: fm_backend_source recognizes known backends and rejects unknown ones"
+
+    # zsh ties the lowercase `path` array to PATH; a backend loaded while
+    # fm_backend_source clobbers PATH cannot resolve external commands.
+    stub="$TMP_ROOT/zsh-source-path"
+    probe="$stub/probe"
+    mkdir -p "$stub/backends"
+    printf 'command -v dirname > "%s"\n' "$probe" > "$stub/backends/orca.sh"
+    : > "$stub/fm-composer-lib.sh"
+    zsh -c "cd '$ROOT' && source bin/fm-backend.sh && FM_BACKEND_LIB_DIR='$stub' && fm_backend_source orca" >/dev/null 2>&1 \
+      || fail "zsh: fm_backend_source orca should load a stub adapter"
+    [ -s "$probe" ] \
+      || fail "zsh: fm_backend_source clobbered PATH while loading a backend adapter"
+    pass "zsh: fm_backend_source keeps PATH intact while loading a backend adapter"
   else
     pass "zsh: shell-portable backend matching skipped (zsh not found)"
   fi
@@ -481,6 +641,42 @@ test_backend_source_shell_portable() {
   pass "bash: fm_backend_source recognizes known backends and rejects unknown ones"
 }
 
+test_backend_source_requires_adapter_file() {
+  local dir adapter exit_status continuation out rc condition test_bash
+  dir="$TMP_ROOT/adapter-precheck"
+  adapter="$dir/backends/tmux.sh"
+  test_bash=${FM_TEST_BASH:-${BASH:-bash}}
+  mkdir -p "$dir/backends"
+
+  for condition in missing unreadable; do
+    if [ "$condition" = unreadable ]; then
+      printf ':\n' > "$adapter"
+      chmod 000 "$adapter"
+      if [ -r "$adapter" ]; then
+        pass "fm_backend_source: unreadable adapter case skipped (this user can read mode-000 files)"
+        continue
+      fi
+    fi
+    exit_status="$dir/$condition.exit"
+    continuation="$dir/$condition.continued"
+    # shellcheck disable=SC2016 # The child Bash expands $1..$4 and $? at runtime.
+    out=$("$test_bash" -c '
+      . "$1"
+      FM_BACKEND_LIB_DIR=$2
+      trap '\''printf "%s\n" "$?" > "$3"'\'' EXIT
+      set -e
+      fm_backend_source tmux
+      : > "$4"
+    ' _ "$ROOT/bin/fm-backend.sh" "$dir" "$exit_status" "$continuation" 2>&1)
+    rc=$?
+    [ "$rc" -ne 0 ] || fail "fm_backend_source returned success for a $condition adapter: $out"
+    [ -f "$exit_status" ] || fail "fm_backend_source did not record the $condition adapter exit status"
+    [ "$(cat "$exit_status")" -ne 0 ] || fail "fm_backend_source lost the $condition adapter failure at EXIT"
+    [ ! -e "$continuation" ] || fail "fm_backend_source continued the lifecycle after a $condition adapter"
+    pass "fm_backend_source: $condition adapter fails before lifecycle continuation"
+  done
+}
+
 test_backend_validate_spawn_accepts_orca() {
   local out
   fm_backend_validate_spawn tmux 2>/dev/null || fail "fm_backend_validate_spawn should accept tmux"
@@ -488,6 +684,8 @@ test_backend_validate_spawn_accepts_orca() {
   fm_backend_validate_spawn zellij 2>/dev/null || fail "fm_backend_validate_spawn should accept zellij"
   fm_backend_validate_spawn orca 2>/dev/null || fail "fm_backend_validate_spawn should accept orca"
   fm_backend_validate_spawn cmux 2>/dev/null || fail "fm_backend_validate_spawn should accept cmux"
+  fm_backend_validate_spawn t3code 2>/dev/null || fail "fm_backend_validate_spawn should accept t3code"
+  [ "$(fm_backend_required_tools t3code)" = 'node treehouse' ] || fail "t3code should require node and treehouse"
   out=$(fm_backend_validate_spawn bogus 2>&1) && fail "fm_backend_validate_spawn should still refuse unknown backends"
   assert_contains "$out" "unknown backend 'bogus'" "fm_backend_validate_spawn did not preserve unknown-backend validation"
   out=$(fm_backend_validate_spawn codex-app 2>&1) && fail "fm_backend_validate_spawn should refuse codex-app"
@@ -498,7 +696,7 @@ test_backend_validate_spawn_accepts_orca() {
 }
 
 test_meta_get_and_backend_of_meta() {
-  local meta=$TMP_ROOT/meta-get.meta
+  local meta=$TMP_ROOT/meta-get.meta edge=$TMP_ROOT/meta-get-edge.meta
   fm_write_meta "$meta" "window=firstmate:fm-x1" "harness=claude"
   [ "$(fm_meta_get "$meta" window)" = "firstmate:fm-x1" ] || fail "fm_meta_get did not read window="
   [ "$(fm_meta_get "$meta" missing)" = "" ] || fail "fm_meta_get should print nothing for an absent key"
@@ -507,7 +705,11 @@ test_meta_get_and_backend_of_meta() {
   printf 'backend=tmux\n' >> "$meta"
   [ "$(fm_backend_of_meta "$meta")" = tmux ] || fail "fm_backend_of_meta should read an explicit backend=tmux"
 
-  pass "fm_meta_get / fm_backend_of_meta: read key=value, default backend to tmux"
+  printf 'token=first\ntoken=last=value' > "$edge"
+  [ "$(fm_meta_get "$edge" token)" = "last=value" ] \
+    || fail "fm_meta_get did not preserve last-value or no-final-newline semantics"
+
+  pass "fm_meta_get / fm_backend_of_meta: read last key=value and default backend to tmux"
 }
 
 test_resolve_selector_three_forms() {
@@ -573,6 +775,7 @@ test_backend_of_selector_matches_explicit_target_meta() {
   fm_write_meta "$state/tmux-task.meta" "window=firstmate:fm-tmux-task"
   fm_write_meta "$state/custom-window-task.meta" "window=custom-window"
   fm_write_meta "$state/orca-task.meta" "window=fm-orca-task" "terminal=term-orca-task" "backend=orca"
+  fm_write_meta "$state/t3-task.meta" "window=fm-t3-task" "t3_thread_id=6f1c2b3a-0000-4000-8000-00000000c0de" "backend=t3code"
 
   [ "$(fm_backend_of_selector 'dotfiles-d6' 'default:wA:p2' "$state")" = herdr ] \
     || fail "bare non-fm task id selector should use its recorded backend"
@@ -588,6 +791,10 @@ test_backend_of_selector_matches_explicit_target_meta() {
     || fail "raw window selector matching metadata should not require tmux fallback"
   [ "$(fm_backend_of_selector 'term-orca-task' 'term-orca-task' "$state")" = orca ] \
     || fail "matching an explicit Orca terminal handle should inherit metadata backend"
+  [ "$(fm_backend_resolve_selector 'fm-t3-task' "$state")" = 6f1c2b3a-0000-4000-8000-00000000c0de ] \
+    || fail "t3code fm-<id> selector should resolve to t3_thread_id=, not window="
+  [ "$(fm_backend_of_selector '6f1c2b3a-0000-4000-8000-00000000c0de' '6f1c2b3a-0000-4000-8000-00000000c0de' "$state")" = t3code ] \
+    || fail "matching an explicit T3 thread id should inherit metadata backend"
   [ "$(fm_backend_of_selector 'default:w1:p2' 'default:w1:p2' "$state")" = herdr ] \
     || fail "explicit backend target matching metadata should use that task's backend"
   [ "$(fm_backend_of_selector 'firstmate:fm-tmux-task' 'firstmate:fm-tmux-task' "$state")" = tmux ] \
@@ -699,10 +906,24 @@ set -u
 case "${1:-}" in
   send-keys) exit 0 ;;
   display-message)
-    for a in "$@"; do case "$a" in *cursor_y*) printf '0\n'; exit 0 ;; esac; done
+    for a in "$@"; do case "$a" in *cursor_y*) printf '1\n'; exit 0 ;; esac; done
     printf 'fakepane\n'; exit 0 ;;
-  capture-pane) printf '\xe2\x94\x82 \xe2\x94\x82\n'; exit 0 ;;
-  list-windows) exit 0 ;;
+  capture-pane)
+    start= end=
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -S) start=$2; shift 2 ;;
+        -E) end=$2; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [ "$start" = 1 ] && [ "$end" = 1 ]; then
+      printf '│    │\n'
+    else
+      printf '╭────╮\n│    │\n╰────╯\n'
+    fi
+    exit 0 ;;
+  list-windows) printf 'win\n'; exit 0 ;;
 esac
 exit 0
 SH
@@ -721,60 +942,55 @@ run_send_case() {  # <bin-root> <fakebin> <log> <home> -- <send args...>
 
 strip_send_preflight() {  # <log>
   local preflight
-  preflight=$'tmux\x1fdisplay-message\x1f-p\x1f-t\x1fsess:win\x1f#{pane_id}'
+  preflight=$'tmux\x1flist-windows\x1f-t\x1f=sess\x1f-F\x1f#{window_name}'
   awk -v preflight="$preflight" '$0 != preflight { print }' "$1"
 }
 
-test_send_conformance_old_vs_new() {
-  local old_bin fb log_old log_new home rc_old rc_new filtered_old filtered_new
-  old_bin=$(build_old_bin send-old)
+# The byte-identical old-vs-new tmux log comparison this test used to run
+# covered the P1 backend extraction, which promised an unchanged command
+# sequence. The composer consolidation (fm-composer-thin-adapter-refactor-r1)
+# deliberately changed that sequence - the submit core reads a busy baseline
+# before typing (its idle-to-busy turn-started confirmation) and the composer
+# verdict comes from one full styled capture instead of a second band capture -
+# so the current contract is asserted directly instead.
+test_send_tmux_contract() {
+  local fb log home rc
   fb=$(make_send_fakebin "$TMP_ROOT/send-fake")
   home="$TMP_ROOT/send-home"; mkdir -p "$home/state"
-  log_old="$TMP_ROOT/send-old.log"; log_new="$TMP_ROOT/send-new.log"
-  filtered_old="$TMP_ROOT/send-old.filtered.log"; filtered_new="$TMP_ROOT/send-new.filtered.log"
+  log="$TMP_ROOT/send-new.log"
 
-  # Case 1: --key path.
-  run_send_case "$old_bin" "$fb" "$log_old" "$home" -- "sess:win" --key Escape
-  rc_old=$?
-  run_send_case "$ROOT" "$fb" "$log_new" "$home" -- "sess:win" --key Escape
-  rc_new=$?
-  expect_code "$rc_old" "$rc_new" "fm-send --key: old vs new exit code"
-  assert_contains "$(cat "$log_new")" $'\x1f''display-message'$'\x1f''-p'$'\x1f''-t'$'\x1f''sess:win'$'\x1f''#{pane_id}' \
+  # Case 1: --key path - target verified, named key sent, no typing.
+  run_send_case "$ROOT" "$fb" "$log" "$home" -- "sess:win" --key Escape
+  rc=$?
+  expect_code 0 "$rc" "fm-send --key should succeed against a live fake pane"
+  assert_contains "$(cat "$log")" $'\x1f''list-windows'$'\x1f''-t'$'\x1f''=sess'$'\x1f''-F'$'\x1f''#{window_name}' \
     "fm-send --key did not verify the explicit tmux target before sending"
-  strip_send_preflight "$log_old" > "$filtered_old"
-  strip_send_preflight "$log_new" > "$filtered_new"
-  diff -u "$filtered_old" "$filtered_new" > "$TMP_ROOT/send-diff-key.txt" 2>&1 \
-    || fail "fm-send --key: tmux command log differs old vs new"$'\n'"$(cat "$TMP_ROOT/send-diff-key.txt")"
-  assert_contains "$(cat "$log_new")" $'\x1f''Escape' "fm-send --key did not send the named key"
+  assert_contains "$(cat "$log")" $'\x1f''Escape' "fm-send --key did not send the named key"
+  assert_not_contains "$(cat "$log")" $'\x1f''-l'$'\x1f' "fm-send --key must not type literal text"
 
-  # Case 2: plain text (0.3s settle, no popup).
-  run_send_case "$old_bin" "$fb" "$log_old" "$home" -- "sess:win" hello captain
-  rc_old=$?
-  run_send_case "$ROOT" "$fb" "$log_new" "$home" -- "sess:win" hello captain
-  rc_new=$?
-  expect_code "$rc_old" "$rc_new" "fm-send plain text: old vs new exit code"
-  strip_send_preflight "$log_old" > "$filtered_old"
-  strip_send_preflight "$log_new" > "$filtered_new"
-  diff -u "$filtered_old" "$filtered_new" > "$TMP_ROOT/send-diff-plain.txt" 2>&1 \
-    || fail "fm-send plain text: tmux command log differs old vs new"$'\n'"$(cat "$TMP_ROOT/send-diff-plain.txt")"
-  assert_contains "$(cat "$log_new")" $'\x1f''send-keys'$'\x1f''-t'$'\x1f''sess:win'$'\x1f''-l'$'\x1f''hello captain' \
+  # Case 2: plain text - typed literally exactly once, submitted with Enter,
+  # confirmed against the bordered-empty fake composer.
+  run_send_case "$ROOT" "$fb" "$log" "$home" -- "sess:win" hello captain
+  rc=$?
+  expect_code 0 "$rc" "fm-send plain text should confirm against the empty fake composer"
+  assert_contains "$(cat "$log")" $'\x1f''send-keys'$'\x1f''-t'$'\x1f''sess:win'$'\x1f''-l'$'\x1f''hello captain' \
     "fm-send did not send the literal text with send-keys -l"
-  assert_contains "$(cat "$log_new")" $'\x1f''Enter' "fm-send did not submit with Enter"
+  [ "$(grep -c $'\x1f''-l'$'\x1f' "$log")" -eq 1 ] \
+    || fail "fm-send must type the text exactly once (Enter-only retries, never a retype)"
+  assert_contains "$(cat "$log")" $'\x1f''Enter' "fm-send did not submit with Enter"
 
-  # Case 3: a slash command still opens the popup-settle path (verified
-  # elsewhere in tests/fm-send-popup-settle.test.sh) and still ends in the
-  # same tmux command shape: send-keys -l, then a retried Enter.
-  run_send_case "$old_bin" "$fb" "$log_old" "$home" -- "sess:win" /some-skill
-  rc_old=$?
-  run_send_case "$ROOT" "$fb" "$log_new" "$home" -- "sess:win" /some-skill
-  rc_new=$?
-  expect_code "$rc_old" "$rc_new" "fm-send /skill: old vs new exit code"
-  strip_send_preflight "$log_old" > "$filtered_old"
-  strip_send_preflight "$log_new" > "$filtered_new"
-  diff -u "$filtered_old" "$filtered_new" > "$TMP_ROOT/send-diff-slash.txt" 2>&1 \
-    || fail "fm-send /skill: tmux command log differs old vs new"$'\n'"$(cat "$TMP_ROOT/send-diff-slash.txt")"
+  # Case 3: a slash command still opens the popup-settle path (verified in
+  # tests/fm-send-popup-settle.test.sh) and ends in the same command shape:
+  # one literal type, then Enter.
+  run_send_case "$ROOT" "$fb" "$log" "$home" -- "sess:win" /some-skill
+  rc=$?
+  expect_code 0 "$rc" "fm-send /skill should confirm against the empty fake composer"
+  assert_contains "$(cat "$log")" $'\x1f''send-keys'$'\x1f''-t'$'\x1f''sess:win'$'\x1f''-l'$'\x1f''/some-skill' \
+    "fm-send /skill did not type the literal slash command"
+  [ "$(grep -c $'\x1f''-l'$'\x1f' "$log")" -eq 1 ] \
+    || fail "fm-send /skill must type the text exactly once"
 
-  pass "fm-send.sh: explicit tmux targets are verified, while --key/plain/slash send command shape stays old-compatible"
+  pass "fm-send.sh: explicit tmux targets are verified; text types once and submits with Enter"
 }
 
 # --- old vs new: fm-peek.sh --------------------------------------------------
@@ -855,7 +1071,7 @@ test_peek_metaless_undetectable_errors() {
 # --- old vs new: fm-spawn.sh --------------------------------------------------
 
 make_spawn_fakebin() {  # <dir> <fake-worktree-path> -> echoes fakebin dir
-  local dir=$1 wt=$2 fb="$1/fakebin"
+  local dir=$1 wt=$2 fb="$1/fakebin" window_file="$1/window-name"
   mkdir -p "$fb"
   cat > "$fb/tmux" <<SH
 #!/usr/bin/env bash
@@ -865,7 +1081,23 @@ case "\${1:-}" in
   display-message)
     for a in "\$@"; do case "\$a" in *pane_current_path*) printf '%s\\n' "$wt"; exit 0 ;; esac; done
     printf 'firstmate\\n'; exit 0 ;;
-  list-windows) exit 0 ;;
+  new-window)
+    _name=
+    _previous=
+    for _arg in "\$@"; do
+      [ "\$_previous" = -n ] && _name=\$_arg
+      _previous=\$_arg
+    done
+    printf '%s\\n' "\$_name" > "$window_file"
+    printf '@1\\n'
+    exit 0 ;;
+  list-windows)
+    [ -s "$window_file" ] || exit 0
+    case "\$*" in
+      *'#{window_id}'*) printf '@1\\n' ;;
+      *) cat "$window_file" ;;
+    esac
+    exit 0 ;;
 esac
 exit 0
 SH
@@ -875,10 +1107,12 @@ SH
 }
 
 run_spawn_case() {  # <bin-root> <fakebin> <log> <state> <data> <config> <proj> -- <spawn args...>
-  local bin=$1 fb=$2 log=$3 state=$4 data=$5 config=$6 proj=$7; shift 7
+  local bin=$1 fb=$2 log=$3 state=$4 data=$5 config=$6 proj=$7 home; shift 7
   [ "${1:-}" = -- ] && shift
+  home="$TMP_ROOT/spawn-home"
+  mkdir -p "$home/state"
   : > "$log"
-  env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$bin" \
+  env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$bin" FM_HOME="$home" HOME="$SPAWN_HOME" CLAUDE_CONFIG_DIR='' \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" \
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" FM_TMUX_LOG="$log" \
@@ -915,8 +1149,8 @@ run_spawn_case() {  # <bin-root> <fakebin> <log> <state> <data> <config> <proj> 
 # first pane_current_path poll, then the real worktree path from the second poll
 # onward, so this test fails loudly if the PROJ_ABS/PROJ_ABS_REAL
 # canonicalization in bin/fm-spawn.sh ever regresses.
-make_spawn_symlink_fakebin() {  # <dir> <initial-project-path> <worktree-path> -> echoes fakebin dir
-  local dir=$1 initial_path=$2 wt=$3 fb="$1/fakebin" counter="$1/poll-count"
+make_spawn_symlink_fakebin() {  # <dir> <initial-project-path> <worktree-path> <window-name> -> echoes fakebin dir
+  local dir=$1 initial_path=$2 wt=$3 window_name=$4 fb="$1/fakebin" counter="$1/poll-count"
   mkdir -p "$fb"
   : > "$counter"
   cat > "$fb/tmux" <<SH
@@ -935,7 +1169,17 @@ case "\${1:-}" in
       exit 0
     ;; esac; done
     printf 'firstmate\\n'; exit 0 ;;
-  list-windows) exit 0 ;;
+  new-window)
+    : > "$counter.window-created"
+    printf '@1\\n'
+    exit 0 ;;
+  list-windows)
+    [ -e "$counter.window-created" ] || exit 0
+    case "\$*" in
+      *'#{window_id}'*) printf '@1\\n' ;;
+      *) printf '%s\\n' "$window_name" ;;
+    esac
+    exit 0 ;;
 esac
 exit 0
 SH
@@ -964,15 +1208,15 @@ run_spawn_symlink_case() {  # <label> <physical|logical>
     logical) initial_path=$proj ;;
     *) fail "unknown symlink first-reply mode: $first_reply" ;;
   esac
-  fb=$(make_spawn_symlink_fakebin "$TMP_ROOT/symlink-fake-$label" "$initial_path" "$wt")
+  fb=$(make_spawn_symlink_fakebin "$TMP_ROOT/symlink-fake-$label" "$initial_path" "$wt" "fm-$id")
   data="$TMP_ROOT/symlink-data-$label"
   mkdir -p "$data/$id"
-  printf 'test brief content\n' > "$data/$id/brief.md"
+  write_spawn_brief "$data/$id/brief.md" "$id"
   state="$TMP_ROOT/symlink-state-$label"; config="$TMP_ROOT/symlink-config-$label"
   mkdir -p "$state" "$config"
   log="$TMP_ROOT/symlink-spawn-$label.log"
 
-  out=$(run_spawn_case "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$proj" -- "$id" "$proj" claude 2>&1)
+  out=$(run_spawn_case "$ROOT" "$fb" "$log" "$state" "$data" "$config" "$proj" -- "$id" "$proj" claude --mode no-mistakes --yolo off 2>&1)
   rc=$?
   expect_code 0 "$rc" "fm-spawn.sh should succeed for a project reached through a symlinked prefix when the backend reports $first_reply cwd"$'\n'"$out"
   assert_contains "$out" "worktree=$wt" \
@@ -1004,7 +1248,18 @@ set -u
 { printf 'treehouse'; for a in "$@"; do printf '\x1f%s' "$a"; done; printf '\n'; } >> "${FM_TMUX_LOG:?}"
 exit 0
 SH
-  chmod +x "$fb/tmux" "$fb/treehouse"
+  cat > "$fb/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  --version) printf '0.2.6\n'; exit 0 ;;
+  hold) [ "${2:-}" = --help ] && { printf '%s\n' 'usage: tasks-axi hold <id> --reason <text> --kind captain'; exit 0; } ;;
+  update) [ "${2:-}" = --help ] && { printf '%s\n' 'usage: tasks-axi update <id> --body-file <path> --archive-body'; exit 0; } ;;
+  mv) [ "${2:-}" = --help ] && { printf '%s\n' 'usage: tasks-axi mv <id> [<id>...] --to <path-or-dir>'; exit 0; } ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/tmux" "$fb/treehouse" "$fb/tasks-axi"
   printf '%s\n' "$fb"
 }
 
@@ -1024,9 +1279,20 @@ run_teardown_case() {
 }
 
 test_teardown_conformance_old_vs_new() {
-  local old_bin fb proj wt id
+  local old_bin fb proj wt id old_tmux_ref saved_base_ref
   local state_old state_new config_old config_new data log_old log_new out_old out_new rc_old rc_new
+  # Force the post-squash topology inside this case: merge-base with main may
+  # equal HEAD on default-branch CI, and that must not make the legacy kill
+  # fixture self-referential. build_old_bin still uses BASE_REF for entrypoints;
+  # only the tmux kill adapter is pinned to the content-historical permissive ref.
+  saved_base_ref=$BASE_REF
+  BASE_REF=$(git -C "$ROOT" rev-parse HEAD)
+  old_tmux_ref=$(resolve_permissive_tmux_kill_ref) \
+    || { BASE_REF=$saved_base_ref; fail "unable to locate a historical bin/backends/tmux.sh with permissive kill-window selectors"; }
   old_bin=$(build_old_bin teardown-old)
+  git -C "$ROOT" show "$old_tmux_ref:bin/backends/tmux.sh" > "$old_bin/bin/backends/tmux.sh" \
+    || { BASE_REF=$saved_base_ref; fail "could not materialize historical tmux adapter from $old_tmux_ref"; }
+  BASE_REF=$saved_base_ref
   proj="$TMP_ROOT/teardown-project"; wt="$TMP_ROOT/teardown-wt"
   id="teardownconform1"
   fm_git_worktree "$proj" "$wt" "fm/$id"
@@ -1056,14 +1322,21 @@ test_teardown_conformance_old_vs_new() {
 
   expect_code 0 "$rc_old" "old fm-teardown.sh (scout, report present) should succeed"$'\n'"$out_old"
   expect_code 0 "$rc_new" "new fm-teardown.sh (scout, report present) should succeed"$'\n'"$out_new"
-  diff -u "$log_old" "$log_new" > "$TMP_ROOT/teardown-diff.txt" 2>&1 \
-    || fail "fm-teardown.sh: tmux+treehouse command log differs old vs new"$'\n'"$(cat "$TMP_ROOT/teardown-diff.txt")"
   assert_contains "$(cat "$log_new")" "treehouse"$'\x1f''return'$'\x1f''--force'$'\x1f'"$wt" \
     "teardown did not call treehouse return --force <worktree>"
-  assert_contains "$(cat "$log_new")" "tmux"$'\x1f''kill-window'$'\x1f''-t'$'\x1f'"firstmate:fm-$id" \
-    "teardown did not call tmux kill-window -t <window>"
+  # The legacy fixture's adapter comes from BASE_REF, so its selector form is
+  # whatever the merge-base carried: permissive while the exact-selector change
+  # was still on a branch, exact for every branch cut after it landed on main.
+  # Pinning the old form here would make this case pass once and then fail
+  # forever, so the '=' exactness markers are normalized away and the legacy run
+  # is only required to have reached tmux window cleanup for this task. The
+  # exact-selector contract belongs to the current script, asserted below.
+  assert_contains "$(tr -d '=' < "$log_old")" "tmux"$'\x1f''kill-window'$'\x1f''-t'$'\x1f'"firstmate:fm-$id" \
+    "legacy teardown fixture did not exercise tmux window cleanup for the task"
+  assert_contains "$(cat "$log_new")" "tmux"$'\x1f''kill-window'$'\x1f''-t'$'\x1f'"=firstmate:=fm-$id" \
+    "teardown did not call tmux kill-window with exact session and window selectors"
 
-  pass "fm-teardown.sh: treehouse return + tmux kill-window command log is byte-identical old vs new for a scout task"
+  pass "fm-teardown.sh: treehouse return remains compatible while tmux cleanup uses exact selectors"
 }
 
 # --- backend selection loudly refuses an unknown backend --------------------
@@ -1074,7 +1347,7 @@ test_spawn_refuses_unknown_backend_flag() {
   # graduated to real adapters and have their own spawn tests.
   out=$(FM_ROOT_OVERRIDE='' FM_HOME='' FM_STATE_OVERRIDE='' FM_DATA_OVERRIDE='' \
     FM_PROJECTS_OVERRIDE='' FM_CONFIG_OVERRIDE='' FM_SPAWN_NO_GUARD=1 \
-    "$ROOT/bin/fm-spawn.sh" nope-backend-z1 projects/none claude --backend bogus 2>&1)
+    "$ROOT/bin/fm-spawn.sh" nope-backend-z1 projects/none claude --mode no-mistakes --yolo off --backend bogus 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail "fm-spawn --backend bogus should refuse"
   assert_contains "$out" "unknown backend 'bogus'" "fm-spawn did not name the rejected backend"
@@ -1085,7 +1358,7 @@ test_spawn_refuses_codex_app_backend_flag() {
   local out status
   out=$(FM_ROOT_OVERRIDE='' FM_HOME='' FM_STATE_OVERRIDE='' FM_DATA_OVERRIDE='' \
     FM_PROJECTS_OVERRIDE='' FM_CONFIG_OVERRIDE='' FM_SPAWN_NO_GUARD=1 \
-    "$ROOT/bin/fm-spawn.sh" nope-codex-app-z1 projects/none claude --backend codex-app 2>&1)
+    "$ROOT/bin/fm-spawn.sh" nope-codex-app-z1 projects/none claude --mode no-mistakes --yolo off --backend codex-app 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail "fm-spawn --backend codex-app should refuse"
   assert_contains "$out" "unknown backend 'codex-app'" "fm-spawn did not preserve the blocked codex-app contract"
@@ -1096,7 +1369,7 @@ test_spawn_refuses_unknown_fm_backend_env() {
   local out status
   out=$(FM_ROOT_OVERRIDE='' FM_HOME='' FM_STATE_OVERRIDE='' FM_DATA_OVERRIDE='' \
     FM_PROJECTS_OVERRIDE='' FM_CONFIG_OVERRIDE='' FM_SPAWN_NO_GUARD=1 FM_BACKEND=bogus \
-    "$ROOT/bin/fm-spawn.sh" nope-backend-z2 projects/none claude 2>&1)
+    "$ROOT/bin/fm-spawn.sh" nope-backend-z2 projects/none claude --mode no-mistakes --yolo off 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail "FM_BACKEND=bogus should refuse"
   assert_contains "$out" "unknown backend 'bogus'" "fm-spawn did not name the rejected FM_BACKEND"
@@ -1110,15 +1383,15 @@ test_spawn_default_backend_writes_no_meta_field() {
   fm_git_worktree "$proj" "$wt" "fm/$id"
   local fb
   fb=$(make_spawn_fakebin "$TMP_ROOT/nobackend-fake" "$wt")
-  mkdir -p "$data/$id"; printf 'brief\n' > "$data/$id/brief.md"
+  mkdir -p "$data/$id"; write_spawn_brief "$data/$id/brief.md" "$id"
   state="$TMP_ROOT/nobackend-state"; config="$TMP_ROOT/nobackend-config"
   mkdir -p "$state" "$config"
 
-  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
+  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" HOME="$SPAWN_HOME" CLAUDE_CONFIG_DIR='' \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
     FM_TMUX_LOG="$TMP_ROOT/nobackend.log" \
-    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend tmux 2>&1)
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend tmux 2>&1)
   expect_code 0 $? "explicit --backend tmux should spawn successfully"$'\n'"$out"
   assert_no_grep 'backend=' "$state/$id.meta" \
     "an explicit --backend tmux (the default) must not write backend= to meta (P1 compatibility contract)"
@@ -1132,17 +1405,17 @@ test_spawn_explicit_backend_flag_beats_autodetect_herdr_env() {
   id="explicitbackendz4"
   fm_git_worktree "$proj" "$wt" "fm/$id"
   fb=$(make_spawn_fakebin "$TMP_ROOT/explicit-backend-fake" "$wt")
-  mkdir -p "$data/$id"; printf 'brief\n' > "$data/$id/brief.md"
+  mkdir -p "$data/$id"; write_spawn_brief "$data/$id/brief.md" "$id"
   state="$TMP_ROOT/explicit-backend-state"; config="$TMP_ROOT/explicit-backend-config"
   mkdir -p "$state" "$config"
 
   # HERDR_ENV=1 is present (as if firstmate itself were running under herdr),
   # but an explicit --backend tmux flag must still win outright.
-  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
+  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" HOME="$SPAWN_HOME" CLAUDE_CONFIG_DIR='' \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" HERDR_ENV=1 \
     FM_TMUX_LOG="$TMP_ROOT/explicit-backend.log" \
-    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --backend tmux 2>&1)
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend tmux 2>&1)
   expect_code 0 $? "explicit --backend tmux should spawn successfully even with HERDR_ENV=1 set"$'\n'"$out"
   assert_no_grep 'backend=' "$state/$id.meta" \
     "an explicit --backend tmux must win over an ambient HERDR_ENV=1 auto-detect marker"
@@ -1156,7 +1429,7 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
   id="nestbackendz5"
   fm_git_worktree "$proj" "$wt" "fm/$id"
   fb=$(make_spawn_fakebin "$TMP_ROOT/nest-fake" "$wt")
-  mkdir -p "$data/$id"; printf 'brief\n' > "$data/$id/brief.md"
+  mkdir -p "$data/$id"; write_spawn_brief "$data/$id/brief.md" "$id"
   state="$TMP_ROOT/nest-state"; config="$TMP_ROOT/nest-config"
   mkdir -p "$state" "$config"
 
@@ -1165,11 +1438,11 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
   # (tmux nested inside a herdr pane) - the full fm-spawn.sh pipeline, not just
   # fm_backend_name, must resolve this to tmux and stay completely silent about
   # it (today's default path, byte-identical).
-  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
+  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" HOME="$SPAWN_HOME" CLAUDE_CONFIG_DIR='' \
     FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" HERDR_ENV=1 \
     FM_TMUX_LOG="$TMP_ROOT/nest.log" \
-    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude 2>&1)
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off 2>&1)
   expect_code 0 $? "fm-spawn.sh should auto-detect tmux and spawn successfully for nested tmux-in-herdr"$'\n'"$out"
   assert_no_grep 'backend=' "$state/$id.meta" \
     "auto-detected nested tmux-in-herdr must resolve to tmux (missing backend= means tmux)"
@@ -1180,7 +1453,15 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
   pass "fm-spawn.sh: auto-detect resolves nested tmux-in-herdr to tmux and stays silent end to end"
 }
 
+if [ -n "${FM_TEST_ONLY:-}" ]; then
+  "$FM_TEST_ONLY"
+  exit 0
+fi
+
+backend_base_ref >/dev/null
+
 test_backend_name_precedence
+test_backend_detect_t3_explicit_only
 test_backend_detect_precedence
 test_backend_detect_cmux_fallback_bundle_id
 test_backend_detect_cmux_fallback_requires_darwin
@@ -1190,16 +1471,19 @@ test_backend_detect_cmux_fallback_ancestry_comm_match
 test_backend_detect_cmux_fallback_ancestry_stops_at_launchd
 test_backend_name_cmux_fallback_notice
 test_backend_name_autodetect_notice
+test_backend_paseo_is_never_autodetected
+test_backend_rex_autodetect
 test_backend_name_explicit_beats_detection
 test_backend_validate_refuses_unknown
 test_backend_source_shell_portable
+test_backend_source_requires_adapter_file
 test_backend_validate_spawn_accepts_orca
 test_meta_get_and_backend_of_meta
 test_resolve_selector_three_forms
 test_backend_of_selector_matches_explicit_target_meta
 test_backend_of_selector_metaless_runtime
 test_backend_runtime_or_error
-test_send_conformance_old_vs_new
+test_send_tmux_contract
 test_peek_conformance_old_vs_new
 test_peek_metaless_undetectable_errors
 test_spawn_symlinked_project_prefix_avoids_false_refusal
