@@ -381,11 +381,21 @@ if [ "$KIND" = ship ] && [ "$MODE" != local-only ] && [ "$PROJECT_DIR_SET" -eq 1
   esac
 fi
 ID=${POS[0]}
-BRANCH="$BRANCH_PREFIX$ID"
+BRANCH="$BRANCH_PREFIX${FM_BRANCH_SLUG:-$ID}"
 if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
   echo "error: --branch-prefix and task id must form a valid git branch (got '$BRANCH')" >&2
   exit 1
 fi
+# A task id is firstmate's own name for the work and means nothing to the people
+# reviewing it. Three PRs went up on branches named after one before this warned.
+case "$BRANCH" in
+  */[A-Z][A-Z]*-[0-9]*|*/[0-9]*) ;;
+  *)
+    echo "notice: branch '$BRANCH' carries the task id rather than a ticket key." >&2
+    echo "        On a company repo the convention is <prefix>/<TICKET>-<short-description>." >&2
+    echo "        Set FM_BRANCH_SLUG='SMM-1234-short-description' to name it properly." >&2
+    ;;
+esac
 printf -v BRANCH_Q '%q' "$BRANCH"
 
 if [ "$KIND" = secondmate ] && [ "$HERDR_LAB" -eq 1 ]; then
