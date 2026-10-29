@@ -675,6 +675,20 @@ IFS= read -r -d '' SHARED_NO_CD_RULE <<'EOF' || true
 EOF
 SHARED_NO_CD_RULE=${SHARED_NO_CD_RULE%$'\n'}
 
+# The captain's machine is 16GB and usually runs an emulator, a simulator and Metro.
+# A full jest suite (7 workers, ~1GB each) drove it to 15GB of swap during a live demo.
+IFS= read -r -d '' SHARED_MACHINE_LOAD_RULE <<'EOF' || true
+10. This is the captain's own 16GB laptop, usually running an emulator, a simulator and Metro.
+   NEVER run the full test suite: no bare `jest`, `pnpm test`, `pnpm run test:all`,
+   `pnpm run check`, `npm test`, or any equivalent. A full run took the machine down mid-demo.
+   Run only the tests for files you changed, capped: `pnpm exec jest <path> --maxWorkers=2`.
+   Before any heavy command (tests, a full tsc, a native build) run `memory_pressure`; if free
+   memory is under ~30%, do not start it and say so in your status instead.
+   Never leave a test run going in the background.
+   If you think a change needs wider coverage, say so in your report and let the captain decide.
+EOF
+SHARED_MACHINE_LOAD_RULE=${SHARED_MACHINE_LOAD_RULE%$'\n'}
+
 if [ -n "$BASE_BRANCH" ]; then
   SETUP_BASE="You are in a disposable git worktree of $REPO, at a detached HEAD on a clean copy of its base branch.
 Base branch: $BASE_BRANCH"
@@ -739,6 +753,7 @@ $SHARED_NO_CD_RULE
    never what the line already says. Rationale, background and alternatives belong in the
    commit message, not above the code. Before you report done, run
    \`$FM_ROOT/bin/fm-comment-check.sh <base-ref>\` in the worktree and trim until it passes.
+$SHARED_MACHINE_LOAD_RULE
 
 $WAIT_BLOCK$INBOX_SECTION
 
@@ -836,6 +851,7 @@ $SHARED_NO_CD_RULE
    never what the line already says. Rationale, background and alternatives belong in the
    commit message, not above the code. Before you report done, run
    \`$FM_ROOT/bin/fm-comment-check.sh <base-ref>\` in the worktree and trim until it passes.
+$SHARED_MACHINE_LOAD_RULE
 
 $WAIT_BLOCK$INBOX_SECTION
 
