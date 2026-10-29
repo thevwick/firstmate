@@ -2058,7 +2058,7 @@ if [ "$RELAUNCH" -eq 0 ] && [ "${ID#cpt-}" != "$ID" ] && [ "${CAPTAIN_ASKED:-0}"
   exit 2
 fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = ship ]; then
-  BRANCH="$BRANCH_PREFIX$ID"
+  BRANCH="$BRANCH_PREFIX${FM_BRANCH_SLUG:-$ID}"
   if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
     echo "error: --branch-prefix and task id must form a valid git branch (got '$BRANCH')" >&2
     exit 1
