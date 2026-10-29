@@ -681,6 +681,8 @@ IFS= read -r -d '' SHARED_MACHINE_LOAD_RULE <<'EOF' || true
 10. This is the captain's own 16GB laptop, usually running an emulator, a simulator and Metro.
    NEVER run the full test suite: no bare `jest`, `pnpm test`, `pnpm run test:all`,
    `pnpm run check`, `npm test`, or any equivalent. A full run took the machine down mid-demo.
+   Sharding is NOT a workaround: `--shard=n/m` splits the files but still spawns a worker per
+   core, so it costs the same memory. A crewmate tried it and took the machine down twice.
    Run only the tests for files you changed, capped: `pnpm exec jest <path> --maxWorkers=2`.
    Before any heavy command (tests, a full tsc, a native build) run `memory_pressure`; if free
    memory is under ~30%, do not start it and say so in your status instead.
