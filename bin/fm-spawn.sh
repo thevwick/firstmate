@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--branch-prefix <prefix>] [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--workspace <label>] [--herdr-resume-lock-wait]
 #        fm-spawn.sh <task-id> <project-dir> --scout [--base-branch <branch>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--herdr-resume-lock-wait]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
+#   A task id starting cpt- marks a crew the captain asked for by that name and
+#   only he retires; it is refused unless --captain-asked is passed. Firstmate
+#   never infers that prefix, because asking for the work is not asking for a
+#   cpt- crew. Default to fm-.
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
 #   per task at intake (AGENTS.md section 7); data/projects.md holds the captain's
@@ -942,7 +946,13 @@ BASE_BRANCH_SET=0
 UPSTREAM_CONSENT=
 UPSTREAM_CONSENT_SET=0
 TRACEPARENT_SET=0
+# --workspace <label>: put this task's pane in a named herdr workspace shared
+# with other tasks given the same label, instead of this home's own. Implies
+# the flat layout, because a projected workspace holds exactly one pane.
+WORKSPACE_ARG=
+WORKSPACE_SET=0
 RELAUNCH=0
+CAPTAIN_ASKED=0
 # Opt-in only: exact-resume presentation-order lock waits instead of refusing.
 # Absent/unset keeps upstream refuse-on-contention. See header.
 HERDR_RESUME_LOCK_WAIT=0
@@ -997,6 +1007,10 @@ for a in "$@"; do
       TRACEPARENT_ARG=$a
       TRACEPARENT_SET=1
       ;;
+    workspace)
+      WORKSPACE_ARG=$a
+      WORKSPACE_SET=1
+      ;;
     *)
       echo "error: internal parser state for --$want_value" >&2
       exit 1
@@ -1015,6 +1029,7 @@ for a in "$@"; do
     KIND_SET=1
     ;;
   --relaunch) RELAUNCH=1 ;;
+  --captain-asked) CAPTAIN_ASKED=1 ;;
   --herdr-resume-lock-wait) HERDR_RESUME_LOCK_WAIT=1 ;;
   --harness) want_value=harness ;;
   --harness=*)
@@ -1065,6 +1080,11 @@ for a in "$@"; do
   --traceparent=*)
     TRACEPARENT_ARG=${a#--traceparent=}
     TRACEPARENT_SET=1
+    ;;
+  --workspace) want_value=workspace ;;
+  --workspace=*)
+    WORKSPACE_ARG=${a#--workspace=}
+    WORKSPACE_SET=1
     ;;
   *) POS+=("$a") ;;
   esac
@@ -2025,6 +2045,18 @@ fm_task_id_creation_valid "$ID" || {
   echo "error: invalid task id" >&2
   exit 2
 }
+# The cpt- prefix marks a crew the CAPTAIN asked for by that name and only he
+# retires it, so firstmate must never infer it. Three times a crew firstmate
+# owned was named cpt- because the captain had asked for the work, and each time
+# a finished crew was left standing holding a worktree. --captain-asked makes the
+# claim explicit; without it a cpt- id is refused.
+if [ "$RELAUNCH" -eq 0 ] && [ "${ID#cpt-}" != "$ID" ] && [ "${CAPTAIN_ASKED:-0}" -eq 0 ]; then
+  echo "error: task id '$ID' claims the cpt- prefix, which marks a crew the captain asked for and only he retires." >&2
+  echo "       Asking for the WORK is not asking for a cpt- crew; almost every crew comes from something he asked for." >&2
+  echo "       Use fm-${ID#cpt-} unless he said 'cpt', 'spin one up for me' or 'I want to talk to it'." >&2
+  echo "       If he did, pass --captain-asked." >&2
+  exit 2
+fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = ship ]; then
   BRANCH="$BRANCH_PREFIX$ID"
   if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
@@ -4631,7 +4663,14 @@ else
     fi
     HERDR_PRESENTATION_JOURNAL=$(fm_backend_herdr_projection_journal_path "$STATE" "$ID")
     HERDR_PROJECTED=0
-    if [ "$KIND" != secondmate ] && fm_backend_herdr_presentation_enabled "$CONFIG" "$STATE"; then
+    # --workspace names a shared herdr workspace for this task. A projected
+    # workspace holds exactly one pane by construction, so sharing one means
+    # the flat layout: the label is what container_ensure resolves, and every
+    # task given the same label adopts the same workspace.
+    if [ "$WORKSPACE_SET" = 1 ] && [ -n "$WORKSPACE_ARG" ]; then
+      export FM_HERDR_WORKSPACE_LABEL=$WORKSPACE_ARG
+    fi
+    if [ "$KIND" != secondmate ] && [ "$WORKSPACE_SET" != 1 ] && fm_backend_herdr_presentation_enabled "$CONFIG" "$STATE"; then
       HERDR_SES=$(fm_backend_herdr_session)
       HERDR_PARENT_LABEL=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_workspace_label)
       if [ -e "$HERDR_PRESENTATION_JOURNAL" ] || [ -L "$HERDR_PRESENTATION_JOURNAL" ]; then
