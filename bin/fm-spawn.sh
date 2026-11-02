@@ -4493,7 +4493,12 @@ if [ -e "$STATE/$ID.backlog-close" ] || [ -L "$STATE/$ID.backlog-close" ]; then
   exit 1
 fi
 
-W="fm-$ID"
+# The id already carries its own ownership prefix (fm- or cpt-, see fm-brief.sh),
+# so prepending another produced windows like "fm-fm-intake-stage0".
+case "$ID" in
+  fm-*|cpt-*) W="$ID" ;;
+  *) W="fm-$ID" ;;
+esac
 if [ "$RELAUNCH" -eq 1 ]; then
   # A secondmate's home already resolved WT above through the same validation a
   # fresh secondmate spawn uses; every other kind takes the recorded worktree.

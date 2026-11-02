@@ -951,9 +951,37 @@ fm_backend_resolve_selector() {  # <raw-target> <state-dir>
 # changing call sites.
 
 # fm_backend_capture: bounded plain-text session capture.
+# fm_backend_cpt_pane: true when <target> resolves to a captain-owned `cpt-` task.
+# The captain reads those panes himself, and a scrollback capture snaps his
+# viewport to the bottom mid-read. Resolution is by recorded pane id, so it
+# holds however the caller spells the target.
+fm_backend_cpt_pane() {  # <target>
+  local target=${1:-} state_dir meta pane
+  [ -n "$target" ] || return 1
+  case "$target" in
+    *cpt-*) return 0 ;;
+  esac
+  state_dir=${FM_HOME:-/Users/thev/sitemate/firstmate}/state
+  for meta in "$state_dir"/cpt-*.meta; do
+    [ -e "$meta" ] || continue
+    pane=$(grep -h '^herdr_pane_id=' "$meta" 2>/dev/null | cut -d= -f2)
+    [ -n "$pane" ] || continue
+    case "$target" in
+      *"$pane") return 0 ;;
+    esac
+  done
+  return 1
+}
+
 fm_backend_capture() {  # <backend> <target> <lines> [expected-label]
   local backend=$1
   shift
+  # Scrollback capture is what moves the captain's viewport, so a cpt- pane is
+  # never captured this way. fm_backend_visible_capture reads the viewport as it
+  # already stands and stays available, so busy-detection is not blinded.
+  if [ "${FM_ALLOW_CPT_CAPTURE:-}" != "1" ] && fm_backend_cpt_pane "${1:-}"; then
+    return 1
+  fi
   fm_backend_source "$backend" || return 1
   case "$backend" in
     tmux) fm_backend_tmux_capture "$@" ;;
