@@ -34,7 +34,8 @@ make_tools() { # <world>
   mkdir -p "$fake"
   cat > "$fake/fm-crew-state.sh" <<'SH'
 #!/usr/bin/env bash
-printf 'state: %s · source: fake\n' "${FM_FAKE_CREW_STATE:-unknown}"
+printf 'state: %s · source: %s%s\n' "${FM_FAKE_CREW_STATE:-unknown}" "${FM_FAKE_CREW_SOURCE:-fake}" \
+  "${FM_FAKE_CREW_DETAIL:+ · $FM_FAKE_CREW_DETAIL}"
 SH
   cat > "$fake/tmux" <<'SH'
 #!/usr/bin/env bash
@@ -206,7 +207,7 @@ test_branch_ack_retires_inactive_outcome_receipt() {
     FM_CONFIG_OVERRIDE="$MAIN/config" "$DRAIN" --ack-through "$seq" --recovery-generation "$generation" \
     || fail "branch acknowledgement failed"
 
-  [ "$(wake_count "$MAIN" 'inactive-outcome:')" = 0 ] || fail "branch acknowledgement left its check row queued"
+  no_wake "$MAIN" 'inactive-outcome:' || fail "branch acknowledgement left its check row queued"
   [ "$(outcome_count "$MAIN" pending)" = 0 ] || fail "branch acknowledgement left the terminal-outcome receipt pending"
   [ "$(outcome_count "$MAIN" presented)" = 1 ] || fail "branch acknowledgement never recorded the presentation receipt"
 
@@ -1038,6 +1039,181 @@ SH
   pass "reconciliation state reads set no-forge mode"
 }
 
+no_wake() { # <home> <key prefix>
+  ! grep -q "$2" "$1/state/.wake-queue" 2>/dev/null
+}
+
+drain_and_ack() { # <home>
+  local home=$1 err seq generation
+  err="$WORLD/drain-ack.err"
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$DRAIN" >/dev/null 2> "$err"
+  seq=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation .*/\1/p' "$err")
+  generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$err")
+  [ -n "$seq" ] && [ -n "$generation" ] || fail "drain did not require acknowledgement"
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$DRAIN" --ack-through "$seq" --recovery-generation "$generation"
+}
+
+# A finished worker whose last line is a stale blocked: (the observed shape).
+test_stalled_idle_worker_is_presented_once_per_line() {
+  make_world stalled-idle
+  write_child "$MAIN" child 'blocked: rebase onto 0badc0de failed'
+  FM_FAKE_CREW_STATE=blocked FM_FAKE_CREW_SOURCE=status-log run_reconcile "$MAIN" --startup
+  [ "$(wake_count "$MAIN" 'inactive-outcome:')" = 1 ] || fail "stalled worker was not presented"
+  assert_grep 'stalled without a terminal outcome: child=child endpoint=idle last=blocked pr=https://example.test/owner/repo/pull/1' \
+    "$MAIN/state/.wake-queue" "stalled presentation payload is wrong"
+  grep -Fxq 'state=stalled' "$MAIN/state/terminal-outcomes/"*.pending || fail "stalled record lacks its state"
+
+  FM_FAKE_CREW_STATE=blocked FM_FAKE_CREW_SOURCE=status-log run_reconcile "$MAIN" --startup
+  [ "$(wake_count "$MAIN" 'inactive-outcome:')" = 1 ] || fail "a queued stalled presentation was duplicated"
+  drain_and_ack "$MAIN"
+  [ "$(outcome_count "$MAIN" presented)" = 1 ] || fail "acknowledged stalled presentation got no receipt"
+  FM_FAKE_CREW_STATE=blocked FM_FAKE_CREW_SOURCE=status-log run_reconcile "$MAIN" --startup
+  no_wake "$MAIN" 'inactive-outcome:' || fail "a presented stale line was presented again"
+
+  printf 'working: picked the stack back up\n' >> "$MAIN/state/child.status"
+  age "$MAIN/state/child.status"
+  FM_FAKE_CREW_STATE=working FM_FAKE_CREW_SOURCE=status-log run_reconcile "$MAIN" --startup
+  [ "$(wake_count "$MAIN" 'inactive-outcome:')" = 1 ] || fail "a new stale line was not presented"
+  [ -f "$MAIN/state/child.meta" ] && [ -d "$MAIN/projects/child" ] || fail "stalled presentation touched the task record"
+  pass "a stalled idle worker is presented once per stale line and left standing"
+}
+
+test_stalled_dead_endpoint_is_presented() {
+  make_world stalled-dead
+  write_child "$MAIN" child 'working: rebuilding the stack'
+  FM_FAKE_CREW_STATE=unknown FM_FAKE_CREW_SOURCE=none FM_FAKE_CREW_DETAIL='backend target gone: %9' \
+    run_reconcile "$MAIN" --startup
+  assert_grep 'child=child endpoint=dead last=working' "$MAIN/state/.wake-queue" "dead endpoint was not presented"
+  [ -f "$MAIN/state/child.meta" ] && [ -f "$MAIN/state/child.status" ] || fail "dead endpoint presentation removed records"
+  pass "a dead endpoint with a nonterminal last line is presented"
+}
+
+test_stalled_presentation_exclusions() {
+  local name line crew source detail
+  while IFS='|' read -r name line crew source detail; do
+    make_world "not-stalled-$name"
+    write_child "$MAIN" child "$line"
+    FM_FAKE_CREW_STATE=$crew FM_FAKE_CREW_SOURCE=$source FM_FAKE_CREW_DETAIL=$detail run_reconcile "$MAIN" --startup
+    no_wake "$MAIN" 'inactive-outcome:' || fail "$name was presented as stalled"
+    [ "$(outcome_count "$MAIN" pending)" = 0 ] || fail "$name left a stalled record"
+  done <<'EOF'
+paused|paused: waiting on CI until 2099-01-01T00:00Z|paused|status-log|
+busy|working: compiling|working|pane|harness busy (spinner)
+pipeline|working: validating|working|run-step|ci
+unreachable|working: compiling|unknown|none|backend unreachable (herdr endpoint state: timeout)
+gated-done|done: PR https://example.test/owner/repo/pull/1 checks green|blocked|status-log|named head only in the worker copy
+EOF
+  make_world not-stalled-recent
+  write_child "$MAIN" child 'blocked: just now'
+  touch "$MAIN/state/child.status"
+  FM_FAKE_CREW_STATE=blocked FM_FAKE_CREW_SOURCE=status-log run_reconcile "$MAIN" --startup
+  no_wake "$MAIN" 'inactive-outcome:' || fail "a recently active worker was presented"
+
+  make_world not-stalled-captain
+  write_child "$MAIN" cpt-rig 'blocked: waiting on the device'
+  FM_FAKE_CREW_STATE=blocked FM_FAKE_CREW_SOURCE=status-log run_reconcile "$MAIN" --startup
+  no_wake "$MAIN" 'inactive-outcome:' || fail "a captain-owned task was presented"
+  pass "paused, live, unreachable, gated-done, recent, and captain-owned workers are not presented"
+}
+
+# A secondmate's stalled child is that home's own supervision, not a parent report.
+test_secondmate_stalled_child_stays_in_its_home() {
+  make_world stalled-mate; bind_secondmate local
+  write_child "$MATE" child 'blocked: waiting'
+  : > "$MAIN/state/mate.status"
+  FM_FAKE_CREW_STATE=blocked FM_FAKE_CREW_SOURCE=status-log run_reconcile "$MATE" --startup
+  [ "$(wake_count "$MATE" 'inactive-outcome:')" = 1 ] || fail "secondmate did not present its stalled child"
+  [ ! -s "$MAIN/state/mate.status" ] || fail "a stalled child was reported to the parent channel"
+  pass "a secondmate presents its stalled child in its own home"
+}
+
+write_orphan() { # <home> <id> <status-line>
+  local home=$1 id=$2 line=$3
+  printf '%s\n' "$line" > "$home/state/$id.status"
+  : > "$home/state/$id.turn-ended"
+  : > "$home/state/.seen-${id//./_}_status"
+  : > "$home/state/.seen-${id//./_}_turn-ended"
+  : > "$home/state/.hb-surfaced-${id//./_}"
+  : > "$home/state/.$id.open-decisions-cursor"
+  age "$home/state/$id.status" "$home/state/$id.turn-ended"
+}
+
+test_orphan_status_record_is_cleared() {
+  local f
+  make_world orphan-clear
+  write_orphan "$MAIN" cpt-rfc-rewrite 'working: rewriting'
+  write_orphan "$MAIN" fm-engtest-rig 'done: rig ready'
+  write_child "$MAIN" live 'working: still here'
+  mkdir -p "$MAIN/state/cpt-rfc-rewrite.inbox"
+  printf 'x' > "$MAIN/state/.hash-default_w1_p9"
+  FM_FAKE_CREW_STATE=working FM_FAKE_CREW_SOURCE=pane run_reconcile "$MAIN" --startup
+  for f in cpt-rfc-rewrite.status cpt-rfc-rewrite.turn-ended .seen-cpt-rfc-rewrite_status \
+    .seen-cpt-rfc-rewrite_turn-ended .hb-surfaced-cpt-rfc-rewrite .cpt-rfc-rewrite.open-decisions-cursor \
+    fm-engtest-rig.status fm-engtest-rig.turn-ended; do
+    [ ! -e "$MAIN/state/$f" ] || fail "orphaned record file $f was not cleared"
+  done
+  for f in live.meta live.status live.turn-ended cpt-rfc-rewrite.inbox .hash-default_w1_p9; do
+    [ -e "$MAIN/state/$f" ] || fail "$f is not an orphaned record file but was removed"
+  done
+  [ "$(wake_count "$MAIN" 'orphan-status:')" = 2 ] || fail "cleared orphans were not reported"
+  assert_grep 'orphaned status record cleared: task=cpt-rfc-rewrite' "$MAIN/state/.wake-queue" "orphan report payload is wrong"
+  find "$MAIN/state" -maxdepth 1 -name '.*.lock*' | grep -q . && fail "orphan sweep leaked a lock"
+
+  run_reconcile "$MAIN" --startup
+  [ "$(wake_count "$MAIN" 'orphan-status:')" = 2 ] || fail "a repeat sweep reported again"
+  pass "orphaned status records are cleared precisely and reported once"
+}
+
+test_orphan_status_record_is_retained_when_unsafe() {
+  local holder i
+  make_world orphan-keep
+  write_orphan "$MAIN" fresh 'working: spawn just wrote this'
+  touch "$MAIN/state/fresh.status"
+  write_orphan "$MAIN" spawning 'working: old line'
+  : > "$MAIN/state/.spawning.meta.spawn.4242"
+  write_orphan "$MAIN" decided 'needs-decision [key=pick]: which stack'
+  write_orphan "$MAIN" locked 'working: old line'
+  ln -s "$MAIN/state/fresh.status" "$MAIN/state/linked.status"
+  FM_STATE_OVERRIDE="$MAIN/state" bash -c '
+    . "$1/bin/fm-wake-lib.sh"
+    fm_lock_acquire_wait "$FM_STATE_OVERRIDE/.spawn-locked.lock"
+    : > "$2/spawn-held"
+    while [ ! -e "$2/release-spawn" ]; do sleep 0.05; done
+    fm_lock_release "$FM_STATE_OVERRIDE/.spawn-locked.lock"
+  ' _ "$ROOT" "$WORLD" &
+  holder=$!
+  i=0
+  while [ "$i" -lt 40 ] && [ ! -e "$WORLD/spawn-held" ]; do sleep 0.05; i=$((i + 1)); done
+  [ -e "$WORLD/spawn-held" ] || { reap "$holder"; fail "spawn lock holder did not start"; }
+  run_reconcile "$MAIN" --startup
+  : > "$WORLD/release-spawn"; reap "$holder"
+  for i in fresh spawning decided locked; do
+    [ -f "$MAIN/state/$i.status" ] || fail "unsafe orphan candidate $i was cleared"
+  done
+  [ -L "$MAIN/state/linked.status" ] || fail "a symlinked status was touched"
+  no_wake "$MAIN" 'orphan-status:' || fail "a retained record was reported as cleared"
+
+  fm_write_meta "$MAIN/state/fresh.meta" 'window=firstmate:fm-fresh' 'kind=ship'
+  age "$MAIN/state/fresh.status" "$MAIN/state/fresh.turn-ended"
+  run_reconcile "$MAIN" --startup
+  [ -f "$MAIN/state/fresh.status" ] || fail "a status whose meta arrived late was cleared"
+  [ -f "$MAIN/state/locked.status" ] && fail "a released spawn lock still blocked the orphan sweep"
+  pass "fresh, spawning, locked, decided, and symlinked orphan candidates are retained"
+}
+
+test_orphan_sweep_is_safe_concurrently() {
+  local a b
+  make_world orphan-concurrent
+  write_orphan "$MAIN" ghost 'working: gone'
+  run_reconcile "$MAIN" --startup & a=$!
+  run_reconcile "$MAIN" --startup & b=$!
+  wait "$a" || fail "a concurrent sweep failed"
+  wait "$b" || fail "a concurrent sweep failed"
+  [ ! -e "$MAIN/state/ghost.status" ] || fail "concurrent sweeps left the orphan"
+  [ "$(wake_count "$MAIN" 'orphan-status:')" = 1 ] || fail "concurrent sweeps reported the orphan twice"
+  pass "concurrent sweeps clear an orphan exactly once"
+}
+
 test_main_direct_terminal_presentation_receipt
 test_branch_ack_retires_inactive_outcome_receipt
 test_unpushed_ci_ready_done_is_not_published
@@ -1075,5 +1251,13 @@ test_notice_recovery_does_not_duplicate_wake
 test_missing_parent_binding_names_itself
 test_reconciliation_never_calls_forge
 test_reconciliation_sets_no_forge_mode_for_state_read
+
+test_stalled_idle_worker_is_presented_once_per_line
+test_stalled_dead_endpoint_is_presented
+test_stalled_presentation_exclusions
+test_secondmate_stalled_child_stays_in_its_home
+test_orphan_status_record_is_cleared
+test_orphan_status_record_is_retained_when_unsafe
+test_orphan_sweep_is_safe_concurrently
 
 echo "all inactive reconciliation tests passed"
