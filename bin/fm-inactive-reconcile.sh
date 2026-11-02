@@ -53,10 +53,18 @@
 # terminal done or failed line belongs to the ledger-first path above and is
 # skipped here, so one outcome is never reported twice. It then uses
 # fm-crew-state.sh as the sole current-state source.
-# Only a done or failed state is suspicious enough to create a durable terminal
-# outcome record or wake the supervisor.
-# Working, paused, parked, blocked, unknown, persistent secondmates, and
-# captain-held work retain their existing supervision semantics.
+# A done or failed state creates a durable terminal outcome record.
+# Any other last status line is STALLED when fm-crew-state.sh reads the endpoint
+# as gone or falls back to the log over an idle pane: it is presented once per
+# incarnation and last line through this home's own inactive-outcome wake, never
+# torn down. Paused waits (the watcher rechecks them), cpt-* tasks (the
+# captain's), and live, parked, unreachable, or captain-held work are not.
+#
+# Each cadence scan also clears an ORPHANED state/<id>.status: no <id>.meta, no
+# spawn in flight, no write for FM_INACTIVE_RECONCILE_SECS, and no open decision.
+# Under the spawn and meta locks it retires the log via fm-classify-lib.sh, drops
+# <id>.turn-ended and its seen marker, and queues an `orphan-status:<id>` check.
+# Window-keyed .hash- markers cannot be tied to a task without its meta.
 #
 # A terminal-outcomes/<fingerprint>.pending record remains until its upstream
 # receipt is durable.
@@ -495,6 +503,29 @@ report_child() { # <id>
   report_child_ledger_locked "$id" "$meta"
 }
 
+present_stalled_child_locked() { # <id> <meta> <secondmate-id-or-empty> <state-line> <last-line>
+  local id=$1 meta=$2 self=$3 state_line=$4 last=$5 verb endpoint pr incarnation fingerprint outcome_key payload
+  case "$id" in cpt-*) return 0 ;; esac
+  verb=$(status_line_verb "$last")
+  case "$verb" in done|failed) return 0 ;; esac
+  case "$state_line" in
+    'state: unknown '*'source: none '*'backend target gone'*) endpoint=dead ;;
+    'state: paused '*) return 0 ;;
+    *'source: status-log'*) endpoint=idle ;;
+    *) return 0 ;;
+  esac
+  pr=$(pr_for_task "$meta")
+  incarnation=$(meta_incarnation "$meta")
+  # Binding the last line presents each stale line once; a fresh line is a new event.
+  fingerprint=$(sha256_text "$incarnation|$id|stalled|$last")
+  outcome_key="inactive-stalled-${self:-main}-$id"
+  ensure_record "$fingerprint" "$id" "$incarnation" stalled "$outcome_key" direct presentation "$pr" "$(sha256_text "$last")" || return 1
+  [ -n "$RECORD_PENDING" ] || return 0
+  payload="inactive worker stalled without a terminal outcome: child=$id endpoint=$endpoint last=${verb:-none}"
+  [ -z "$pr" ] || payload="$payload pr=$pr"
+  queue_presentation "$RECORD_PENDING" "$fingerprint" "$payload" || true
+}
+
 reconcile_direct_child_locked() { # <id> <meta> <secondmate-id-or-empty> <timeout>
   local id=$1 meta=$2 self=${3:-} timeout=$4 status turn last age state_line state pr incarnation fingerprint outcome_key payload kind state_rc=0
   [ -f "$meta" ] && [ ! -L "$meta" ] || return 0
@@ -522,7 +553,10 @@ reconcile_direct_child_locked() { # <id> <meta> <secondmate-id-or-empty> <timeou
   case "$state_line" in
     'state: done '*) state='done' ;;
     'state: failed '*) state='failed' ;;
-    *) return 0 ;;
+    *)
+      present_stalled_child_locked "$id" "$meta" "$self" "$state_line" "$last"
+      return
+      ;;
   esac
   pr=$(pr_for_task "$meta")
   incarnation=$(meta_incarnation "$meta")
@@ -560,6 +594,50 @@ reconcile_direct_child() { # <id> <meta> <secondmate-id-or-empty> <timeout>
   reconcile_direct_child_locked "$id" "$meta" "$self" "$timeout" || rc=$?
   fm_lock_release "$lock"
   return "$rc"
+}
+
+orphan_status_quiet() { # <id>
+  local id=$1 tmp
+  [ ! -e "$STATE/$id.meta" ] && [ ! -L "$STATE/$id.meta" ] || return 1
+  [ -f "$STATE/$id.status" ] && [ ! -L "$STATE/$id.status" ] || return 1
+  for tmp in "$STATE/.$id.meta.spawn."* "$STATE/.$id.meta.relaunch."*; do
+    [ ! -e "$tmp" ] && [ ! -L "$tmp" ] || return 1
+  done
+  [ "$(last_activity_age '' "$STATE/$id.status" "$STATE/$id.turn-ended")" -ge "$FM_INACTIVE_RECONCILE_SECS" ]
+}
+
+# Spawn holds the task lock from before its meta exists, and spawn and teardown
+# both hold the meta lock, so quiescence is re-read only once both are ours.
+clear_orphan_status() { # <id>
+  local id=$1 spawn_lock meta_lock turn rc=1
+  orphan_status_quiet "$id" || return 0
+  meta_lock=$(fm_meta_lock_path "$STATE/$id.meta") || return 0
+  spawn_lock="$STATE/.spawn-$id.lock"
+  fm_lock_try_acquire "$spawn_lock" || return 0
+  if fm_lock_try_acquire "$meta_lock"; then
+    # An open decision stays visible in the drain's open-decisions section.
+    if orphan_status_quiet "$id" && [ -z "$(status_open_decisions "$STATE/$id.status")" ] \
+      && status_retire_presentation_task "$STATE" "$id"; then
+      turn="$STATE/$id.turn-ended"
+      rm -f -- "$turn" "$(fm_wake_signal_seen_path "$STATE" "$turn")"
+      rc=0
+    fi
+    fm_lock_release "$meta_lock"
+  fi
+  fm_lock_release "$spawn_lock"
+  [ "$rc" -eq 0 ] || return 0
+  publish_actionable "orphan-status:$id" "orphaned status record cleared: task=$id had no task record" || true
+}
+
+orphan_status_sweep() { # <deadline>
+  local deadline=$1 status id
+  for status in "$STATE"/*.status; do
+    [ "$(date +%s)" -lt "$deadline" ] || return 0
+    [ -f "$status" ] && [ ! -L "$status" ] || continue
+    id=$(basename "$status" .status)
+    valid_id "$id" || continue
+    clear_orphan_status "$id"
+  done
 }
 
 # SCAN_FIRST_VISIT_PENDING is armed by scan() before its passes. The deadline
@@ -622,6 +700,7 @@ scan() {
     return 0
   fi
   deadline=$(( $(date +%s) + FM_INACTIVE_RECONCILE_BUDGET_SECS ))
+  orphan_status_sweep "$deadline"
   SCAN_FIRST_VISIT_PENDING=1
   scan_pass "$cursor" after "$deadline" "$self" || rc=$?
   if [ "$rc" -eq 0 ] && [ -n "$cursor" ]; then
