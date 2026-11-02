@@ -2997,9 +2997,16 @@ fm_capture_output_cleanup() {
 # so a stop is not held for a blocked read (watcher_stop_signals). The group is
 # recorded like a check's, so watcher_cleanup stops a read still in flight.
 watcher_capture() {  # <backend> <target> <lines> [expected-label]
-  local rc pgid
+  local rc pgid cap_task
   fm_capture_output_cleanup
   WATCHER_CAPTURE=
+  # A cpt- pane belongs to the captain, who reads it himself. herdr's scrollback
+  # read snaps his viewport to the bottom, so polling it is a visible nuisance
+  # rather than supervision: firstmate never has to detect a wedge in one.
+  cap_task=$(window_to_task "$2" "$STATE" 2>/dev/null || true)
+  case "$cap_task" in
+    cpt-*) return 1 ;;
+  esac
   FM_CAPTURE_OUTPUT=$(mktemp "$STATE/.fm-capture-output.XXXXXX") || return 1
   FM_CHECK_SIGNAL_PENDING=
   trap 'FM_CHECK_SIGNAL_PENDING=1' HUP INT TERM

@@ -374,6 +374,25 @@ fm_backend_herdr_presentation_enabled() {  # <config-dir> [<state-dir>]
 # nature.
 fm_backend_herdr_workspace_label() {
   local marker="$FM_HOME/$FM_BACKEND_HERDR_SECONDMATE_MARKER" id override line label
+  # FM_HERDR_WORKSPACE_LABEL: one spawn's workspace, for putting a batch of
+  # flat-layout tasks in a shared space of their own instead of this home's.
+  # Same validation as the config file; the secondmate marker still wins, so a
+  # secondmate home can never be redirected out of its own 2ndmate- namespace.
+  if [ -n "${FM_HERDR_WORKSPACE_LABEL:-}" ] && [ ! -f "$marker" ]; then
+    label=${FM_HERDR_WORKSPACE_LABEL}
+    case "$label" in
+      *[[:space:]]*|*:*)
+        echo "warning: FM_HERDR_WORKSPACE_LABEL '$label' contains whitespace or a colon; ignoring it" >&2
+        ;;
+      2ndmate-*)
+        echo "warning: FM_HERDR_WORKSPACE_LABEL '$label' uses the reserved '2ndmate-' secondmate namespace; ignoring it" >&2
+        ;;
+      *)
+        printf '%s' "$label"
+        return 0
+        ;;
+    esac
+  fi
   if [ -f "$marker" ]; then
     id=$(tr -d '[:space:]' < "$marker" 2>/dev/null)
     if [ -n "$id" ]; then
@@ -2028,7 +2047,10 @@ fm_backend_herdr_workspace_ensure() {  # <session> <cwd> [<launcher-relationship
   local session=$1 cwd=$2 relationship=${3:-launcher-home} wsid out label matches count status
   FM_BACKEND_HERDR_WS_ID=""
   FM_BACKEND_HERDR_WS_SEEDED_TAB_ID=""
-  if [ "$relationship" = launcher-home ]; then
+  # An explicit FM_HERDR_WORKSPACE_LABEL asks for a NAMED workspace, so the
+  # launcher-identity short-circuit (which would adopt the launcher's own
+  # workspace and never consult the label) must be skipped for it.
+  if [ "$relationship" = launcher-home ] && [ -z "${FM_HERDR_WORKSPACE_LABEL:-}" ]; then
     fm_backend_herdr_launcher_identity "$session" && status=0 || status=$?
     case "$status" in
       0)
