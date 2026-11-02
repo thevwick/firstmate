@@ -146,8 +146,9 @@
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
 #                          status, unless afk is active
 #   check: inactive-outcome bounded poll-loop reconciliation found a suspicious
-#                          inactive terminal outcome that still lacks its durable
-#                          upstream receipt
+#                          inactive terminal outcome or stalled worker that still
+#                          lacks its durable receipt, or cleared an orphaned
+#                          status record (bin/fm-inactive-reconcile.sh)
 #   check: secondmate wake-loop stalled: mate=<id> row=<seq> idle=<seconds>s
 #                          an actionable row in an endpoint-recorded local
 #                          secondmate home's durable wake queue did not advance
