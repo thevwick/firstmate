@@ -222,6 +222,33 @@ test_name_shared_file_folds_in_a_local_mate() {
   pass "a parent-replies.status in a local mate still folds"
 }
 
+# A standing home is a local mate: the declaration must not move its channel
+# into its own state dir or hide its ordinary self-home files from the folds.
+test_standing_home_resolves_like_a_local_mate() {
+  local standing out
+  standing="$TMP_ROOT/standing-mate"
+  seed_local_mate "$standing" "$PLAIN"
+  fm_declare_standing_home "$standing" mate
+  out=$(FM_TEST_LIB_SOURCED=1 bash -c '
+    . "$1/bin/fm-parent-channel-lib.sh"
+    fm_parent_channel_destination "$2" "$3"
+  ' _ "$ROOT" "$standing" "$standing/state") || fail "a standing home's channel did not resolve"
+  [ "$out" = "$PLAIN_STATE/mate.status" ] \
+    || fail "a standing home's channel must be the parent's state/<id>.status, got: $out"
+  out=$(FM_TEST_LIB_SOURCED=1 bash -c '
+    . "$1/bin/fm-classify-lib.sh"
+    status_scan_parent_channel_exclude "$2"
+  ' _ "$ROOT" "$standing/state")
+  [ -z "$out" ] || fail "a standing home must exclude nothing from its own scans, got: $out"
+  out=$(FM_TEST_LIB_SOURCED=1 bash -c '
+    . "$1/bin/fm-classify-lib.sh"
+    scan_open_decisions "$2"
+  ' _ "$ROOT" "$standing/state") || fail "the standing-home fold failed"
+  printf '%s\n' "$out" | grep -F 'local-shape' >/dev/null \
+    || fail "a standing home's own parent-replies.status must keep folding: $out"
+  pass "a standing home resolves and folds exactly like a local mate"
+}
+
 # --- unit: the watcher's signal scan and heartbeat backstop -----------------
 
 # Source the watcher once with an isolated state/home; its source guard returns
@@ -450,6 +477,7 @@ test_incremental_fold_omits_channel_and_keeps_genuine_task
 test_channel_lines_never_reach_the_remote_unread_surface
 test_name_shared_file_folds_in_a_main_home
 test_name_shared_file_folds_in_a_local_mate
+test_standing_home_resolves_like_a_local_mate
 test_watcher_scan_skips_channel_and_keeps_task_in_remote_mate
 test_record_hygiene_skips_remote_parent_channel
 test_heartbeat_backstop_skips_channel_in_remote_mate

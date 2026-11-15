@@ -257,6 +257,9 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-merge-authority-lib.sh"
 # shellcheck source=bin/fm-afk-contract.sh
 . "$SCRIPT_DIR/fm-afk-contract.sh"
+# shellcheck source=bin/fm-standing-lib.sh
+. "$SCRIPT_DIR/fm-standing-lib.sh"
+fm_standing_refuse_in_home "$FM_HOME" "PR merge" || exit 2
 
 if [ "$#" -lt 2 ]; then
   echo "error: invalid PR merge request" >&2

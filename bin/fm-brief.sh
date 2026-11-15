@@ -17,6 +17,7 @@
 # Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--branch-prefix <prefix>] [--base-branch <branch>] [--forge <none|gerrit|forgejo|external> [--shape squash]] [--pr <auto|manual>] [--herdr-lab]
 #        fm-brief.sh <task-id> <repo-name> --scout [--base-branch <branch>] [--herdr-lab]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
+#        fm-brief.sh <task-id> --standing <project>
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
 #   It offers the Lavish review loop only when `fm-bootstrap.sh lavish-compatible`
@@ -30,6 +31,9 @@
 #   firstmate repo itself (its home is a firstmate worktree, its crews take pooled
 #   worktrees of the same repo). It is mutually exclusive with a project list, and
 #   omitting both still fails loudly so an accidental omission is never silent.
+#   --standing writes a standing charter instead: the secondmate home and parent
+#   channel plus a hands-on contract on exactly one leased worktree of <project>
+#   (bin/fm-standing-lib.sh owns the kind). It takes exactly one project.
 #   Set FM_SECONDMATE_CHARTER='<charter>' to fill the charter text.
 #   Set FM_SECONDMATE_SCOPE='<scope>' to write a routing scope distinct from the charter text.
 #   --herdr-lab is mandatory when the task will issue Herdr lifecycle commands.
@@ -219,6 +223,7 @@ case "$CONFIG" in /*) ;; *) CONFIG="$PWD/$CONFIG" ;; esac
 KIND=ship
 HERDR_LAB=0
 NO_PROJECTS=0
+STANDING=0
 MODE=
 MODE_SET=0
 BRANCH_PREFIX=fm/
@@ -259,6 +264,7 @@ for a in "$@"; do
   case "$a" in
     --scout) KIND=scout ;;
     --secondmate) KIND=secondmate ;;
+    --standing) KIND=secondmate; STANDING=1 ;;
     --herdr-lab) HERDR_LAB=1 ;;
     --no-projects) NO_PROJECTS=1 ;;
     --mode) want_value=mode ;;
@@ -421,6 +427,10 @@ if [ "$NO_PROJECTS" -eq 1 ] && [ "$KIND" != secondmate ]; then
   echo "error: --no-projects applies only to --secondmate charters" >&2
   exit 1
 fi
+if [ "$STANDING" -eq 1 ] && { [ "$NO_PROJECTS" -eq 1 ] || [ "${#POS[@]}" -ne 2 ]; }; then
+  echo "error: --standing takes exactly one project: its one hands-on worktree is a copy of that project" >&2
+  exit 1
+fi
 
 # The optional home-local include is read before anything is written, so an
 # unusable file never leaves a partial scaffold behind.
@@ -536,8 +546,95 @@ else
   PROJECT_CLONES_BODY=$(printf '%s\n' "$SECONDMATE_PROJECTS" | tr ' ' '\n' | sed 's/^/- /')
   PROJECT_CLONES_NOTE="The projects above are local clones for work you supervise; they are not an exclusive ownership claim."
 fi
+if [ "$STANDING" -eq 1 ]; then
+OPENING_LINE="You are a standing agent managed by the main firstmate: a persistent agent the captain talks to directly in this pane. Between jobs you wait for the captain or a request the main firstmate routes to you."
+IFS= read -r -d '' OPERATING_BODY <<EOF || true
+You are in an isolated firstmate home. The local \`AGENTS.md\` is your job description as narrowed by its standing-kind exception, and your local \`data/\`, \`state/\`, \`config/\`, and \`projects/\` dirs are yours to operate.
+You do your own hands-on work: inside your one worktree you may edit files and run state-changing commands such as builds, installs, and device or simulator runs.
+Nowhere else in any project may you write; the clone under \`projects/\` is your worktree's source, not a place to work.
+You hold no crew: never spawn a crewmate, scout, or secondmate, and never delegate, because \`bin/fm-spawn.sh\` refuses in this home.
+You hold no backlog of other agents' work.
+You never push, open or update a pull request, or merge: your commits stay on a local branch in your worktree until the captain lands them.
+Anything outward-facing - a pull request or ticket comment, a review, a message to a person - you draft for the captain in a file under this home's \`data/\` and point to; you never send it.
+Your work is what the captain asks of you in this pane and what the main firstmate routes to you.
+Never start a survey, audit, or "find improvements" sweep on your own initiative; that is not your job and it is unwanted.
+EOF
+IFS= read -r -d '' CHANNEL_BODY <<EOF || true
+Nothing is delivered through this chat. The only way an outcome reaches the captain or the main firstmate is a line appended to $STATUS_FILE, your parent channel; an outcome that is not appended there has not been delivered, even when you also said it here.
+This chat is where the captain talks to you: hold the conversation here, and still treat every outcome, finding, blocker, failure, and finished job as undelivered until its line is on the parent channel.
+Your machinery publishes only a few facts for you (\`bin/fm-parent-channel-lib.sh\`): a task you hold for the captain and its answer, and the correlated answer the helper below appends.
+Everything else you produce exists only in your reasoning until you append it, so append it: a finished job, a finding with a pointer to its doc, a blocker or failure of your own, a recommendation, and anything else the captain must not miss.
+EOF
+IFS= read -r -d '' CAPTAIN_JOBS_SECTION <<EOF || true
+# Captain jobs
+When you accept a job from the captain in this pane, append \`working [key=cpt-<job-slug>] [at=<epoch>]: {the job}\` to the parent channel before you start it.
+Close it with \`done [key=cpt-<job-slug>] [at=<epoch>]: {outcome}\` or \`failed [key=cpt-<job-slug>] [at=<epoch>]: {why}\` when it ends, or \`resolved [key=cpt-<job-slug>] [at=<epoch>]: {why}\` when the captain drops it.
+That keyed pair is what carries the outcome when the captain walks away from a long job, and it is how the main firstmate knows you are busy.
+A conversational answer is not a job; anything that builds, drives a device, or outlasts the conversation is.
+When a marked request arrives while a captain job is open, do not abandon the captain's job for it: answer the request with a correlated line that names the open job and when you expect to take the request.
+
+EOF
+UNMARKED_LINE="A message with NO marker is the captain talking to you in this pane: it is authoritative, and captain-directed work it asks for is in scope; take it on under the captain-job rule above."
+REVIEW_LINES="Use this only for material phase changes, a captain job opening or closing, a captain decision, a real blocker, a failure, or work ready for the captain."
+ROUTINE_LINE="Routine progress, retries, and tool output stay in this chat or this home and must not touch that status file."
+IFS= read -r -d '' DOD_BODY <<EOF || true
+You are persistent by default. Do not exit just because nothing is queued.
+On startup and restart, run \`bin/fm-session-start.sh\` for your own home, which loads this home's records including \`data/learnings.md\`, then reconcile only work that is already yours: an open keyed captain job on the parent channel and anything recorded in this home.
+A relaunch is a fresh conversation, so files are your only memory: an open captain job you cannot resume gets a keyed \`failed\` or \`blocked\` line saying what was lost.
+Your worktree, its build caches, and any device or simulator session do not come back with you on their own; re-establish only what the next job needs, when it needs it.
+When nothing is open after that reconciliation, wait silently for the captain or a routed request.
+An empty queue is a healthy resting state, not a cue to invent work.
+If this charter cannot be carried out, append \`blocked [at=<epoch>]: {why}\` or \`failed [at=<epoch>]: {why}\` to the parent channel and stop.
+
+# Knowledge
+\`data/learnings.md\` is your always-loaded core: corrections the captain gave, traps, never-do rules, and anything else that applies to every job, kept within the startup memory budget.
+Narrower references live in \`data/knowledge/<topic>.md\`, each pointed to by one line in \`data/learnings.md\`; read one when a job touches its topic.
+When the captain corrects you, find the matching entry and edit it in place at once, archiving the superseded text by the \`stow\` skill's cold-tier rule rather than appending a contradicting line.
+A captain preference that reaches beyond this domain goes to the main firstmate on the parent channel; never edit the read-only \`data/captain-shared.md\`.
+EOF
+PROJECT_CLONES_NOTE=
+IFS= read -r -d '' PROJECT_EXTRA_SECTION <<EOF || true
+# Hands-on worktree
+Your one hands-on worktree is a durably leased copy of \`$SECONDMATE_PROJECTS\`, named by the \`worktree=\` line of this home's \`.fm-standing-home\` record.
+It survives relaunches and is released only when the captain retires you.
+
+EOF
+else
+OPENING_LINE="You are a persistent second mate managed by the main firstmate. Work on your own; do not wait for a human."
+IFS= read -r -d '' OPERATING_BODY <<EOF || true
+You are in an isolated firstmate home. The local \`AGENTS.md\` is your job description, and your local \`data/\`, \`state/\`, \`config/\`, and \`projects/\` dirs are yours to operate.
+$PROJECT_CLONES_NOTE
+Delegate project work to your own crewmates with the normal firstmate lifecycle: brief, spawn, status, watcher, steer, teardown, and recovery.
+Do not invent a second delegation system.
+You do not generate your own work.
+Act only on tasks the main firstmate routes to you.
+Never start a survey, audit, or "find improvements" sweep on your own initiative; that is not your job and it is unwanted.
+EOF
+IFS= read -r -d '' CHANNEL_BODY <<EOF || true
+Nobody reads this chat: the captain and the main firstmate see only what is appended to $STATUS_FILE, and a captain-facing sentence that is not appended there has not been sent.
+That file is your parent channel, and in this home it IS the captain: every sentence you would say to the captain, and every outcome the local AGENTS.md tells a firstmate to bring to the captain, is one appended line there, never chat.
+Your own machinery publishes the durable facts about your crew's work for you (\`bin/fm-parent-channel-lib.sh\`): a child's terminal done or failed line with its note and PR on every supervision poll, a PR-ready line when you register a PR, a task you hold for the captain and its answer, a merge, and a child's final line at cleanup all reach the parent channel from the scripts that record them, whether or not you append anything.
+What only you can append is judgement: the answer to a marked request below, a recommendation or caveat on a delivered outcome, a blocker or failure of your own, and anything else you would otherwise say to the captain.
+EOF
+CAPTAIN_JOBS_SECTION=
+UNMARKED_LINE="A message with NO marker is the captain typing directly into your pane: treat it as authoritative captain intervention and stay conversational exactly as you would for any captain message; do not force it onto the status path."
+REVIEW_LINES="Use this only for material phase changes, a captain decision, a real blocker, a failure, work ready for review, or work you landed.
+Work you landed includes a merge you performed yourself under standing merge authority and one the captain merged on the forge: under that authority nothing is ever \\\"ready for review\\\", so a landed merge that goes unreported reaches the captain as silence."
+ROUTINE_LINE="Routine internal supervision, heartbeats, retries, and crewmate churn stay inside your own home and must not touch that status file."
+IFS= read -r -d '' DOD_BODY <<EOF || true
+You are persistent by default. Do not exit just because your queue is empty.
+On startup and restart, run normal firstmate bootstrap and recovery through \`bin/fm-session-start.sh\` for your own home, but only to RECONCILE work that is already yours: in-flight crewmates, tracked backlog items, and durable watches recorded in this home.
+When you have no assigned or in-flight work after that reconciliation, go idle and wait silently for the main firstmate to route you a task.
+An empty queue is a healthy resting state, not a cue to invent work: never spawn a survey, audit, or any self-directed "find work" task on your own initiative.
+If this charter cannot be carried out, append \`blocked [at=<epoch>]: {why}\` or \`failed [at=<epoch>]: {why}\` to the main status file and stop.
+EOF
+PROJECT_EXTRA_SECTION=
+fi
+OPERATING_BODY=${OPERATING_BODY%$'\n'}
+CHANNEL_BODY=${CHANNEL_BODY%$'\n'}
+DOD_BODY=${DOD_BODY%$'\n'}
 cat > "$BRIEF" <<EOF
-You are a persistent second mate managed by the main firstmate. Work on your own; do not wait for a human.
+$OPENING_LINE
 
 # Charter
 $SECONDMATE_CHARTER
@@ -548,22 +645,13 @@ $SECONDMATE_SCOPE
 # Project clones
 $PROJECT_CLONES_BODY
 
-# Operating model
-You are in an isolated firstmate home. The local \`AGENTS.md\` is your job description, and your local \`data/\`, \`state/\`, \`config/\`, and \`projects/\` dirs are yours to operate.
-$PROJECT_CLONES_NOTE
-Delegate project work to your own crewmates with the normal firstmate lifecycle: brief, spawn, status, watcher, steer, teardown, and recovery.
-Do not invent a second delegation system.
-You do not generate your own work.
-Act only on tasks the main firstmate routes to you.
-Never start a survey, audit, or "find improvements" sweep on your own initiative; that is not your job and it is unwanted.
+${PROJECT_EXTRA_SECTION}# Operating model
+$OPERATING_BODY
 
 # The captain and the parent channel
-Nobody reads this chat: the captain and the main firstmate see only what is appended to $STATUS_FILE, and a captain-facing sentence that is not appended there has not been sent.
-That file is your parent channel, and in this home it IS the captain: every sentence you would say to the captain, and every outcome the local AGENTS.md tells a firstmate to bring to the captain, is one appended line there, never chat.
-Your own machinery publishes the durable facts about your crew's work for you (\`bin/fm-parent-channel-lib.sh\`): a child's terminal done or failed line with its note and PR on every supervision poll, a PR-ready line when you register a PR, a task you hold for the captain and its answer, a merge, and a child's final line at cleanup all reach the parent channel from the scripts that record them, whether or not you append anything.
-What only you can append is judgement: the answer to a marked request below, a recommendation or caveat on a delivered outcome, a blocker or failure of your own, and anything else you would otherwise say to the captain.
+$CHANNEL_BODY
 
-# Requests from the main firstmate
+${CAPTAIN_JOBS_SECTION}# Requests from the main firstmate
 You are a firstmate in your own home, so an incoming message reaches you in your own chat.
 You must distinguish who it is from, because the answer goes to a different place.
 A request relayed to you by the main firstmate is tagged with a leading \`$FM_FROMFIRST_LABEL\` marker followed by an invisible system separator; this marker is untypable, so a human never produces it.
@@ -574,7 +662,7 @@ A plain \`echo\` that includes the same \`corr=<id>\` on this parent channel is 
 For a terse result, a status line is the whole answer.
 For a detailed answer (an investigation, a plan, an audit), write it to a doc under your home's \`data/\` and append a status line that points to that doc - the scout-report pattern - so the main firstmate is woken and can read it.
 Before treating an investigation or visual review as complete, load \`captain-hold-lifecycle\` from this home's \`.agents/skills/\` and pass its shared completion gate.
-A message with NO marker is the captain typing directly into your pane: treat it as authoritative captain intervention and stay conversational exactly as you would for any captain message; do not force it onto the status path.
+$UNMARKED_LINE
 A request arriving through the instruction inbox below follows the same marker and reply rules.
 
 $INBOX_SECTION
@@ -586,8 +674,7 @@ Report only true captain-relevant outcomes or a declared external wait by append
 States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
 Substitute \`<epoch>\` with the current Unix time in seconds - run \`date +%s\` and write the number it printed; a stamp that is not plain digits records no time at all.
 Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) only when your domain is deliberately idling on a known external wait you expect to clear on its own, naming when it clears with \`until <YYYY-MM-DDTHH:MMZ>\` (UTC) when you know; use \`blocked:\` when you are stuck and need firstmate to act.
-Use this only for material phase changes, a captain decision, a real blocker, a failure, work ready for review, or work you landed.
-Work you landed includes a merge you performed yourself under standing merge authority and one the captain merged on the forge: under that authority nothing is ever \"ready for review\", so a landed merge that goes unreported reaches the captain as silence.
+$REVIEW_LINES
 This is also how you return the answer to a marked from-firstmate request above.
 A marked request requires one correlated answer after the work; it does not require a separate receipt or start acknowledgement.
 Never append \`working:\` merely to acknowledge receipt or announce that a marked request has started.
@@ -596,19 +683,17 @@ If its first reportable event is \`working [key=<work-slug>]: {material phase}\`
 When a keyed phase ends without another reportable state, append \`resolved [key=<work-slug>] [at=<epoch>]: {why it is no longer active}\`.
 \`resolved\` separately closes an escalated decision or blocker, and only a \`resolved\` line carrying that decision's exact key closes it: a later \`done\` or \`working\` event never does, even when the answer is what started that work.
 The main firstmate's answer normally writes that closing line at answer time; when a blocker or wait clears WITHOUT an answer from the main firstmate, append \`resolved [at=<epoch>]: {how it cleared}\` yourself (keyed with \`[key=<slug>]\` if you opened it with one) as your domain resumes.
-Routine internal supervision, heartbeats, retries, and crewmate churn stay inside your own home and must not touch that status file.
+$ROUTINE_LINE
 
 # Definition of done
-You are persistent by default. Do not exit just because your queue is empty.
-On startup and restart, run normal firstmate bootstrap and recovery through \`bin/fm-session-start.sh\` for your own home, but only to RECONCILE work that is already yours: in-flight crewmates, tracked backlog items, and durable watches recorded in this home.
-When you have no assigned or in-flight work after that reconciliation, go idle and wait silently for the main firstmate to route you a task.
-An empty queue is a healthy resting state, not a cue to invent work: never spawn a survey, audit, or any self-directed "find work" task on your own initiative.
-If this charter cannot be carried out, append \`blocked [at=<epoch>]: {why}\` or \`failed [at=<epoch>]: {why}\` to the main status file and stop.
+$DOD_BODY
 EOF
+CHARTER_KIND="secondmate charter"
+[ "$STANDING" -eq 0 ] || CHARTER_KIND="standing charter"
 if [ "$SECONDMATE_CHARTER" = "{TASK}" ]; then
-  echo "scaffolded: $BRIEF (secondmate charter; replace {TASK})"
+  echo "scaffolded: $BRIEF ($CHARTER_KIND; replace {TASK})"
 else
-  echo "scaffolded: $BRIEF (secondmate charter)"
+  echo "scaffolded: $BRIEF ($CHARTER_KIND)"
 fi
 exit 0
 fi

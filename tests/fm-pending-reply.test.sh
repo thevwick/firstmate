@@ -1889,6 +1889,35 @@ test_mechanical_helper_writes_parent_channel() {
   pass "mechanical helper writes the parent channel from verb, corr, and note"
 }
 
+# A standing agent keeps the marked-request guard and the channel resolver.
+test_standing_agent_keeps_marked_requests_and_helper_routing() {
+  local dir fb log home sm_home got corr rec
+  dir="$TMP_ROOT/send-standing"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"
+  home=$(setup_parent send-standing)
+  sm_home=$(bind_local_mate "$home" rig)
+  fm_declare_standing_home "$sm_home" rig
+  fm_write_standing_meta "$home/state/rig.meta" "$sm_home" "$sm_home/standing-worktree" "sess:fm-rig"
+  run_send "$fb" "$home" "$log" rig "build the release candidate" \
+    || fail "a marked send to a standing agent failed"
+  got=$(latest_record_body "$home" rig)
+  case "$got" in
+    "$FM_FROMFIRST_MARK"corr=*) : ;;
+    *) fail "a standing agent's steer record must embed marker+corr" ;;
+  esac
+  corr=$(fm_pending_reply_extract_corr "$got")
+  rec=$(fm_pending_reply_path "$home/state" "$corr")
+  [ "$(fm_pending_reply_get "$rec" phase)" = awaiting_report ] \
+    || fail "a marked request to a standing agent did not arm the pending-reply guard"
+  FM_HOME="$sm_home" "$REPORT" "done" "$corr" "release candidate built" \
+    || fail "the helper refused a standing home"
+  grep -Fq "corr=$corr" "$home/state/rig.status" \
+    || fail "the helper did not resolve a standing home's parent channel"
+  fm_pending_reply_try_resolve "$home/state" "$corr" \
+    || fail "a standing agent's correlated answer did not resolve its request"
+  pass "a standing agent keeps the marked-request guard and helper channel routing"
+}
+
 test_remote_parent_replies_is_not_wrong_home() {
   local home state sm_home corr rec hits
   home=$(setup_parent remote-parent-replies)
@@ -2169,6 +2198,7 @@ test_same_basename_self_home_corr_resolves_on_tick
 test_same_basename_reply_resolves_after_recovery_failure
 test_child_status_wrong_home_is_not_copied
 test_mechanical_helper_writes_parent_channel
+test_standing_agent_keeps_marked_requests_and_helper_routing
 test_remote_parent_replies_is_not_wrong_home
 test_local_parent_replies_is_wrong_home_evidence
 test_escalated_undelivered_correlation_stays_retryable

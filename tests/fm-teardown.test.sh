@@ -2243,6 +2243,61 @@ test_forced_secondmate_child_scout_nested_clone_returns_clean() {
   pass "a forced secondmate teardown returns a child scout copy with a nested clone clean"
 }
 
+# A standing agent's case: a seeded home whose leased worktree is the case copy.
+make_standing_case() {  # <name> -> case dir
+  local case_dir home
+  case_dir=$(make_case "$1")
+  write_meta "$case_dir" local-only secondmate
+  home="$case_dir/secondmate-home"
+  mkdir -p "$home/state" "$home/data" "$home/config" "$home/projects"
+  printf '%s\n' task-x1 > "$home/.fm-secondmate-home"
+  fm_declare_standing_home "$home" task-x1 project "$case_dir/wt"
+  printf 'home=%s\nstanding=1\nstanding_worktree=%s\n' "$home" "$case_dir/wt" >> "$case_dir/state/task-x1.meta"
+  cat > "$case_dir/fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$(dirname "$0")/../treehouse.log"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+  printf '%s\n' "$case_dir"
+}
+
+# Only the captain retires a standing agent, --force included, and retirement
+# never strands work its worktree holds on no remote.
+test_standing_retirement_is_captain_only_and_returns_its_worktree() {
+  local case_dir rc flags
+  case_dir=$(make_standing_case standing-retire)
+  for flags in '' --force; do
+    rc=0
+    # shellcheck disable=SC2086 # the empty flag set must expand to no argument
+    run_teardown "$case_dir" $flags > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+    expect_code 1 "$rc" "standing-retire: retirement without --captain-asked (${flags:-plain}) must refuse"
+    assert_grep 'only the captain retires one' "$case_dir/stderr" "standing-retire: the refusal did not name the captain-only rule"
+    assert_present "$case_dir/secondmate-home/.fm-standing-home" "standing-retire: a refused retirement touched the home"
+    assert_present "$case_dir/state/task-x1.meta" "standing-retire: a refused retirement removed the task record"
+  done
+
+  wt_commit "$case_dir" "device fix kept local"
+  rc=0
+  run_teardown "$case_dir" --captain-asked > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 1 "$rc" "standing-retire: unlanded worktree work must refuse even when the captain asked"
+  assert_grep 'local commit(s) on no remote' "$case_dir/stderr" "standing-retire: the refusal did not name the unlanded commit"
+  [ ! -e "$case_dir/treehouse.log" ] || fail "standing-retire: a refused retirement returned the worktree"
+
+  rc=0
+  run_teardown "$case_dir" --captain-asked --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "standing-retire: a captain-approved discard must retire the agent: $(cat "$case_dir/stderr")"
+  assert_grep "return --force $case_dir/wt" "$case_dir/treehouse.log" "standing-retire: the leased worktree was not returned"
+  assert_absent "$case_dir/secondmate-home" "standing-retire: the standing home was not removed"
+
+  case_dir=$(make_standing_case standing-retire-clean)
+  rc=0
+  run_teardown "$case_dir" --captain-asked > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  expect_code 0 "$rc" "standing-retire-clean: a clean standing agent must retire when the captain asked: $(cat "$case_dir/stderr")"
+  assert_grep "return --force $case_dir/wt" "$case_dir/treehouse.log" "standing-retire-clean: the leased worktree was not returned"
+  pass "a standing agent retires only when the captain asked, never over unlanded work, and returns its worktree"
+}
+
 # Return succeeds but leaves no readable worktree behind to verify.
 add_treehouse_that_removes_copy() {
   local case_dir=$1
@@ -6667,6 +6722,7 @@ test_ship_nested_clone_is_refused_and_bytes_stay
 test_dirty_return_warns_which_slot_was_lost
 test_dirty_return_warns_even_when_a_later_step_refuses
 test_forced_secondmate_child_scout_nested_clone_returns_clean
+test_standing_retirement_is_captain_only_and_returns_its_worktree
 test_forced_secondmate_dirty_child_return_warns_and_completes
 test_return_that_removes_copy_warns_cannot_verify
 test_scout_ignored_files_survive_scratch_clean

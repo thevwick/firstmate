@@ -12,8 +12,9 @@
 
 # A fake tmux (window ops are logged to FM_FAKE_TMUX_LOG, list-windows returns
 # FM_FAKE_TMUX_WINDOW, capture-pane echoes FM_FAKE_TMUX_CAPTURE) plus a fake
-# treehouse (durable lease of FM_FAKE_TREEHOUSE_HOME, recording the lease holder
-# to FM_FAKE_TREEHOUSE_LEASE_FILE; `return` removes the target and lease unless
+# treehouse (durable lease of FM_FAKE_TREEHOUSE_HOME, a real worktree when
+# FM_FAKE_TREEHOUSE_GIT_WORKTREE is set, recording the lease holder to
+# FM_FAKE_TREEHOUSE_LEASE_FILE; `return` removes the target and lease unless
 # FM_FAKE_TREEHOUSE_RETURN_FAIL is set). Echoes the fakebin dir.
 make_fake_tmux() {
   local dir=$1 fakebin capture
@@ -143,7 +144,11 @@ case "${1:-}" in
       shift
     done
     if [ -n "${FM_FAKE_TREEHOUSE_HOME:-}" ]; then
-      mkdir -p "$FM_FAKE_TREEHOUSE_HOME"
+      if [ -n "${FM_FAKE_TREEHOUSE_GIT_WORKTREE:-}" ]; then
+        git worktree add --quiet --detach "$FM_FAKE_TREEHOUSE_HOME" >/dev/null 2>&1 || exit 1
+      else
+        mkdir -p "$FM_FAKE_TREEHOUSE_HOME"
+      fi
       [ -n "${FM_FAKE_TREEHOUSE_LEASE_FILE:-}" ] && printf '%s\n' "$holder" > "$FM_FAKE_TREEHOUSE_LEASE_FILE"
       printf 'leased worktree for %s\n' "${holder:-unknown}" >&2
       printf '%s\n' "$FM_FAKE_TREEHOUSE_HOME"

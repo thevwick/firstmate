@@ -947,6 +947,119 @@ test_home_seed_refuses_local_only_project() {
   pass "home seeding refuses local-only projects"
 }
 
+# Only the standing kind may seed a local-only project, and it leases exactly
+# one worktree of the new clone, kept across a re-seed.
+test_home_seed_standing_admits_local_only_and_leases_worktree() {
+  local home subhome wt wt_abs fakebin log err
+  home="$TMP_ROOT/standing-seed-home"
+  subhome="$TMP_ROOT/standing-seed-subhome"
+  wt="$TMP_ROOT/standing-seed-wt"
+  err="$TMP_ROOT/standing-seed.err"
+  mkdir -p "$home/projects" "$home/data" "$home/state"
+  fm_git_init_commit "$home/projects/alpha"
+  fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/standing-alpha.git"
+  printf '%s\n' '- alpha [local-only] - alpha project (added 2026-11-15)' > "$home/data/projects.md"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/standing-seed-fake")
+  log="$TMP_ROOT/standing-seed-fake/tmux.log"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$wt" FM_FAKE_TREEHOUSE_GIT_WORKTREE=1 \
+    FM_FAKE_TMUX_LOG="$log" FM_SECONDMATE_CHARTER='engineering rig' \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing alpha >/dev/null 2>"$err" \
+    || fail "standing seed refused a local-only project: $(cat "$err")"
+  wt_abs=$(cd "$wt" && pwd -P)
+  grep -F 'treehouse get --lease --lease-holder rig' "$log" >/dev/null || fail "standing seed did not lease its worktree under the agent id"
+  assert_grep "worktree=$wt_abs" "$subhome/.fm-standing-home" "standing seed did not record the leased worktree"
+  assert_grep 'project=alpha' "$subhome/.fm-standing-home" "standing seed did not record its project"
+  assert_grep '# Hands-on worktree' "$subhome/data/charter.md" "standing seed did not install a standing charter"
+  [ "$(cat "$subhome/.fm-secondmate-home")" = rig ] || fail "standing seed did not write the identity marker"
+  assert_grep 'projects: alpha' "$home/data/secondmates.md" "standing seed did not register its route"
+
+  : > "$log"
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing alpha >/dev/null 2>"$err" \
+    || fail "standing re-seed failed: $(cat "$err")"
+  grep -F 'treehouse get' "$log" >/dev/null && fail "standing re-seed leased a second worktree"
+
+  if FM_HOME="$home" FM_SECONDMATE_CHARTER='x' "$ROOT/bin/fm-home-seed.sh" plain "$TMP_ROOT/standing-seed-plain" alpha >/dev/null 2>"$err"; then
+    fail "an ordinary secondmate seed accepted a local-only project"
+  fi
+  grep -F 'is local-only; secondmate routes support only' "$err" >/dev/null || fail "the ordinary local-only refusal changed"
+  if FM_HOME="$home" FM_SECONDMATE_CHARTER='x' "$ROOT/bin/fm-home-seed.sh" two "$TMP_ROOT/standing-seed-two" --standing alpha alpha >/dev/null 2>"$err"; then
+    fail "a standing seed accepted two projects"
+  fi
+  grep -F -- '--standing takes exactly one project' "$err" >/dev/null || fail "standing seed did not explain its one-project rule"
+  pass "home seeding admits local-only only for the standing kind and leases one durable worktree"
+}
+
+test_home_seed_standing_refuses_conversion_and_rolls_back_its_lease() {
+  local home subhome plain notwt fakebin log err
+  home="$TMP_ROOT/standing-convert-home"
+  subhome="$TMP_ROOT/standing-convert-subhome"
+  plain="$TMP_ROOT/standing-convert-plain"
+  notwt="$TMP_ROOT/standing-convert-notwt"
+  err="$TMP_ROOT/standing-convert.err"
+  mkdir -p "$home/projects" "$home/data" "$home/state"
+  fm_git_init_commit "$home/projects/alpha"
+  fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/standing-convert-alpha.git"
+  printf '%s\n' '- alpha [direct-PR] - alpha project (added 2026-11-15)' > "$home/data/projects.md"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/standing-convert-fake")
+  log="$TMP_ROOT/standing-convert-fake/tmux.log"
+
+  FM_HOME="$home" FM_SECONDMATE_CHARTER='plain domain' "$ROOT/bin/fm-home-seed.sh" plain "$plain" alpha >/dev/null 2>&1 \
+    || fail "ordinary seed failed"
+  rm -rf "$home/data/plain"
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_SECONDMATE_CHARTER='rig' \
+    "$ROOT/bin/fm-home-seed.sh" plain "$plain" --standing alpha >/dev/null 2>"$err"; then
+    fail "a standing seed converted an ordinary secondmate home"
+  fi
+  grep -F 'is seeded as an ordinary secondmate' "$err" >/dev/null || fail "standing seed did not explain the conversion refusal"
+  [ ! -e "$plain/.fm-standing-home" ] || fail "a refused conversion wrote a standing record"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$notwt" FM_FAKE_TMUX_LOG="$log" \
+    FM_SECONDMATE_CHARTER='rig' "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing alpha >/dev/null 2>"$err"; then
+    fail "a standing seed accepted a lease that is not a worktree of its clone"
+  fi
+  grep -F 'is not a git worktree' "$err" >/dev/null || fail "standing seed did not explain the bad lease"
+  grep -F "treehouse return --force $notwt" "$log" >/dev/null || fail "a failed standing seed kept its worktree lease"
+  [ ! -e "$subhome" ] || fail "a failed standing seed left its home behind"
+  if grep -F -- '- rig ' "$home/data/secondmates.md" >/dev/null 2>&1; then
+    fail "a failed standing seed left a registry route"
+  fi
+  pass "home seeding refuses secondmate-to-standing conversion and returns a failed seed's lease"
+}
+
+# Inside a standing home every spawn refuses before any endpoint exists, and a
+# standing home whose record cannot be read never launches.
+test_standing_home_refuses_spawn_and_unreadable_record() {
+  local home standing fakebin log err
+  home="$TMP_ROOT/standing-spawn-home"
+  standing="$TMP_ROOT/standing-spawn-subhome"
+  err="$TMP_ROOT/standing-spawn.err"
+  mkdir -p "$home/data" "$home/state" "$standing/data" "$standing/state" "$standing/config" "$standing/projects/alpha"
+  mark_firstmate_home "$standing"
+  printf 'rig\n' > "$standing/.fm-secondmate-home"
+  printf 'charter\n' > "$standing/data/charter.md"
+  fm_declare_standing_home "$standing" rig alpha "$TMP_ROOT/standing-spawn-wt"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/standing-spawn-fake")
+  log="$TMP_ROOT/standing-spawn-fake/tmux.log"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$standing" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/standing-spawn-fake/pane.txt" \
+    "$ROOT/bin/fm-spawn.sh" helper projects/alpha codex --scout >/dev/null 2>"$err"; then
+    fail "a standing home spawned a crewmate"
+  fi
+  grep -F 'spawn refused: this is a standing home' "$err" >/dev/null || fail "the standing spawn refusal did not explain itself: $(cat "$err")"
+  grep -F 'new-window' "$log" >/dev/null && fail "a refused standing spawn created a window"
+
+  printf 'schema=fm-standing-home.v1\nid=rig\n' > "$standing/.fm-standing-home"
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/standing-spawn-fake/pane.txt" \
+    "$ROOT/bin/fm-spawn.sh" rig "$standing" codex --secondmate >/dev/null 2>"$err"; then
+    fail "a standing home with an unreadable record launched"
+  fi
+  grep -F 'is unreadable or names another agent' "$err" >/dev/null || fail "the unreadable-record refusal did not explain itself: $(cat "$err")"
+  grep -F 'new-window' "$log" >/dev/null && fail "an unreadable standing record still created a window"
+  pass "a standing home refuses every spawn and never launches on an unreadable record"
+}
+
 # A registry entry whose forge token the parser cannot resolve yields no posture
 # at all. Reading that refusal as an empty mode would walk straight past the
 # local-only routing refusal above and clone the project into a secondmate home,
@@ -3143,6 +3256,9 @@ test_home_seed_refuses_projectless_home_with_non_directory_projects
 test_home_seed_refuses_projectless_home_with_uninspectable_registry
 test_home_seed_refuses_missing_projects_without_signal
 test_home_seed_refuses_local_only_project
+test_home_seed_standing_admits_local_only_and_leases_worktree
+test_home_seed_standing_refuses_conversion_and_rolls_back_its_lease
+test_standing_home_refuses_spawn_and_unreadable_record
 test_home_seed_refuses_an_unresolvable_registry_posture
 test_home_seed_refuses_registry_delimiter_home
 test_home_seed_refuses_active_home_and_root

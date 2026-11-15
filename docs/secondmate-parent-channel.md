@@ -6,7 +6,8 @@ This note records why a secondmate home's captain-facing outcomes are delivered 
 
 ## The problem
 
-A secondmate is a firstmate in its own home, and nobody reads its chat: the captain and the main firstmate see only what is appended to the parent channel.
+A secondmate is a firstmate in its own home, and its chat delivers nothing: the captain and the main firstmate receive only what is appended to the parent channel.
+A standing home (`bin/fm-standing-lib.sh`) is the same: the captain talks to its agent in chat, and that conversation is never how an outcome is delivered.
 On 2026-09-02 four outcomes across two mate homes never reached the captain.
 The watcher had delivered the parent's request within a minute each time, the mate did the work, and then the mate addressed "captain" in its own chat instead of appending to the channel.
 The cause is structural rather than a one-off lapse: the mate can satisfy the [address rule in `AGENTS.md`](../AGENTS.md#firstmate) in local chat while missing the charter's later return-channel instruction.
@@ -31,6 +32,7 @@ Every captain-facing outcome that leaves durable evidence in the mate home is pu
 | Child ended silently | terminal current state with a silent ledger | the existing inactive-outcome scan in `bin/fm-inactive-reconcile.sh` |
 | Answer to a marked request | a correlated line guarded by the pending-reply record | `bin/fm-secondmate-report.sh`, which resolves the parent channel from the mate home; the pending-reply guard repairs a line stranded in the local mate's same-basename status file before recovery or escalation |
 | An outcome that exists only in the mate's reasoning | none | the charter and the `AGENTS.md` carve-outs only |
+| A job the captain gave a standing agent in its pane | the agent's keyed `cpt-` working line | the standing charter's captain-job rule only, so it is model-dependent like the row above |
 
 The ledger delivery reads files, plus a local git reachability check on a ship `done:` with no delivery record yet (`bin/fm-dod-lib.sh`): it calls no harness, no forge, and no current-state reader, so it is identical for every harness and runtime backend.
 Each delivery is keyed with the first eight hexadecimal characters of its receipt fingerprint and uses the shared append contract above, and the ledger path reuses the inactive scan's per-fingerprint receipts, so a replayed poll or restart cannot deliver an event twice while a genuinely new terminal event is delivered again.
@@ -59,6 +61,7 @@ It also covers the registration-time ready line and its withholding until checks
 `tests/fm-brief.test.sh` pins the charter's channel rule.
 `tests/fm-pending-reply.test.sh` covers helper-selected local routing, remote-channel classification, same-basename restatement before false escalation, readable wrong-home diagnostics, and the rule that arbitrary mate-home sightings never acknowledge a reply.
 `tests/fm-parent-channel-scan-exclusion.test.sh` covers the home-shape-aware scan exclusion against real remote, main-home, and local-mate fixtures: the watcher signal scan, both heartbeat backstops, the fleet-wide folds, and the real `fm-wake-drain.sh` end to end.
+Every suite above, plus `tests/fm-secondmate-liveness.test.sh`, also runs a standing-home case (`bin/fm-standing-lib.sh`), so the standing declaration cannot drop channel resolution, a publisher, the reply guard, a scan fold, or liveness relaunch; the merge and teardown suites pin that kind's merge refusal and captain-only retirement.
 
 ## Live verification
 

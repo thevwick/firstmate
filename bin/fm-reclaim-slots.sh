@@ -2,7 +2,8 @@
 # Reclaim disk from treehouse slots no live task is using.
 #
 # A slot is reclaimable only when ALL of these hold:
-#   - no state/<id>.meta in ANY firstmate home records it as a worktree
+#   - no state/<id>.meta in ANY firstmate home records it as a worktree or as a
+#     standing agent's leased worktree (bin/fm-standing-lib.sh)
 #   - it is detached with no branch checked out
 #   - it has zero uncommitted changes
 #   - no process holds a file open under it
@@ -28,7 +29,7 @@ held_paths() {
   local home
   for home in "$HOME"/.firstmate-* "$HOME"/sitemate/firstmate "${FM_HOME:-}"; do
     [ -d "$home/state" ] || continue
-    grep -h '^worktree=' "$home"/state/*.meta 2>/dev/null | cut -d= -f2-
+    grep -h -e '^worktree=' -e '^standing_worktree=' "$home"/state/*.meta 2>/dev/null | cut -d= -f2-
   done
 }
 

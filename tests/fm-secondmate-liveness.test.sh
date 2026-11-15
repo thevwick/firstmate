@@ -425,6 +425,28 @@ test_sweep_respawns_on_the_recorded_backend() {
   pass "sweep: a dead secondmate respawns on its recorded backend, not a changed default"
 }
 
+# The standing declaration must not cost a standing agent its relaunch.
+test_sweep_respawns_confirmed_dead_standing_agent() {
+  local w fb tmuxfb log
+  w=$(new_world sweep-dead-standing)
+  add_sm_home "$w" rig firstmate:fm-rig
+  mkdir -p "$w/rig-worktree"
+  fm_declare_standing_home "$w/rig" rig app "$w/rig-worktree"
+  printf 'standing=1\nstanding_worktree=%s\n' "$w/rig-worktree" >> "$w/home/state/rig.meta"
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+
+  run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" >/dev/null
+
+  assert_contains "$(cat "$log")" "new-window" "a confirmed-dead standing agent was not relaunched"
+  assert_grep 'relaunched' "$w/home/state/.secondmate-relaunch-rig" \
+    "a standing agent's relaunch left no durable relaunch record"
+  assert_grep 'standing=1' "$w/home/state/rig.meta" "the relaunched record dropped the standing declaration"
+  assert_grep "standing_worktree=$w/rig-worktree" "$w/home/state/rig.meta" \
+    "the relaunched record dropped the standing worktree"
+  pass "sweep: a confirmed-dead standing agent is relaunched and keeps its declaration"
+}
+
 test_sweep_recovers_the_durable_secondmate_account() {
   local w fb tmuxfb log out
   w=$(new_world sweep-account)
@@ -996,6 +1018,8 @@ test_herdr_agent_state_preserves_husk_classifier
 test_agent_state_dispatcher_and_compatibility
 test_sweep_respawns_confirmed_dead_secondmate
 test_sweep_respawns_on_the_recorded_backend
+
+test_sweep_respawns_confirmed_dead_standing_agent
 test_sweep_recovers_the_durable_secondmate_account
 test_sweep_serializes_distinct_secondmate_relaunches
 test_sweep_keeps_tmux_best_effort_kill_when_close_fails

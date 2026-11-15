@@ -975,6 +975,21 @@ fm_write_secondmate_meta() {
     "projects=$projects"
 }
 
+# fm_declare_standing_home <home> <id> [project] [worktree]: turn a secondmate
+# fixture into a standing home through the production record writer.
+fm_declare_standing_home() {
+  local home=$1 id=$2 project=${3:-alpha} worktree=${4:-$1/standing-worktree}
+  bash -c '. "$1/bin/fm-standing-lib.sh" && fm_standing_record_write "$2" "$3" "$4" "$5"' \
+    _ "$ROOT" "$home" "$id" "$project" "$worktree"
+}
+
+# fm_write_standing_meta <file> <home> <worktree> [window]: the parent's record
+# of a standing agent, as bin/fm-spawn.sh writes it for a standing home.
+fm_write_standing_meta() {
+  fm_write_secondmate_meta "$1" "$2" "${4:-}"
+  printf 'standing=1\nstanding_worktree=%s\n' "$3" >> "$1"
+}
+
 # --- common assertions ------------------------------------------------------
 
 # assert_equals <expected> <actual> <msg>

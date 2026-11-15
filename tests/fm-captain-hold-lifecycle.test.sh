@@ -1645,6 +1645,35 @@ EOF
   pass "a secondmate home publishes each hold occurrence and its answer on the parent channel"
 }
 
+# The standing declaration must not cost a hold or its answer its publisher.
+test_standing_home_publishes_holds_and_answers() {
+  local parent mate fakebin channel decision
+  parent=$(make_home parent-standing-channel)
+  mate="$TMP_ROOT/standing-channel-home"
+  mkdir -p "$mate/data" "$mate/state" "$mate/config" "$mate/projects"
+  fm_test_tasks_toml "$mate/.tasks.toml"
+  printf '# Synthetic standing home\n' > "$mate/AGENTS.md"
+  printf 'standing-mate\n' > "$mate/.fm-secondmate-home"
+  printf 'schema=fm-secondmate-parent.v1\nroute=local\nparent_home=%s\n' "$parent" \
+    > "$mate/.fm-secondmate-parent"
+  fm_declare_standing_home "$mate" standing-mate
+  printf '## In flight\n\n## Queued\n\n## Done\n' > "$mate/data/backlog.md"
+  fakebin=$(fm_fakebin "$mate")
+  fm_fake_exit0 "$fakebin" tmux treehouse no-mistakes gh gh-axi
+  channel="$parent/state/standing-mate.status"
+  decision="$mate/decision.txt"
+
+  run_captain "$mate" hold device-call --title "Choose the device" \
+    --reason "device choice pending" --repo sample >/dev/null || fail "standing hold failed"
+  assert_grep 'needs-decision [key=captain-hold-device-call-1]: captain hold device-call: device choice pending' \
+    <(sed -E 's/ \[at=[0-9]+\]//' "$channel") "a standing home's hold did not reach the parent channel"
+  printf 'use the pixel\n' > "$decision"
+  run_captain "$mate" answer device-call --decision-file "$decision" >/dev/null || fail "standing answer failed"
+  assert_grep 'resolved [key=captain-hold-device-call-1]: captain hold device-call: answered' \
+    <(sed -E 's/ \[at=[0-9]+\]//' "$channel") "a standing home's answer did not close the parent decision"
+  pass "a standing home publishes a hold and its answer on the parent channel like any secondmate"
+}
+
 test_secondmate_reconcile_publishes_before_request_retirement() {
   local parent mate channel evidence out show rc request
   parent=$(make_home reconcile-parent-channel)
@@ -5142,6 +5171,7 @@ test_completion_replaces_a_pair_recorded_after_pr
 test_terminal_single_owner_status_decision_does_not_block_empty_inventory
 test_secondmate_hold_stays_in_authoritative_home
 test_secondmate_home_publishes_holds_and_answers
+test_standing_home_publishes_holds_and_answers
 test_secondmate_reconcile_publishes_before_request_retirement
 test_bound_channel_answers_close_at_answer_time
 test_reconcile_never_closes_through_the_keyed_answer_intake

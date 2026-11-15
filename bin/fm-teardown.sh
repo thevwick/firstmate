@@ -209,7 +209,11 @@
 # leased home releases its durable treehouse lease so the pool slot is freed,
 # never left leased forever. If the treehouse return fails, teardown leaves the
 # leased home and state in place instead of hiding a still-held lease.
-# Usage: fm-teardown.sh <task-id> [--force] [--legacy-record]
+# A standing agent (bin/fm-standing-lib.sh) is retired only with --captain-asked,
+# which says the captain explicitly asked for that retirement, mirroring the cpt-
+# gate in bin/fm-spawn.sh. Without --force it also refuses while the leased
+# worktree holds work found on no remote, and it returns that lease before the home.
+# Usage: fm-teardown.sh <task-id> [--force] [--legacy-record] [--captain-asked]
 #   --force skips ordinary-task dirty and landed-work checks, skips scout report
 #   checks and closes the scout as discarded with no report recorded, and
 #   discards secondmate child work for kind=secondmate. Only use it when the
@@ -543,11 +547,13 @@ ID=$1
 TEARDOWN_LOST_SLOT_EXIT=4
 FORCE=
 LEGACY_RECORD_GIVEN=0
+CAPTAIN_ASKED=0
 shift
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --force) FORCE=--force ;;
     --legacy-record) LEGACY_RECORD_GIVEN=1 ;;
+    --captain-asked) CAPTAIN_ASKED=1 ;;
     *)
       echo "error: invalid teardown request" >&2
       exit 2
@@ -561,6 +567,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 }
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-standing-lib.sh
+. "$SCRIPT_DIR/fm-standing-lib.sh"
 # Supervision lease guard: post-landing cleanup is overlap territory between
 # the two Pi supervision actors; refuse while the OTHER actor holds this
 # task's live lease (contract: bin/fm-lease-lib.sh; no-op in homes without
@@ -680,6 +688,11 @@ TEARDOWN_META_KIND=$(fm_meta_get "$META" kind)
 # Retiring a persistent secondmate is main's alone in both postures; the kind
 # is read under the metadata lock (role partition: bin/fm-lease-lib.sh).
 [ "$TEARDOWN_META_KIND" != secondmate ] || fm_lease_forbid_branch "secondmate retirement (fm-teardown)"
+if [ "$TEARDOWN_META_KIND" = secondmate ] && [ "$CAPTAIN_ASKED" -eq 0 ] && fm_standing_meta "$META"; then
+  echo "REFUSED: $ID is a standing agent, and only the captain retires one." >&2
+  echo "Retire it only when the captain explicitly said to, and then pass --captain-asked." >&2
+  exit 1
+fi
 # A secondmate's endpoint-liveness episodes (bin/fm-secondmate-liveness-lib.sh)
 # serialize on this lock; retirement holds it to the end so no probe or relaunch
 # can act on the route mid-teardown, and its relaunch ledger and park marker are
@@ -1301,6 +1314,20 @@ if [ "${FM_TEARDOWN_GUARD_DONE:-0}" != 1 ]; then
   "$FM_ROOT/bin/fm-guard.sh" || true
 fi
 HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
+STANDING_WORKTREE=
+STANDING_SRC=
+if [ "$TEARDOWN_META_KIND" = secondmate ] && fm_standing_meta "$META"; then
+  STANDING_WORKTREE=$(fm_meta_get "$META" standing_worktree)
+  if fm_standing_record_parse "$HOME_PATH/$FM_STANDING_RECORD"; then
+    [ -n "$STANDING_WORKTREE" ] || STANDING_WORKTREE=$FM_STANDING_WORKTREE
+    STANDING_SRC="$HOME_PATH/projects/$FM_STANDING_PROJECT"
+    [ -d "$STANDING_SRC" ] || STANDING_SRC=
+  fi
+  if [ -z "$STANDING_WORKTREE" ] && [ "$FORCE" != --force ]; then
+    echo "REFUSED: standing agent $ID names no readable worktree, so its work cannot be proven landed; repair $HOME_PATH/$FM_STANDING_RECORD or get the captain's explicit OK to discard, then --force." >&2
+    exit 1
+  fi
+fi
 PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 # tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
 # (/tmp/fm-<id>/); absent for tasks spawned before that change, so tolerate empty.
@@ -3770,6 +3797,14 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
     done
   fi
   secondmate_unresolved_pending_replies_refuse || exit 1
+  if [ -n "$STANDING_WORKTREE" ]; then
+    standing_unlanded=$(fm_standing_worktree_unlanded "$STANDING_WORKTREE")
+    if [ -n "$standing_unlanded" ]; then
+      echo "REFUSED: $standing_unlanded." >&2
+      echo "Have the captain land or keep that work, or get the captain's explicit OK to discard it, then --force." >&2
+      exit 1
+    fi
+  fi
 fi
 
 if [ "$KIND" = secondmate ]; then
@@ -4182,6 +4217,13 @@ if [ "$KIND" != secondmate ]; then
     echo "error: $ID's final outcome has not reached the parent channel; retaining every durable task record so a rerun can retry the delivery" >&2
     exit 1
   fi
+fi
+if [ "$KIND" = secondmate ] && [ -n "$STANDING_WORKTREE" ] && [ -d "$STANDING_WORKTREE" ]; then
+  # The worktree is linked to a clone inside the home, so it goes back first.
+  teardown_treehouse_return "$STANDING_WORKTREE" "${STANDING_SRC:-${HOME_PATH:-/}}" "standing worktree" || {
+    echo "error: treehouse return failed for standing worktree $STANDING_WORKTREE; preserving the standing home and route" >&2
+    exit 1
+  }
 fi
 teardown_export_records "$STATE" "$ID" || exit 1
 if [ "$KIND" = secondmate ]; then

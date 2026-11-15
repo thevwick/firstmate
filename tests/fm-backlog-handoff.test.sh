@@ -56,6 +56,25 @@ doorbell_count() { # <backend-log>
   grep -cF 'Firstmate instruction waiting:' "$1" 2>/dev/null || true
 }
 
+# A standing agent holds no backlog of other agents' work: a handoff to one
+# refuses before either backlog changes.
+test_handoff_refuses_a_standing_agent() {
+  local home="$TMP_ROOT/standing-main" sub="$TMP_ROOT/standing-sub" err="$TMP_ROOT/standing-handoff.err" before
+  setup_homes "$home" "$sub" rig
+  mkdir -p "$sub/state"
+  fm_declare_standing_home "$sub" rig
+  printf '## Queued\n- [ ] device-item - routed to a standing agent (repo: alpha)\n\n## Done\n' > "$home/data/backlog.md"
+  printf '## Queued\n\n## Done\n' > "$sub/data/backlog.md"
+  before=$(cat "$home/data/backlog.md")
+  if FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" rig device-item >/dev/null 2>"$err"; then
+    fail "a backlog handoff to a standing agent succeeded"
+  fi
+  grep -F 'holds no backlog of other agents' "$err" >/dev/null || fail "the standing handoff refusal did not explain itself: $(cat "$err")"
+  [ "$(cat "$home/data/backlog.md")" = "$before" ] || fail "a refused standing handoff changed the main backlog"
+  assert_no_grep 'device-item' "$sub/data/backlog.md" "a refused standing handoff reached the standing backlog"
+  pass "a backlog handoff refuses a standing agent before any move"
+}
+
 # A live local receiver gets the routed-work instruction through its durable
 # inbox record while the endpoint receives only the constant doorbell.
 test_handoff_wakes_live_local_receiver() {
@@ -1368,6 +1387,7 @@ EOF
   pass "a cwd .tasks.toml for another backend does not redirect a markdown handoff"
 }
 
+test_handoff_refuses_a_standing_agent
 test_handoff_wakes_live_local_receiver
 test_cwd_tasks_toml_does_not_redirect_handoff
 test_failed_wake_retries_when_the_item_is_already_present

@@ -1040,6 +1040,32 @@ test_watcher_hook_and_idle_secondmate_exemption() {
   pass "watcher hook wakes for terminal loss and preserves idle secondmate exemption"
 }
 
+# A standing home keeps both halves: its outcomes still resolve the channel,
+# and its quiet pane is still the healthy idle state, not an inactive outcome.
+test_standing_home_keeps_channel_and_idle_exemption() {
+  local pid
+  make_world standing-channel; bind_secondmate local; fm_declare_standing_home "$MATE" mate
+  write_child "$MATE" child 'failed: device lost'
+  FM_FAKE_CREW_STATE='unknown' run_reconcile "$MATE"
+  grep -q 'child-outcome-child-failed' "$MAIN/state/mate.status" \
+    || fail "a standing home did not resolve its parent channel: $(cat "$MAIN/state/mate.status" 2>/dev/null)"
+
+  make_world idle-standing; bind_secondmate local; fm_declare_standing_home "$MATE" mate
+  fm_write_standing_meta "$MAIN/state/mate.meta" "$MATE" "$MATE/standing-worktree"
+  printf 'working [key=cpt-build]: building the release candidate\n' > "$MAIN/state/mate.status"
+  age "$MAIN/state/mate.meta" "$MAIN/state/mate.status"
+  prime_seen "$MAIN/state" "$MAIN/state/mate.status"
+  PATH="$WORLD/fakebin:$PATH" FM_HOME="$MAIN" FM_STATE_OVERRIDE="$MAIN/state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$WORLD/idle.out" 2>&1 &
+  pid=$!; sleep 2; kill -0 "$pid" 2>/dev/null || fail "idle standing watcher exited unexpectedly"; reap "$pid"
+  grep -F 'stale:' "$WORLD/idle.out" >/dev/null && fail "an idle standing agent was treated as a wedge"
+  write_child "$MAIN" crew 'working: quiet since'
+  FM_FAKE_CREW_STATE='done' run_reconcile "$MAIN" --startup >/dev/null
+  grep -qs 'child=crew' "$MAIN/state/.wake-queue" || fail "the control crew's inactive outcome was not reported"
+  ! grep -qs 'child=mate' "$MAIN/state/.wake-queue" || fail "an idle standing agent was reported as an inactive outcome"
+  pass "a standing home resolves its parent channel and its idle pane stays exempt"
+}
+
 # The real watcher poll in a secondmate home delivers a child's terminal ledger
 # line to the parent channel on its first cycle, with no line appended by the
 # mate and no wake needed in the mate home for it.
@@ -1688,6 +1714,7 @@ test_heartbeat_cap_does_not_delay_reconciliation
 test_scan_marker_replaces_symlink_safely
 test_nonterminal_and_captain_held_states_do_not_report
 test_watcher_hook_and_idle_secondmate_exemption
+test_standing_home_keeps_channel_and_idle_exemption
 test_watcher_poll_delivers_child_ledger_line_to_parent
 test_stalled_state_read_is_bounded_and_scan_progresses
 test_stalled_liveness_read_is_bounded_and_scan_progresses

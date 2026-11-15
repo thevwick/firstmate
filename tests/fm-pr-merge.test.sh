@@ -3226,6 +3226,35 @@ test_secondmate_merge_reports_on_the_local_route() {
   pass "a locally routed secondmate home reports the landed PR into its parent's own channel"
 }
 
+# Both merge entrypoints refuse in a standing home before any forge call; the
+# same home without the declaration merges in the local-route test above.
+test_standing_home_refuses_every_merge() {
+  local case_dir parent rc
+  parent="$TMP_ROOT/standing-merge/parent"
+  case_dir=$(make_home_case standing-merge local "$parent")
+  mkdir -p "$parent/state"
+  fm_declare_standing_home "$case_dir/home" mate-x
+  add_gh_mocks "$case_dir" 6666666666666666666666666666666666666666
+  : >"$case_dir/gh-axi.log"
+  : >"$case_dir/gh.log"
+
+  rc=0
+  FM_TEST_HOME="$case_dir/home" run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/64 \
+    >"$case_dir/stdout" 2>"$case_dir/stderr" || rc=$?
+  expect_code 2 "$rc" "standing-merge: a PR merge from a standing home must be refused"
+  assert_grep 'this is a standing home' "$case_dir/stderr" "standing-merge: the refusal did not name the standing home"
+  [ ! -s "$case_dir/gh-axi.log" ] && [ ! -s "$case_dir/gh.log" ] \
+    || fail "standing-merge: a refused merge still reached the forge"
+  [ ! -e "$parent/state/mate-x.status" ] || fail "standing-merge: a refused merge reported an outcome"
+
+  rc=0
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$case_dir/home" FM_STATE_OVERRIDE="$case_dir/state" \
+    "$ROOT/bin/fm-merge-local.sh" task-x1 >/dev/null 2>"$case_dir/local.err" || rc=$?
+  expect_code 2 "$rc" "standing-merge: a local merge from a standing home must be refused"
+  assert_grep 'this is a standing home' "$case_dir/local.err" "standing-merge: the local refusal did not name the standing home"
+  pass "a standing home refuses both PR and local merges before touching anything"
+}
+
 test_failed_merge_reports_nothing() {
   local case_dir rc
   case_dir=$(make_home_case failed-merge-silent remote)
@@ -5491,6 +5520,7 @@ test_allow_no_pipeline_is_attended_only_and_gitlab_only() {
 test_gitlab_head_override_args_refuse_before_recording
 test_secondmate_merge_reports_upward_once
 test_secondmate_merge_reports_on_the_local_route
+test_standing_home_refuses_every_merge
 test_gitlab_merge_reports_upward
 test_queued_gitlab_merge_leaves_the_poll_armed
 test_failed_merge_reports_nothing

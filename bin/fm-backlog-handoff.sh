@@ -19,6 +19,8 @@
 #   - proving the destination is a genuine seeded secondmate home
 #     (.fm-secondmate-home marker, AGENTS.md + bin/), never a project clone, the
 #     active home, or the firstmate repo;
+#   - refusing a standing home (bin/fm-standing-lib.sh), which holds no backlog
+#     of other agents' work;
 #   - moving only `## Queued` items, refusing `## In flight` and historical
 #     `## Done` records, which must stay with their home for pruning or
 #     archiving;
@@ -97,6 +99,8 @@ MAIN_BACKLOG="$DATA/backlog.md"
 . "$SCRIPT_DIR/fm-public-followup-lib.sh"
 # shellcheck source=bin/fm-pending-reply-lib.sh
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
+# shellcheck source=bin/fm-standing-lib.sh
+. "$SCRIPT_DIR/fm-standing-lib.sh"
 
 RECEIVER_WAKE_MESSAGE='New routed work is in your backlog. Run bin/fm-session-start.sh now, then act on the routed task.'
 
@@ -257,6 +261,10 @@ validate_secondmate_home() {
   fi
   if [ ! -d "$abs_home/bin" ]; then
     echo "error: $home is not a firstmate home (missing bin/)" >&2
+    return 1
+  fi
+  if fm_standing_home "$abs_home"; then
+    echo "error: $id is a standing agent, which holds no backlog of other agents' work; send it the request with bin/fm-send.sh instead" >&2
     return 1
   fi
   printf '%s\n' "$abs_home"

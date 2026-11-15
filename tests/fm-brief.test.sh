@@ -1314,6 +1314,48 @@ test_inbox_guidance_explains_marked_body_terminator() {
   pass "fm-brief: inbox guidance explains marked synthetic terminators in every scaffold"
 }
 
+# The standing charter is where the 2026-09-02 lost-delivery shape could return,
+# so its channel rule must come first and nothing may say the captain reads chat.
+test_standing_charter() {
+  local home brief status rule_line talk_line
+  home="$TMP_ROOT/standing-charter"
+  mkdir -p "$home/data"
+  FM_HOME="$home" FM_SECONDMATE_CHARTER='Engineering test rig.' \
+    "$ROOT/bin/fm-brief.sh" rig --standing app >/dev/null 2>&1; status=$?
+  expect_code 0 "$status" "--standing charter should scaffold"
+  brief="$home/data/rig/brief.md"
+  assert_grep '# The captain and the parent channel' "$brief" "standing charter lost the parent-channel section"
+  assert_grep 'Nothing is delivered through this chat.' "$brief" "standing charter lost the unconditional channel rule"
+  assert_grep 'This chat is where the captain talks to you' "$brief" "standing charter does not let the captain talk to it"
+  rule_line=$(grep -n 'Nothing is delivered through this chat.' "$brief" | head -1 | cut -d: -f1)
+  talk_line=$(grep -n 'This chat is where the captain talks to you' "$brief" | head -1 | cut -d: -f1)
+  [ "$rule_line" -lt "$talk_line" ] || fail "standing charter put the conversation ahead of the channel rule"
+  if grep -inE 'captain[^.]*reads?[^.]*chat' "$brief" >/dev/null; then
+    fail "standing charter describes chat as something the captain reads: $(grep -inE 'captain[^.]*reads?[^.]*chat' "$brief")"
+  fi
+  assert_no_grep 'Nobody reads this chat' "$brief" "standing charter kept the ordinary unread-chat wording"
+  assert_no_grep 'it IS the captain' "$brief" "standing charter kept the channel-is-the-captain wording"
+  assert_no_grep 'Work on your own; do not wait for a human' "$brief" "standing charter tells the agent not to wait for the captain"
+  assert_no_grep 'Act only on tasks the main firstmate routes to you' "$brief" "standing charter still excludes captain-directed work"
+  assert_grep 'captain-directed work it asks for is in scope' "$brief" "standing charter does not scope in captain-directed work"
+  assert_grep 'working [key=cpt-<job-slug>]' "$brief" "standing charter lost the keyed captain-job opener"
+  assert_grep 'done [key=cpt-<job-slug>]' "$brief" "standing charter lost the keyed captain-job closer"
+  assert_grep '# Hands-on worktree' "$brief" "standing charter lost its worktree section"
+  assert_grep 'never spawn a crewmate, scout, or secondmate' "$brief" "standing charter lost the no-crew strip"
+  assert_grep 'You never push, open or update a pull request, or merge' "$brief" "standing charter lost the no-delivery strip"
+  assert_grep 'you never send it' "$brief" "standing charter lost the drafted-for-the-captain rule"
+  assert_grep 'data/knowledge/<topic>.md' "$brief" "standing charter lost its on-demand knowledge owner"
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" none --standing >/dev/null 2>&1; status=$?
+  expect_code 1 "$status" "--standing with no project must fail"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" two --standing app other >/dev/null 2>&1; status=$?
+  expect_code 1 "$status" "--standing with two projects must fail"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" bare --standing --no-projects >/dev/null 2>&1; status=$?
+  expect_code 1 "$status" "--standing with --no-projects must fail"
+  assert_absent "$home/data/two/brief.md" "a refused standing scaffold still wrote a file"
+  pass "fm-brief: the standing charter keeps the channel rule first and lets the captain talk to it"
+}
+
 test_worker_role_scope() {
   local kind home brief
   home="$TMP_ROOT/worker-role"
@@ -1618,6 +1660,7 @@ test_branch_prefix_command_is_shell_safe() {
 }
 
 test_worker_role_scope
+test_standing_charter
 
 # Rule 2 governs file edits rather than pool administration, so every crewmate
 # scaffold must prohibit the administrative act itself. The rule is emitted from

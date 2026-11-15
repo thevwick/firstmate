@@ -1,7 +1,7 @@
 ---
 name: secondmate-provisioning
 description: >-
-  Load when creating, seeding, validating, launching, recovering, handing backlog to, pushing inherited local material into, or retiring a secondmate home, or when editing data/secondmates.md.
+  Load when creating, seeding, validating, launching, recovering, handing backlog to, pushing inherited local material into, or retiring a secondmate or standing home, or when editing data/secondmates.md.
 user-invocable: false
 metadata:
   internal: true
@@ -154,8 +154,20 @@ Seeding is transactional.
 If validation, cloning, no-mistakes initialization, or registry update fails, generated briefs, new homes, new project clones, and registry edits are rolled back.
 
 Secondmate project lists may include `no-mistakes` and `direct-PR` projects only.
-`local-only` projects stay with the main firstmate.
+`local-only` projects stay with the main firstmate, except the one project of a standing home below.
 For `no-mistakes` projects, seeding initializes only projects newly cloned into a secondmate home and refuses to mutate a preexisting clone that is not already initialized.
+
+## Standing kind
+
+A standing agent is a persistent agent the captain talks to directly and that does its own hands-on work; [`bin/fm-standing-lib.sh`](../../../bin/fm-standing-lib.sh) owns the kind's declaration and every branch where it differs from an ordinary secondmate.
+Scaffold its charter with `bin/fm-brief.sh <id> --standing <project>` and seed it with `bin/fm-home-seed.sh <id> <home|-> --standing <project>`; each takes exactly one project, which may be `local-only`.
+The seed durably leases one worktree of that project's new clone under the agent's id, and launch, recovery, relaunch, and sync then follow this skill's ordinary secondmate paths.
+Prefer a `cpt-` id, so the captain-pane protections that key on that prefix also cover the pane the captain talks in.
+Route work to it as a marked `fm-send` request, never as a backlog handoff, which `bin/fm-backlog-handoff.sh` refuses.
+Before routing, read its parent channel for an open keyed `cpt-` captain job: while one is open the agent is busy with the captain's own work.
+Only the captain retires a standing agent: run `bin/fm-teardown.sh <id> --captain-asked` only when the captain explicitly said to retire it, and teardown refuses without that flag.
+Retirement also refuses while the leased worktree holds uncommitted work or commits found on no remote, unless the captain explicitly said to discard them and `--force` is passed, and it returns the worktree lease before the home.
+The standing charter owns the agent's conversation, captain-job, and knowledge rules.
 
 ## Record intake for an existing or inherited domain
 
@@ -205,7 +217,7 @@ It is idempotent; an item already in the secondmate backlog is skipped.
 After a successful move it warns for any moved key that still owes a public relay reply bound to `main/<key>`, because that binding no longer names the home owning the work; rebind the commitment to `secondmate:<id>` through the `fmx-respond` promised-final procedure, which owns those commands.
 That same rule governs routing generally: a Relay-linked request whose work goes to a secondmate cannot use the home-local mention link at all and needs a promised-final commitment bound to that secondmate's home.
 It refuses any destination that is not a genuine seeded firstmate home with safe operational directories and a matching `.fm-secondmate-home` marker, so a move can never land in a project.
-Do not hand off `local-only` items.
+Do not hand off `local-only` items, and never hand off to a standing agent.
 
 ## Recovery
 
@@ -240,7 +252,7 @@ It never initiates a survey or audit during recovery.
 
 A secondmate is persistent by default.
 An empty queue is healthy and does not trigger teardown.
-Run `bin/fm-teardown.sh <id>` for `kind=secondmate` only when the captain or main firstmate explicitly decides to retire that persistent second mate.
+Run `bin/fm-teardown.sh <id>` for `kind=secondmate` only when the captain or main firstmate explicitly decides to retire that persistent second mate; a standing agent is the captain's alone to retire, as the standing-kind section above says.
 
 The safety check is the secondmate's own home.
 Teardown refuses while its `state/*.meta` contains in-flight work.
