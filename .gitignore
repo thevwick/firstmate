@@ -12,5 +12,6 @@ __pycache__/
 .env
 config/
 bin/fm-console/node_modules/
+.claude/settings.local.json
 
 .tools/
