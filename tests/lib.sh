@@ -975,19 +975,28 @@ fm_write_secondmate_meta() {
     "projects=$projects"
 }
 
-# fm_declare_standing_home <home> <id> [project] [worktree]: turn a secondmate
+# fm_declare_standing_home <home> <id> [project [worktree]]...: turn a secondmate
 # fixture into a standing home through the production record writer.
 fm_declare_standing_home() {
-  local home=$1 id=$2 project=${3:-alpha} worktree=${4:-$1/standing-worktree}
-  bash -c '. "$1/bin/fm-standing-lib.sh" && fm_standing_record_write "$2" "$3" "$4" "$5"' \
-    _ "$ROOT" "$home" "$id" "$project" "$worktree"
+  local home=$1 id=$2
+  shift 2
+  [ $# -gt 0 ] || set -- alpha
+  [ $# -gt 1 ] || set -- "$1" "$home/standing-worktree"
+  bash -c '. "$1/bin/fm-standing-lib.sh" && shift && fm_standing_record_write "$@"' \
+    _ "$ROOT" "$home" "$id" "$@"
 }
 
-# fm_write_standing_meta <file> <home> <worktree> [window]: the parent's record
-# of a standing agent, as bin/fm-spawn.sh writes it for a standing home.
+# fm_write_standing_meta <file> <home> <worktree> [window] [extra-worktree]...:
+# the parent's record of a standing agent, as bin/fm-spawn.sh writes it.
 fm_write_standing_meta() {
-  fm_write_secondmate_meta "$1" "$2" "${4:-}"
-  printf 'standing=1\nstanding_worktree=%s\n' "$3" >> "$1"
+  local file=$1 home=$2 worktree=$3 window=${4:-} extra
+  shift 3
+  [ $# -eq 0 ] || shift
+  fm_write_secondmate_meta "$file" "$home" "$window"
+  printf 'standing=1\nstanding_worktree=%s\n' "$worktree" >> "$file"
+  for extra in "$@"; do
+    printf 'standing_extra_worktree=%s\n' "$extra" >> "$file"
+  done
 }
 
 # --- common assertions ------------------------------------------------------

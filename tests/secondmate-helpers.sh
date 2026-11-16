@@ -12,10 +12,13 @@
 
 # A fake tmux (window ops are logged to FM_FAKE_TMUX_LOG, list-windows returns
 # FM_FAKE_TMUX_WINDOW, capture-pane echoes FM_FAKE_TMUX_CAPTURE) plus a fake
-# treehouse (durable lease of FM_FAKE_TREEHOUSE_HOME, a real worktree when
+# treehouse (durable lease of FM_FAKE_TREEHOUSE_HOME, suffixed -<repo dir> when
+# FM_FAKE_TREEHOUSE_PER_REPO is set, a real worktree when
 # FM_FAKE_TREEHOUSE_GIT_WORKTREE is set, recording the lease holder to
-# FM_FAKE_TREEHOUSE_LEASE_FILE; `return` removes the target and lease unless
-# FM_FAKE_TREEHOUSE_RETURN_FAIL is set). Echoes the fakebin dir.
+# FM_FAKE_TREEHOUSE_LEASE_FILE; `get` fails in the repo dir named by
+# FM_FAKE_TREEHOUSE_GET_FAIL_REPO; `return` removes the target and lease unless
+# FM_FAKE_TREEHOUSE_RETURN_FAIL is set; `status --json` prints
+# FM_FAKE_TREEHOUSE_STATUS_JSON; `lease` only logs). Echoes the fakebin dir.
 make_fake_tmux() {
   local dir=$1 fakebin capture
   fakebin=$(fm_fakebin "$dir")
@@ -143,15 +146,18 @@ case "${1:-}" in
       esac
       shift
     done
+    [ "${FM_FAKE_TREEHOUSE_GET_FAIL_REPO:-}" != "$(basename "$PWD")" ] || exit 1
     if [ -n "${FM_FAKE_TREEHOUSE_HOME:-}" ]; then
+      target=$FM_FAKE_TREEHOUSE_HOME
+      [ -z "${FM_FAKE_TREEHOUSE_PER_REPO:-}" ] || target="$target-$(basename "$PWD")"
       if [ -n "${FM_FAKE_TREEHOUSE_GIT_WORKTREE:-}" ]; then
-        git worktree add --quiet --detach "$FM_FAKE_TREEHOUSE_HOME" >/dev/null 2>&1 || exit 1
+        git worktree add --quiet --detach "$target" >/dev/null 2>&1 || exit 1
       else
-        mkdir -p "$FM_FAKE_TREEHOUSE_HOME"
+        mkdir -p "$target"
       fi
       [ -n "${FM_FAKE_TREEHOUSE_LEASE_FILE:-}" ] && printf '%s\n' "$holder" > "$FM_FAKE_TREEHOUSE_LEASE_FILE"
       printf 'leased worktree for %s\n' "${holder:-unknown}" >&2
-      printf '%s\n' "$FM_FAKE_TREEHOUSE_HOME"
+      printf '%s\n' "$target"
     fi
     exit 0
     ;;
@@ -168,6 +174,11 @@ case "${1:-}" in
     [ -z "${FM_FAKE_TREEHOUSE_RETURN_FAIL:-}" ] || exit 17
     [ -n "${FM_FAKE_TREEHOUSE_LEASE_FILE:-}" ] && rm -f "$FM_FAKE_TREEHOUSE_LEASE_FILE"
     [ -n "$target" ] && rm -rf -- "$target"
+    git worktree prune >/dev/null 2>&1 || true
+    exit 0
+    ;;
+  status)
+    printf '%s\n' "${FM_FAKE_TREEHOUSE_STATUS_JSON:-[]}"
     exit 0
     ;;
 esac

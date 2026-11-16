@@ -973,6 +973,9 @@ test_home_seed_standing_admits_local_only_and_leases_worktree() {
   assert_grep '# Hands-on worktree' "$subhome/data/charter.md" "standing seed did not install a standing charter"
   [ "$(cat "$subhome/.fm-secondmate-home")" = rig ] || fail "standing seed did not write the identity marker"
   assert_grep 'projects: alpha' "$home/data/secondmates.md" "standing seed did not register its route"
+  [ -z "$(ls -A "$subhome/projects")" ] || fail "a standing seed cloned a project into its home"
+  [ "$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir)" = "$(cd "$home/projects/alpha/.git" && pwd -P)" ] \
+    || fail "a standing worktree was not leased from firstmate's own clone"
 
   : > "$log"
   PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
@@ -985,10 +988,209 @@ test_home_seed_standing_admits_local_only_and_leases_worktree() {
   fi
   grep -F 'is local-only; secondmate routes support only' "$err" >/dev/null || fail "the ordinary local-only refusal changed"
   if FM_HOME="$home" FM_SECONDMATE_CHARTER='x' "$ROOT/bin/fm-home-seed.sh" two "$TMP_ROOT/standing-seed-two" --standing alpha alpha >/dev/null 2>"$err"; then
-    fail "a standing seed accepted two projects"
+    fail "a standing seed accepted the same project twice"
   fi
-  grep -F -- '--standing takes exactly one project' "$err" >/dev/null || fail "standing seed did not explain its one-project rule"
+  grep -F -- '--standing names a project more than once' "$err" >/dev/null || fail "standing seed did not explain its one-worktree-per-project rule"
   pass "home seeding admits local-only only for the standing kind and leases one durable worktree"
+}
+
+# Shared fixture: a parent home with three registered projects that each have
+# an origin, and a filled one-project standing charter brief for rig.
+standing_multi_home() {  # <name> -> parent home
+  local home=$TMP_ROOT/$1 project
+  mkdir -p "$home/projects" "$home/data" "$home/state"
+  for project in alpha beta gamma; do
+    fm_git_init_commit "$home/projects/$project"
+    fm_git_add_origin "$home/projects/$project" "$TMP_ROOT/remotes/$1-$project.git"
+  done
+  {
+    printf '%s\n' '- alpha [local-only] - alpha project (added 2026-11-16)'
+    printf '%s\n' '- beta [direct-PR] - beta project (added 2026-11-16)'
+    printf '%s\n' '- gamma [local-only] - gamma project (added 2026-11-16)'
+  } > "$home/data/projects.md"
+  FM_HOME="$home" FM_SECONDMATE_CHARTER='engineering rig' "$ROOT/bin/fm-brief.sh" rig --standing alpha >/dev/null \
+    || fail "could not scaffold the standing charter fixture"
+  printf '%s\n' "$home"
+}
+
+# One standing agent works across several projects: one leased worktree each,
+# extended by a re-seed, never silently shrunk.
+test_home_seed_standing_leases_one_worktree_per_project() {
+  local home subhome wt fakebin log err record
+  home=$(standing_multi_home standing-multi-home)
+  subhome="$TMP_ROOT/standing-multi-subhome"
+  wt="$TMP_ROOT/standing-multi-wt"
+  err="$TMP_ROOT/standing-multi.err"
+  record="$subhome/.fm-standing-home"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/standing-multi-fake")
+  log="$TMP_ROOT/standing-multi-fake/tmux.log"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" FM_SECONDMATE_CHARTER='rig' \
+    "$ROOT/bin/fm-home-seed.sh" fresh "$TMP_ROOT/standing-multi-fresh" --standing alpha beta >/dev/null 2>"$err"; then
+    fail "a several-project standing seed scaffolded a one-project charter"
+  fi
+  grep -F 'fill one before seeding several' "$err" >/dev/null || fail "the several-project charter refusal did not explain itself: $(cat "$err")"
+  grep -F 'treehouse get' "$log" >/dev/null && fail "a refused several-project seed leased a worktree"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$wt" FM_FAKE_TREEHOUSE_PER_REPO=1 \
+    FM_FAKE_TREEHOUSE_GIT_WORKTREE=1 FM_FAKE_TMUX_LOG="$log" \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing alpha beta >/dev/null 2>"$err" \
+    || fail "a two-project standing seed failed: $(cat "$err")"
+  assert_equals 2 "$(grep -cF 'treehouse get --lease --lease-holder rig' "$log")" "a two-project seed did not lease one worktree per project"
+  assert_equals "schema=fm-standing-home.v2
+id=rig
+project=alpha
+worktree=$(cd "$wt-alpha" && pwd -P)
+project=beta
+worktree=$(cd "$wt-beta" && pwd -P)" "$(cat "$record")" "a two-project seed did not record each project with its worktree"
+  assert_grep 'projects: alpha, beta' "$home/data/secondmates.md" "a two-project seed did not register both projects"
+  [ -z "$(ls -A "$subhome/projects")" ] || fail "a two-project standing seed cloned into its home"
+  grep -F -e '- alpha' -e '- beta' "$subhome/data/projects.md" >/dev/null 2>&1 \
+    && fail "a standing seed registered projects its home has no clone of"
+
+  : > "$log"
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$wt" FM_FAKE_TREEHOUSE_PER_REPO=1 \
+    FM_FAKE_TREEHOUSE_GIT_WORKTREE=1 FM_FAKE_TMUX_LOG="$log" \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing gamma beta alpha >/dev/null 2>"$err" \
+    || fail "a re-seed adding a project failed: $(cat "$err")"
+  assert_equals 1 "$(grep -cF 'treehouse get' "$log")" "a re-seed adding one project leased more than its one worktree"
+  assert_equals "alpha beta gamma" "$(grep '^project=' "$record" | cut -d= -f2 | tr '\n' ' ' | sed 's/ $//')" \
+    "a re-seed did not keep the recorded projects first and append the added one"
+  assert_grep "worktree=$(cd "$wt-gamma" && pwd -P)" "$record" "a re-seed did not record the added project's worktree"
+
+  cp "$record" "$TMP_ROOT/standing-multi.record"
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing alpha beta >/dev/null 2>"$err"; then
+    fail "a re-seed dropped a recorded project"
+  fi
+  grep -F 'must name every recorded project' "$err" >/dev/null || fail "the dropped-project refusal did not explain itself: $(cat "$err")"
+  cmp -s "$record" "$TMP_ROOT/standing-multi.record" || fail "a refused re-seed changed the standing record"
+  [ -d "$wt-gamma" ] || fail "a refused re-seed returned a recorded worktree"
+  pass "a standing seed leases one worktree per project and a re-seed adds projects but never drops one"
+}
+
+# A warm pool slot is adopted in place; rollback gives it back its prior lease,
+# or returns it when it was free, and a slot with live processes is refused.
+test_home_seed_standing_adopts_an_existing_slot() {
+  local home subhome wt slot slot_abs free free_abs fakebin log err row
+  home=$(standing_multi_home standing-adopt-home)
+  subhome="$TMP_ROOT/standing-adopt-subhome"
+  wt="$TMP_ROOT/standing-adopt-wt"
+  slot="$TMP_ROOT/standing-adopt-slot"
+  err="$TMP_ROOT/standing-adopt.err"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/standing-adopt-fake")
+  log="$TMP_ROOT/standing-adopt-fake/tmux.log"
+  free="$TMP_ROOT/standing-adopt-free"
+  git -C "$home/projects/alpha" worktree add -q --detach "$slot"
+  git -C "$home/projects/alpha" worktree add -q --detach "$free"
+  slot_abs=$(cd "$slot" && pwd -P)
+  free_abs=$(cd "$free" && pwd -P)
+  row='{"name":"7","path":"'"$slot_abs"'","lease_id":"L7","lease_holder":"old-crew","processes":[]}'
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TREEHOUSE_STATUS_JSON='[{"name":"7","path":"'"$slot_abs"'","lease_id":"L7","lease_holder":"old-crew","processes":[{"pid":1}]}]' \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing --standing-worktree "alpha=$slot" >/dev/null 2>"$err"; then
+    fail "a standing seed adopted a slot with processes running in it"
+  fi
+  grep -F 'process(es) running in it' "$err" >/dev/null || fail "the busy-slot refusal did not explain itself: $(cat "$err")"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$wt" FM_FAKE_TREEHOUSE_PER_REPO=1 \
+    FM_FAKE_TREEHOUSE_GIT_WORKTREE=1 FM_FAKE_TREEHOUSE_GET_FAIL_REPO=beta FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TREEHOUSE_STATUS_JSON="[$row]" \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing alpha beta --standing-worktree "alpha=$slot" >/dev/null 2>"$err"; then
+    fail "a standing seed succeeded although a lease failed"
+  fi
+  grep -qxF 'treehouse lease 7 --lease-holder rig' "$log" || fail "the slot was not adopted in place under the agent id"
+  grep -qxF 'treehouse lease 7 --lease-holder old-crew' "$log" || fail "a failed seed did not give the adopted slot back its prior lease"
+  [ -d "$slot" ] || fail "a failed seed removed the adopted slot"
+
+  : > "$log"
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$wt" FM_FAKE_TREEHOUSE_PER_REPO=1 \
+    FM_FAKE_TREEHOUSE_GIT_WORKTREE=1 FM_FAKE_TREEHOUSE_GET_FAIL_REPO=gamma FM_FAKE_TMUX_LOG="$log" \
+    FM_FAKE_TREEHOUSE_STATUS_JSON='[{"name":"8","path":"'"$free_abs"'","lease_id":"","lease_holder":"","processes":[]}]' \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing alpha gamma --standing-worktree="alpha=$free" >/dev/null 2>"$err" \
+    && fail "a standing seed succeeded although a lease failed"
+  grep -qxF 'treehouse lease 8 --lease-holder rig' "$log" || fail "a free slot was not adopted under the agent id"
+  grep -qxF "treehouse return --force $free_abs" "$log" || fail "a failed seed kept a lease on a slot that was free"
+
+  : > "$log"
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$wt" FM_FAKE_TREEHOUSE_PER_REPO=1 \
+    FM_FAKE_TREEHOUSE_GIT_WORKTREE=1 FM_FAKE_TMUX_LOG="$log" FM_FAKE_TREEHOUSE_STATUS_JSON="[$row]" \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing beta --standing-worktree "alpha=$slot" >/dev/null 2>"$err" \
+    || fail "adopting a slot failed: $(cat "$err")"
+  assert_equals "beta=$(cd "$wt-beta" && pwd -P) alpha=$slot_abs" \
+    "$(awk -F= '/^project=/{p=$2} /^worktree=/{printf "%s%s=%s", sep, p, $2; sep=" "}' "$subhome/.fm-standing-home")" \
+    "the record did not pair the adopted slot and the fresh lease with their projects"
+  assert_equals 1 "$(grep -cF 'treehouse get' "$log")" "adopting a slot also leased a fresh worktree for it"
+  pass "a standing seed adopts a warm slot in place, gives it back on rollback, and refuses a busy one"
+}
+
+# A failed lease rolls back every lease the call made, and a v1
+# record is read as one pair and never rewritten unless its worktrees change.
+test_home_seed_standing_rolls_back_every_lease_and_keeps_v1_records() {
+  local home subhome wt wt_alpha fakebin log err record v1
+  home=$(standing_multi_home standing-v1-home)
+  subhome="$TMP_ROOT/standing-v1-subhome"
+  wt="$TMP_ROOT/standing-v1-wt"
+  err="$TMP_ROOT/standing-v1.err"
+  record="$subhome/.fm-standing-home"
+  v1="$TMP_ROOT/standing-v1.record"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/standing-v1-fake")
+  log="$TMP_ROOT/standing-v1-fake/tmux.log"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$wt" FM_FAKE_TREEHOUSE_PER_REPO=1 \
+    FM_FAKE_TREEHOUSE_GIT_WORKTREE=1 FM_FAKE_TREEHOUSE_GET_FAIL_REPO=gamma FM_FAKE_TMUX_LOG="$log" \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing alpha beta gamma >/dev/null 2>"$err"; then
+    fail "a standing seed succeeded although one project's lease failed"
+  fi
+  grep -F 'failed to lease a standing worktree of gamma' "$err" >/dev/null || fail "the failed lease was not named: $(cat "$err")"
+  grep -F "treehouse return --force $wt-alpha" "$log" >/dev/null || fail "a failed seed kept the first project's lease"
+  grep -F "treehouse return --force $wt-beta" "$log" >/dev/null || fail "a failed seed kept the second project's lease"
+  [ ! -e "$subhome" ] || fail "a failed several-project seed left its home behind"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$wt" FM_FAKE_TREEHOUSE_PER_REPO=1 \
+    FM_FAKE_TREEHOUSE_GIT_WORKTREE=1 FM_FAKE_TMUX_LOG="$log" \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing alpha >/dev/null 2>"$err" \
+    || fail "a one-project standing seed failed: $(cat "$err")"
+  wt_alpha=$(cd "$wt-alpha" && pwd -P)
+  printf 'schema=fm-standing-home.v1\nid=rig\nproject=alpha\nworktree=%s\n' "$wt_alpha" > "$record"
+  cp "$record" "$v1"
+
+  : > "$log"
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing alpha >/dev/null 2>"$err" \
+    || fail "a v1 standing home could not be re-seeded: $(cat "$err")"
+  cmp -s "$record" "$v1" || fail "an unchanged re-seed rewrote a v1 record"
+  grep -F 'treehouse get' "$log" >/dev/null && fail "a v1 re-seed leased a second worktree"
+
+  if PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$wt" FM_FAKE_TREEHOUSE_PER_REPO=1 \
+    FM_FAKE_TREEHOUSE_GIT_WORKTREE=1 FM_FAKE_TREEHOUSE_GET_FAIL_REPO=gamma FM_FAKE_TMUX_LOG="$log" \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing alpha beta gamma >/dev/null 2>"$err"; then
+    fail "a re-seed succeeded although one added project's lease failed"
+  fi
+  cmp -s "$record" "$v1" || fail "a failed re-seed changed the v1 record"
+  grep -F "treehouse return --force $wt-beta" "$log" >/dev/null || fail "a failed re-seed kept the added project's lease"
+  grep -F "treehouse return --force $wt_alpha" "$log" >/dev/null && fail "a failed re-seed returned the recorded worktree"
+  [ -d "$wt_alpha" ] || fail "a failed re-seed lost the recorded worktree"
+  [ -z "$(ls -A "$subhome/projects")" ] || fail "a failed re-seed left a clone in the home"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TREEHOUSE_HOME="$wt" FM_FAKE_TREEHOUSE_PER_REPO=1 \
+    FM_FAKE_TREEHOUSE_GIT_WORKTREE=1 FM_FAKE_TMUX_LOG="$log" \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing alpha beta >/dev/null 2>"$err" \
+    || fail "a v1 home could not add a project: $(cat "$err")"
+  grep -F 'from fm-standing-home.v1 to fm-standing-home.v2' "$err" >/dev/null || fail "upgrading a v1 record was silent"
+  assert_grep 'schema=fm-standing-home.v2' "$record" "adding a project did not upgrade the v1 record"
+  assert_grep "worktree=$wt_alpha" "$record" "upgrading a v1 record lost its worktree"
+
+  git clone -q "$home/projects/alpha" "$subhome/projects/alpha"
+  git -C "$subhome/projects/alpha" worktree add -q --detach "$TMP_ROOT/standing-v1-legacy-wt"
+  printf 'schema=fm-standing-home.v1\nid=rig\nproject=alpha\nworktree=%s\n' "$(cd "$TMP_ROOT/standing-v1-legacy-wt" && pwd -P)" > "$record"
+  cp "$record" "$v1"
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_FAKE_TMUX_LOG="$log" \
+    "$ROOT/bin/fm-home-seed.sh" rig "$subhome" --standing alpha >/dev/null 2>"$err" \
+    || fail "a home whose worktree is linked to its own older clone could not be re-seeded: $(cat "$err")"
+  cmp -s "$record" "$v1" || fail "re-seeding an older cloned home rewrote its record"
+  pass "a failed standing seed returns every lease it took, and v1 records stay untouched until their worktrees change"
 }
 
 test_home_seed_standing_refuses_conversion_and_rolls_back_its_lease() {
@@ -3257,6 +3459,9 @@ test_home_seed_refuses_projectless_home_with_uninspectable_registry
 test_home_seed_refuses_missing_projects_without_signal
 test_home_seed_refuses_local_only_project
 test_home_seed_standing_admits_local_only_and_leases_worktree
+test_home_seed_standing_leases_one_worktree_per_project
+test_home_seed_standing_rolls_back_every_lease_and_keeps_v1_records
+test_home_seed_standing_adopts_an_existing_slot
 test_home_seed_standing_refuses_conversion_and_rolls_back_its_lease
 test_standing_home_refuses_spawn_and_unreadable_record
 test_home_seed_refuses_an_unresolvable_registry_posture
