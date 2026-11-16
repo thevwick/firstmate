@@ -472,7 +472,7 @@ fm_backend_rex_create_task() {  # <label> <cwd> [launcher-home|other-home] [spaw
     }
     wid=$FM_BACKEND_REX_NEW_WINDOW
     bid=$FM_BACKEND_REX_NEW_BLOCK
-    if [ "$relationship" = other-home ] && [ "$count" -ne 0 ]; then
+    if [ "$relationship" = other-home ] && [ "${count:-0}" -ne 0 ]; then
       fm_backend_rex_cli window move -s "$sid" "$wid" --index 1 >/dev/null 2>&1 \
         || echo "warning: could not move the respawned Rex secondmate tab $wid to the first position" >&2
     fi
