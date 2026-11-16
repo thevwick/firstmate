@@ -998,6 +998,31 @@ test_spawn_bare_harness_no_model_effort_flag() {
   pass "C2 spawn: a bare harness-only secondmate-harness file launches with no model/effort flag (backward-compat)"
 }
 
+# A several-project standing agent's Claude launch is granted every leased
+# worktree, and its task record stamps them all.
+test_spawn_standing_claude_grants_every_worktree() {
+  local w sm meta launchlog launch
+  w="$TMP_ROOT/spawn-standing-grants"
+  sm="$w/sm"
+  launchlog="$w/launch.log"
+  mkdir -p "$w/home/config" "$w/wt-app" "$w/wt-web"
+  printf 'claude opus\n' > "$w/home/config/secondmate-harness"
+  make_seeded_home "$sm" sm
+  fm_declare_standing_home "$sm" sm app "$w/wt-app" web "$w/wt-web"
+
+  spawn_secondmate_capture "$w" sm "$sm" "$launchlog" >/dev/null 2>&1
+
+  launch=$(cat "$launchlog")
+  assert_contains "$launch" "claude --dangerously-skip-permissions $(sm_claude_add_dir "$w" sm)--add-dir '$(cd "$w/wt-app" && pwd -P)' --add-dir '$(cd "$w/wt-web" && pwd -P)' --settings" \
+    "standing-grants: the launch was not granted every leased worktree"
+  meta="$w/home/state/sm.meta"
+  assert_equals "standing=1
+standing_worktree=$w/wt-app
+standing_extra_worktree=$w/wt-web" "$(grep '^standing' "$meta")" \
+    "standing-grants: the task record did not stamp every leased worktree"
+  pass "C3b spawn: a several-project standing agent is granted and stamped with every leased worktree"
+}
+
 # "<harness> <model>" durably threads --model into the secondmate launch and
 # records it in meta, with no --effort flag (no effort token supplied).
 test_spawn_secondmate_harness_model_token() {
@@ -2979,6 +3004,7 @@ test_spawn_backend_precedence_over_inherited_config
 test_spawn_explicit_backend_precedence_over_env_and_inherited_config
 test_spawn_bare_harness_no_model_effort_flag
 test_spawn_secondmate_harness_model_token
+test_spawn_standing_claude_grants_every_worktree
 test_spawn_secondmate_harness_model_and_effort_tokens
 test_spawn_secondmate_with_a_legacy_pin_file_uses_the_first_line
 test_spawn_secondmate_with_a_malformed_declared_pin_refuses

@@ -1381,7 +1381,7 @@ Teardown of a leased home fails closed if `treehouse return` cannot release the 
 
 ### Project modes and backlog handoff
 
-Secondmate routes cover `no-mistakes` and `direct-PR` projects; `local-only` projects remain main-firstmate work, except the one project of a standing home seeded with `--standing` (`bin/fm-standing-lib.sh`).
+Secondmate routes cover `no-mistakes` and `direct-PR` projects; `local-only` projects remain main-firstmate work, except the projects of a standing home seeded with `--standing` (`bin/fm-standing-lib.sh`).
 For `no-mistakes` projects, seeding initializes only projects newly cloned into a secondmate home and refuses to mutate a preexisting clone that is not already initialized.
 
 After creating a secondmate, move existing main-backlog queued items that you have judged in-scope with `fm-backlog-handoff.sh <secondmate-id> <item-key>...`; it refuses In flight, Done, or non-secondmate homes, and its [script header](../bin/fm-backlog-handoff.sh) owns route-specific wake outcomes and retries.

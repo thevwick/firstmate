@@ -444,7 +444,30 @@ test_sweep_respawns_confirmed_dead_standing_agent() {
   assert_grep 'standing=1' "$w/home/state/rig.meta" "the relaunched record dropped the standing declaration"
   assert_grep "standing_worktree=$w/rig-worktree" "$w/home/state/rig.meta" \
     "the relaunched record dropped the standing worktree"
+  assert_no_grep 'standing_extra_worktree=' "$w/home/state/rig.meta" \
+    "a one-project standing agent's record gained a field it never had"
   pass "sweep: a confirmed-dead standing agent is relaunched and keeps its declaration"
+}
+
+# A relaunch restores every leased worktree to the task record, including one
+# the home's record gained after the agent's last launch.
+test_sweep_respawn_restores_every_standing_worktree() {
+  local w fb tmuxfb log
+  w=$(new_world sweep-dead-standing-multi)
+  add_sm_home "$w" rig firstmate:fm-rig
+  mkdir -p "$w/rig-app" "$w/rig-web"
+  fm_declare_standing_home "$w/rig" rig app "$w/rig-app" web "$w/rig-web"
+  printf 'standing=1\nstanding_worktree=%s\n' "$w/rig-app" >> "$w/home/state/rig.meta"
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+
+  run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" >/dev/null
+
+  assert_contains "$(cat "$log")" "new-window" "a confirmed-dead several-project standing agent was not relaunched"
+  assert_equals "standing_worktree=$w/rig-app
+standing_extra_worktree=$w/rig-web" "$(grep '^standing_.*worktree=' "$w/home/state/rig.meta")" \
+    "the relaunched record did not restore every standing worktree, first one in the original field"
+  pass "sweep: a relaunched standing agent's record names every leased worktree"
 }
 
 test_sweep_recovers_the_durable_secondmate_account() {
@@ -1020,6 +1043,7 @@ test_sweep_respawns_confirmed_dead_secondmate
 test_sweep_respawns_on_the_recorded_backend
 
 test_sweep_respawns_confirmed_dead_standing_agent
+test_sweep_respawn_restores_every_standing_worktree
 test_sweep_recovers_the_durable_secondmate_account
 test_sweep_serializes_distinct_secondmate_relaunches
 test_sweep_keeps_tmux_best_effort_kill_when_close_fails

@@ -2,8 +2,9 @@
 # Reclaim disk from treehouse slots no live task is using.
 #
 # A slot is reclaimable only when ALL of these hold:
-#   - no state/<id>.meta in ANY firstmate home records it as a worktree or as a
-#     standing agent's leased worktree (bin/fm-standing-lib.sh)
+#   - no state/<id>.meta in ANY firstmate home records it as a worktree, and it
+#     is none of the leased worktrees a standing agent's meta or the
+#     .fm-standing-home of a home that meta names records (bin/fm-standing-lib.sh)
 #   - it is detached with no branch checked out
 #   - it has zero uncommitted changes
 #   - no process holds a file open under it
@@ -12,6 +13,9 @@
 # --force: a slot that fails any check is left alone, full stop.
 set -uo pipefail
 
+# shellcheck source=bin/fm-standing-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-standing-lib.sh"
+
 JUNK=(node_modules ios/Pods ios/build android/build android/app/build .gradle common/temp)
 POOL_ROOT=${TREEHOUSE_ROOT:-$HOME/.treehouse}
 APPLY=0
@@ -19,17 +23,24 @@ APPLY=0
 for arg in "$@"; do
   case "$arg" in
     --apply) APPLY=1 ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
 
 # Every slot path recorded by a live task, across every firstmate home.
 held_paths() {
-  local home
+  local home sub
   for home in "$HOME"/.firstmate-* "$HOME"/sitemate/firstmate "${FM_HOME:-}"; do
     [ -d "$home/state" ] || continue
-    grep -h -e '^worktree=' -e '^standing_worktree=' "$home"/state/*.meta 2>/dev/null | cut -d= -f2-
+    grep -h -e '^worktree=' -e '^standing_worktree=' -e '^standing_extra_worktree=' "$home"/state/*.meta 2>/dev/null | cut -d= -f2-
+    while IFS= read -r sub; do
+      if [ -n "$sub" ] && fm_standing_record_parse "$sub/$FM_STANDING_RECORD"; then
+        printf '%s\n' "${FM_STANDING_WORKTREES[@]}"
+      fi
+    done <<EOF
+$(grep -h '^home=' "$home"/state/*.meta 2>/dev/null | cut -d= -f2-)
+EOF
   done
 }
 

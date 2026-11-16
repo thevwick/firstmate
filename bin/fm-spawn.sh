@@ -344,7 +344,8 @@
 #   see AGENTS.md task lifecycle); --secondmate records kind=secondmate and launches in a
 #   provisioned firstmate home; the default is kind=ship.
 #   A standing home (bin/fm-standing-lib.sh) launches the same way and also records
-#   standing=1 and standing_worktree=; a Claude launch is granted that worktree.
+#   standing=1 and its leased worktrees (that lib owns the fields); a Claude launch
+#   is granted every one of them.
 #   Every spawn run from inside a standing home is refused: it holds no crew.
 #   Before a secondmate launch, the home is fast-forwarded to the primary's
 #   default-branch commit when safe: directly for a local home, or through the
@@ -1040,6 +1041,7 @@ ACCOUNT_SET=0
 RELAUNCH=0
 CAPTAIN_ASKED=0
 STANDING_WORKTREE=
+STANDING_WORKTREES=()
 # Opt-in only: exact-resume presentation-order lock waits instead of refusing.
 # Absent/unset keeps upstream refuse-on-contention. See header.
 HERDR_RESUME_LOCK_WAIT=0
@@ -4065,19 +4067,21 @@ rovo_config_override_flag() {
 # directory that does not exist at launch would leave the channel created
 # later outside the grant. The grant never covers the whole state/ (watcher
 # internals live there) or anything wider.
-claude_add_dirs_flag() {  # <kind> <state-dir> <data-dir> <code-root> <task-id> [<standing-worktree>]
-  local kind=$1 state_dir=$2 data_dir=$3 code_root=$4 id=$5 standing_wt=${6:-}
+claude_add_dirs_flag() {  # <kind> <state-dir> <data-dir> <code-root> <task-id> [<standing-worktree>...]
+  local kind=$1 state_dir=$2 data_dir=$3 code_root=$4 id=$5 standing_wt
   local state_real data_real root_real out='' d
   local dirs=()
+  shift 5
   state_real=$(cd "$state_dir" && pwd -P) || return 1
   case "$kind" in
   secondmate)
     mkdir -p "$state_real/$id.inbox/handled" || return 1
     dirs=("$state_real/$id.inbox")
-    if [ -n "$standing_wt" ] && [ -d "$standing_wt" ]; then
+    for standing_wt in "$@"; do
+      [ -n "$standing_wt" ] && [ -d "$standing_wt" ] || continue
       standing_wt=$(cd "$standing_wt" && pwd -P) || return 1
       dirs+=("$standing_wt")
-    fi
+    done
     ;;
   *)
     data_real=$(cd "$data_dir" && pwd -P) || return 1
@@ -4231,8 +4235,11 @@ if [ "$KIND" = secondmate ]; then
       exit 1
     }
     STANDING_WORKTREE=$FM_STANDING_WORKTREE
-    [ -d "$STANDING_WORKTREE" ] ||
-      echo "warning: standing agent $ID's leased worktree $STANDING_WORKTREE is missing; it launches without one" >&2
+    STANDING_WORKTREES=("${FM_STANDING_WORKTREES[@]}")
+    for standing_wt in "${STANDING_WORKTREES[@]}"; do
+      [ -d "$standing_wt" ] ||
+        echo "warning: standing agent $ID's leased worktree $standing_wt is missing; it launches without it" >&2
+    done
   fi
   if [ -e "$DATA/secondmates.md" ] || [ -L "$DATA/secondmates.md" ]; then
     if ! secondmate_registry_validate_bindings "$DATA/secondmates.md" resolve_path "$ID" "$FIRSTMATE_HOME"; then
@@ -7405,7 +7412,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness hermes_profile hermes_home kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential standing standing_worktree", keys, " ")
+      split("window endpoint_task_id worktree project harness hermes_profile hermes_home kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential standing standing_worktree standing_extra_worktree", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -7510,6 +7517,9 @@ preserve_relaunch_meta() {
     if [ -n "$STANDING_WORKTREE" ]; then
       echo "standing=1"
       echo "standing_worktree=$STANDING_WORKTREE"
+      for ((standing_i = 1; standing_i < ${#STANDING_WORKTREES[@]}; standing_i++)); do
+        echo "standing_extra_worktree=${STANDING_WORKTREES[$standing_i]}"
+      done
     fi
   fi
   if [ "$SPAWN_CONTROL_PARENT" = 1 ] && [ -n "${FM_CONTROL_RELAUNCH_TX:-}" ]; then
@@ -7757,7 +7767,7 @@ case "$LAUNCH" in
 esac
 case "$LAUNCH" in
 *__CLAUDEADDDIRS__*)
-  CLAUDE_ADD_DIRS=$(claude_add_dirs_flag "$KIND" "$STATE" "$DATA" "$FM_ROOT" "$ID" "$STANDING_WORKTREE") || {
+  CLAUDE_ADD_DIRS=$(claude_add_dirs_flag "$KIND" "$STATE" "$DATA" "$FM_ROOT" "$ID" ${STANDING_WORKTREES[@]+"${STANDING_WORKTREES[@]}"}) || {
     echo "error: could not resolve the task-channel directories for $ID's claude --add-dir grant" >&2
     exit 1
   }

@@ -1314,16 +1314,46 @@ if [ "${FM_TEARDOWN_GUARD_DONE:-0}" != 1 ]; then
   "$FM_ROOT/bin/fm-guard.sh" || true
 fi
 HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
-STANDING_WORKTREE=
-STANDING_SRC=
-if [ "$TEARDOWN_META_KIND" = secondmate ] && fm_standing_meta "$META"; then
-  STANDING_WORKTREE=$(fm_meta_get "$META" standing_worktree)
-  if fm_standing_record_parse "$HOME_PATH/$FM_STANDING_RECORD"; then
-    [ -n "$STANDING_WORKTREE" ] || STANDING_WORKTREE=$FM_STANDING_WORKTREE
-    STANDING_SRC="$HOME_PATH/projects/$FM_STANDING_PROJECT"
-    [ -d "$STANDING_SRC" ] || STANDING_SRC=
+# Every worktree the record or the spawn stamp names, each with the clone it
+# returns through; a path in both is listed once.
+STANDING_WORKTREES=()
+STANDING_SRCS=()
+standing_add_worktree() {  # <worktree> [<project>]
+  local i src
+  [ -n "$1" ] || return 0
+  for ((i = 0; i < ${#STANDING_WORKTREES[@]}; i++)); do
+    [ "${STANDING_WORKTREES[$i]}" != "$1" ] || return 0
+  done
+  # The clone the worktree is linked to: firstmate's own, or a home clone
+  # seeded before standing homes stopped cloning.
+  if src=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
+    src=$(dirname "$src") && [ -d "$src" ]; then
+    :
+  elif [ -n "${2:-}" ] && [ -d "$FM_HOME/projects/$2" ]; then
+    src="$FM_HOME/projects/$2"
+  elif [ -n "${2:-}" ] && [ -d "$HOME_PATH/projects/$2" ]; then
+    src="$HOME_PATH/projects/$2"
+  else
+    src=
   fi
-  if [ -z "$STANDING_WORKTREE" ] && [ "$FORCE" != --force ]; then
+  STANDING_WORKTREES+=("$1")
+  STANDING_SRCS+=("$src")
+}
+if [ "$TEARDOWN_META_KIND" = secondmate ] && fm_standing_meta "$META"; then
+  standing_meta_wts=$(grep -e '^standing_worktree=' -e '^standing_extra_worktree=' "$META" | cut -d= -f2- || true)
+  standing_first_project=
+  if fm_standing_record_parse "$HOME_PATH/$FM_STANDING_RECORD"; then
+    standing_first_project=$FM_STANDING_PROJECT
+    for ((standing_i = 0; standing_i < ${#FM_STANDING_WORKTREES[@]}; standing_i++)); do
+      standing_add_worktree "${FM_STANDING_WORKTREES[$standing_i]}" "${FM_STANDING_PROJECTS[$standing_i]}"
+    done
+  fi
+  while IFS= read -r standing_wt; do
+    standing_add_worktree "$standing_wt" "$standing_first_project"
+  done <<EOF
+$standing_meta_wts
+EOF
+  if [ "${#STANDING_WORKTREES[@]}" -eq 0 ] && [ "$FORCE" != --force ]; then
     echo "REFUSED: standing agent $ID names no readable worktree, so its work cannot be proven landed; repair $HOME_PATH/$FM_STANDING_RECORD or get the captain's explicit OK to discard, then --force." >&2
     exit 1
   fi
@@ -3797,13 +3827,17 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" != "--force" ]; then
     done
   fi
   secondmate_unresolved_pending_replies_refuse || exit 1
-  if [ -n "$STANDING_WORKTREE" ]; then
-    standing_unlanded=$(fm_standing_worktree_unlanded "$STANDING_WORKTREE")
+  standing_refused=0
+  for ((standing_i = 0; standing_i < ${#STANDING_WORKTREES[@]}; standing_i++)); do
+    standing_unlanded=$(fm_standing_worktree_unlanded "${STANDING_WORKTREES[$standing_i]}")
     if [ -n "$standing_unlanded" ]; then
       echo "REFUSED: $standing_unlanded." >&2
-      echo "Have the captain land or keep that work, or get the captain's explicit OK to discard it, then --force." >&2
-      exit 1
+      standing_refused=1
     fi
+  done
+  if [ "$standing_refused" -eq 1 ]; then
+    echo "Have the captain land or keep that work, or get the captain's explicit OK to discard it, then --force." >&2
+    exit 1
   fi
 fi
 
@@ -4218,13 +4252,17 @@ if [ "$KIND" != secondmate ]; then
     exit 1
   fi
 fi
-if [ "$KIND" = secondmate ] && [ -n "$STANDING_WORKTREE" ] && [ -d "$STANDING_WORKTREE" ]; then
-  # The worktree is linked to a clone inside the home, so it goes back first.
-  teardown_treehouse_return "$STANDING_WORKTREE" "${STANDING_SRC:-${HOME_PATH:-/}}" "standing worktree" || {
-    echo "error: treehouse return failed for standing worktree $STANDING_WORKTREE; preserving the standing home and route" >&2
+# Worktrees return before the home goes, since an older home may hold the clone one is linked to.
+for ((standing_i = 0; standing_i < ${#STANDING_WORKTREES[@]}; standing_i++)); do
+  [ "$KIND" = secondmate ] || break
+  standing_wt=${STANDING_WORKTREES[$standing_i]}
+  [ -d "$standing_wt" ] || continue
+  standing_src=${STANDING_SRCS[$standing_i]}
+  teardown_treehouse_return "$standing_wt" "${standing_src:-${HOME_PATH:-/}}" "standing worktree" || {
+    echo "error: treehouse return failed for standing worktree $standing_wt; preserving the standing home and route" >&2
     exit 1
   }
-fi
+done
 teardown_export_records "$STATE" "$ID" || exit 1
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT

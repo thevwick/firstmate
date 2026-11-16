@@ -26,14 +26,25 @@
 #       when no filled charter brief exists. Set FM_SECONDMATE_SCOPE='<scope>'
 #       to override the registry routing scope. Otherwise the registry summary
 #       and scope are derived from the filled charter brief.
-#   fm-home-seed.sh <id> <home|-> --standing <project>
+#   fm-home-seed.sh <id> <home|-> --standing <project>... [--standing-worktree <project>=<path>]...
 #       Seed a standing home (bin/fm-standing-lib.sh owns the kind): the same
-#       home, charter, binding, and route, for exactly one project, which may be
-#       local-only for this kind alone. The seed durably leases one worktree of
-#       that project's new clone with "treehouse get --lease" under <id> and
-#       publishes .fm-standing-home before the identity marker; rollback returns
-#       the lease. A re-seed keeps the recorded worktree, and converting a home
-#       between an ordinary secondmate and a standing agent is refused.
+#       home, charter, binding, and route, for one or more distinct projects,
+#       any of which may be local-only for this kind alone. The home holds no
+#       project clone and runs no no-mistakes init: each project's worktree is
+#       durably leased under <id> from this home's own clone, projects/<project>,
+#       with "treehouse get --lease", the pool ordinary crews use.
+#       --standing-worktree adopts an existing free or leased slot of that pool
+#       instead, in place with "treehouse lease", keeping its warm build state;
+#       it names its project implicitly and refuses a slot with live processes.
+#       .fm-standing-home is published before the identity marker; rollback
+#       returns every fresh lease and gives every adopted slot back its prior
+#       lease. A re-seed keeps each recorded worktree (including one linked to a
+#       clone an older seed put in the home), acquires one for each added
+#       project, refuses to drop a recorded project, and leaves an unchanged
+#       record, v1 included, untouched. Converting a home between an ordinary
+#       secondmate and a standing agent is refused. A charter scaffolded here
+#       from FM_SECONDMATE_CHARTER names one project, so seeding several needs a
+#       filled data/<id>/brief.md first.
 #   fm-home-seed.sh validate
 #       Refuse records that operational consumers cannot parse, unavailable or
 #       unsafe registry files when present, non-absolute or unresolvable homes,
@@ -63,7 +74,7 @@ SEED_STANDING=0
 
 usage() {
   echo "usage: fm-home-seed.sh <id> <home|-> {<project>...|--no-projects}" >&2
-  echo "       fm-home-seed.sh <id> <home|-> --standing <project>" >&2
+  echo "       fm-home-seed.sh <id> <home|-> --standing <project>... [--standing-worktree <project>=<path>]..." >&2
   echo "       fm-home-seed.sh validate" >&2
 }
 
@@ -558,9 +569,13 @@ SEED_CHARTER_EXISTED=0
 SEED_MARKER_EXISTED=0
 SEED_PARENT_MARKER_EXISTED=0
 SEED_STANDING_RECORD_EXISTED=0
-SEED_STANDING_WT=
-SEED_STANDING_WT_SRC=
-SEED_STANDING_WT_ACQUIRED=0
+SEED_STANDING_PAIRS=()
+SEED_STANDING_RECORD_CHANGED=0
+SEED_STANDING_ADOPT=()
+SEED_STANDING_UNDO_WTS=()
+SEED_STANDING_UNDO_SRCS=()
+SEED_STANDING_UNDO_NAMES=()
+SEED_STANDING_UNDO_HOLDERS=()
 
 restore_seed_file() {
   local existed=$1 backup=$2 path=$3
@@ -666,9 +681,7 @@ seed_rollback() {
     rmdir "$(dirname "$SEED_PARENT_BRIEF")" 2>/dev/null || true
   fi
 
-  if [ "$SEED_STANDING_WT_ACQUIRED" = 1 ]; then
-    seed_return_standing_worktree
-  fi
+  seed_return_standing_worktrees
 
   if [ -n "${SEED_HOME:-}" ] && [ "$SEED_HOME" != "/" ]; then
     if [ "$SEED_HOME_ACQUIRED" = 1 ]; then
@@ -858,15 +871,26 @@ refuse_projectful_projectless_charter() {
   return 1
 }
 
-# The worktree is linked to the seeded clone, so it is returned before rollback
-# can remove that clone or the home holding it.
-seed_return_standing_worktree() {
-  if ! command -v treehouse >/dev/null 2>&1; then
-    echo "warning: failed to return standing worktree $SEED_STANDING_WT during seed rollback; treehouse command not found" >&2
-    return 0
-  fi
-  ( cd "$SEED_STANDING_WT_SRC" && treehouse return --force "$SEED_STANDING_WT" >/dev/null ) || \
-    echo "warning: failed to return standing worktree $SEED_STANDING_WT during seed rollback; lease may still be held" >&2
+# Undo every lease and adoption this call made, newest first: a fresh lease is
+# returned, and an adopted slot gets back the lease it held before.
+seed_return_standing_worktrees() {
+  local i wt name holder
+  for ((i = ${#SEED_STANDING_UNDO_WTS[@]} - 1; i >= 0; i--)); do
+    wt=${SEED_STANDING_UNDO_WTS[$i]}
+    name=${SEED_STANDING_UNDO_NAMES[$i]}
+    holder=${SEED_STANDING_UNDO_HOLDERS[$i]}
+    if ! command -v treehouse >/dev/null 2>&1; then
+      echo "warning: failed to undo the standing lease on $wt during seed rollback; treehouse command not found" >&2
+      continue
+    fi
+    if [ "$name" = - ] || [ "$holder" = - ]; then
+      ( cd "${SEED_STANDING_UNDO_SRCS[$i]}" && treehouse return --force "$wt" >/dev/null ) || \
+        echo "warning: failed to return standing worktree $wt during seed rollback; lease may still be held" >&2
+    else
+      ( cd "${SEED_STANDING_UNDO_SRCS[$i]}" && treehouse lease "$name" --lease-holder "$holder" >/dev/null ) || \
+        echo "warning: failed to give adopted worktree $wt back to lease holder '$holder' during seed rollback" >&2
+    fi
+  done
 }
 
 refuse_standing_conversion() {  # <home> <brief>
@@ -890,8 +914,10 @@ refuse_standing_conversion() {  # <home> <brief>
   return 1
 }
 
-validate_standing_worktree() {  # <worktree> <source-clone>
-  local wt=$1 src=$2 common expected
+# A worktree belongs to firstmate's own clone of its project, or, for a home
+# seeded when standing homes still cloned, to that home's clone.
+validate_standing_worktree() {  # <worktree> <source-clone> [<legacy-clone>]
+  local wt=$1 src=$2 legacy=${3:-} common
   case "$wt" in /?*) ;; *) echo "error: standing worktree $wt is not an absolute path" >&2; return 1 ;; esac
   [ -d "$wt" ] || { echo "error: standing worktree $wt is not a directory" >&2; return 1; }
   common=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
@@ -899,30 +925,16 @@ validate_standing_worktree() {  # <worktree> <source-clone>
     return 1
   }
   common=$(resolved_path "$common")
-  expected=$(resolved_path "$src/.git")
-  if [ "$common" != "$expected" ] || [ "$(resolved_path "$wt")" = "$(resolved_path "$src")" ]; then
-    echo "error: standing worktree $wt is not a separate worktree of $src" >&2
-    return 1
+  if [ "$(resolved_path "$wt")" != "$(resolved_path "$src")" ]; then
+    [ "$common" != "$(resolved_path "$src/.git")" ] || return 0
+    [ -z "$legacy" ] || [ ! -d "$legacy" ] || [ "$common" != "$(resolved_path "$legacy/.git")" ] || return 0
   fi
+  echo "error: standing worktree $wt is not a separate worktree of $src" >&2
+  return 1
 }
 
-lease_standing_worktree() {  # <id> <home> <project>
-  local id=$1 home=$2 project=$3 src wt
-  src=$(validate_project_destination "$home" "$project") || return 1
-  if fm_standing_record_parse "$home/$FM_STANDING_RECORD"; then
-    if [ "$FM_STANDING_ID" != "$id" ] || [ "$FM_STANDING_PROJECT" != "$project" ]; then
-      echo "error: $home is a standing home for $FM_STANDING_ID on $FM_STANDING_PROJECT, not $id on $project" >&2
-      return 1
-    fi
-    if [ -d "$FM_STANDING_WORKTREE" ]; then
-      validate_standing_worktree "$FM_STANDING_WORKTREE" "$src" || return 1
-      SEED_STANDING_WT=$FM_STANDING_WORKTREE
-      return 0
-    fi
-  elif fm_standing_home "$home"; then
-    echo "error: standing record at $home/$FM_STANDING_RECORD is unreadable; repair or remove it before re-seeding" >&2
-    return 1
-  fi
+lease_standing_worktree() {  # <id> <project> <source-clone>
+  local id=$1 project=$2 src=$3 wt
   command -v treehouse >/dev/null 2>&1 || {
     echo "error: treehouse command not found; cannot lease the standing worktree for $id" >&2
     return 1
@@ -932,34 +944,181 @@ lease_standing_worktree() {  # <id> <home> <project>
     return 1
   }
   [ -n "$wt" ] || { echo "error: treehouse get --lease did not report a standing worktree" >&2; return 1; }
-  SEED_STANDING_WT=$wt
-  SEED_STANDING_WT_SRC=$src
-  SEED_STANDING_WT_ACQUIRED=1
-  validate_standing_worktree "$wt" "$src"
+  SEED_STANDING_UNDO_WTS+=("$wt")
+  SEED_STANDING_UNDO_SRCS+=("$src")
+  SEED_STANDING_UNDO_NAMES+=(-)
+  SEED_STANDING_UNDO_HOLDERS+=(-)
+  validate_standing_worktree "$wt" "$src" || return 1
+  SEED_STANDING_PAIRS+=("$project" "$(resolved_path "$wt")")
+}
+
+# Takes over an existing pool slot in place, keeping its warm build state.
+adopt_standing_worktree() {  # <id> <project> <source-clone> <path>
+  local id=$1 project=$2 src=$3 path=$4 abs pool row name holder lease_id procs
+  if ! command -v treehouse >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    echo "error: treehouse and jq are required to adopt the standing worktree $path" >&2
+    return 1
+  fi
+  validate_standing_worktree "$path" "$src" || return 1
+  abs=$(resolved_path "$path")
+  pool=$(cd "$src" && treehouse status --json) || {
+    echo "error: treehouse status failed for $project; cannot adopt $path" >&2
+    return 1
+  }
+  row=$(printf '%s' "$pool" | jq -c --arg raw "$path" --arg abs "$abs" \
+    'first(.[] | select(.path == $raw or .path == $abs)) // empty' 2>/dev/null) || row=
+  [ -n "$row" ] || { echo "error: $path is not a treehouse pool slot of $project" >&2; return 1; }
+  name=$(printf '%s' "$row" | jq -r '.name')
+  holder=$(printf '%s' "$row" | jq -r '.lease_holder // ""')
+  lease_id=$(printf '%s' "$row" | jq -r '.lease_id // ""')
+  procs=$(printf '%s' "$row" | jq -r '.processes // [] | length')
+  if [ "$procs" != 0 ]; then
+    echo "error: $path has $procs process(es) running in it; adopt it only once that work has stopped" >&2
+    return 1
+  fi
+  if [ -z "$lease_id" ] || [ "$holder" != "$id" ]; then
+    ( cd "$src" && treehouse lease "$name" --lease-holder "$id" >/dev/null ) || {
+      echo "error: treehouse lease failed to adopt $path for $id" >&2
+      return 1
+    }
+    SEED_STANDING_UNDO_WTS+=("$abs")
+    SEED_STANDING_UNDO_SRCS+=("$src")
+    SEED_STANDING_UNDO_NAMES+=("$name")
+    if [ -n "$lease_id" ]; then
+      SEED_STANDING_UNDO_HOLDERS+=("$holder")
+    else
+      SEED_STANDING_UNDO_HOLDERS+=(-)
+    fi
+  fi
+  SEED_STANDING_PAIRS+=("$project" "$abs")
+}
+
+standing_adopt_path() {  # <project>
+  local i
+  for ((i = 0; i < ${#SEED_STANDING_ADOPT[@]}; i += 2)); do
+    [ "${SEED_STANDING_ADOPT[$i]}" != "$1" ] || { printf '%s\n' "${SEED_STANDING_ADOPT[$((i + 1))]}"; return 0; }
+  done
+  return 1
+}
+
+acquire_standing_worktree() {  # <id> <project>
+  local adopt src=$PROJECTS/$2
+  if adopt=$(standing_adopt_path "$2"); then
+    adopt_standing_worktree "$1" "$2" "$src" "$adopt"
+  else
+    lease_standing_worktree "$1" "$2" "$src"
+  fi
+}
+
+# Fills SEED_STANDING_PAIRS: recorded projects first, in record order, keeping
+# each recorded worktree that still exists, then each added project.
+lease_standing_worktrees() {  # <id> <home> <project>...
+  local id=$1 home=$2 project i n=0 known adopt
+  local rec_projects=() rec_wts=()
+  shift 2
+  if fm_standing_record_parse "$home/$FM_STANDING_RECORD"; then
+    if [ "$FM_STANDING_ID" != "$id" ]; then
+      echo "error: $home is a standing home for $FM_STANDING_ID, not $id" >&2
+      return 1
+    fi
+    rec_projects=("${FM_STANDING_PROJECTS[@]}")
+    rec_wts=("${FM_STANDING_WORKTREES[@]}")
+    n=${#rec_projects[@]}
+  elif fm_standing_home "$home"; then
+    echo "error: standing record at $home/$FM_STANDING_RECORD is unreadable; repair or remove it before re-seeding" >&2
+    return 1
+  fi
+  for ((i = 0; i < n; i++)); do
+    known=0
+    for project in "$@"; do
+      [ "$project" != "${rec_projects[$i]}" ] || known=1
+    done
+    if [ "$known" -eq 0 ]; then
+      echo "error: $home is a standing home for $id on ${rec_projects[$i]}; a re-seed must name every recorded project, or its leased worktree would be orphaned" >&2
+      return 1
+    fi
+    if [ -d "${rec_wts[$i]}" ]; then
+      if adopt=$(standing_adopt_path "${rec_projects[$i]}") && [ "$(resolved_path "$adopt")" != "${rec_wts[$i]}" ]; then
+        echo "error: ${rec_projects[$i]} already has the standing worktree ${rec_wts[$i]}; it cannot also adopt $adopt" >&2
+        return 1
+      fi
+      validate_standing_worktree "${rec_wts[$i]}" "$PROJECTS/${rec_projects[$i]}" "$home/projects/${rec_projects[$i]}" || return 1
+      SEED_STANDING_PAIRS+=("${rec_projects[$i]}" "${rec_wts[$i]}")
+    else
+      acquire_standing_worktree "$id" "${rec_projects[$i]}" || return 1
+    fi
+  done
+  for project in "$@"; do
+    known=0
+    for ((i = 0; i < n; i++)); do
+      [ "$project" != "${rec_projects[$i]}" ] || known=1
+    done
+    [ "$known" -eq 0 ] || continue
+    acquire_standing_worktree "$id" "$project" || return 1
+  done
+  SEED_STANDING_RECORD_CHANGED=1
+  [ "${#SEED_STANDING_PAIRS[@]}" -eq $((2 * n)) ] || return 0
+  for ((i = 0; i < n; i++)); do
+    [ "${SEED_STANDING_PAIRS[$((2 * i + 1))]}" = "${rec_wts[$i]}" ] || return 0
+  done
+  SEED_STANDING_RECORD_CHANGED=0
 }
 
 seed_home() {
   local id=$1 requested_home=$2 requested_abs home projects_csv project project_dst charter_summary charter_scope
-  local no_projects=0 arg
+  local no_projects=0 arg adopt want_adopt=0 i known
   local filtered=()
   shift 2
   # A deliberate --no-projects signal (anywhere in the project position) seeds a
   # project-less home; an accidental omission with no signal still fails loudly.
   for arg in "$@"; do
-    case "$arg" in
-      --no-projects) no_projects=1 ;;
-      --standing) SEED_STANDING=1 ;;
-      *) filtered+=("$arg") ;;
+    if [ "$want_adopt" -eq 1 ]; then
+      want_adopt=0
+      adopt=$arg
+    else
+      adopt=
+      case "$arg" in
+        --no-projects) no_projects=1 ;;
+        --standing) SEED_STANDING=1 ;;
+        --standing-worktree) want_adopt=1 ;;
+        --standing-worktree=*) adopt=${arg#--standing-worktree=} ;;
+        *) filtered+=("$arg") ;;
+      esac
+    fi
+    [ -n "$adopt" ] || continue
+    case "$adopt" in
+      ?*=/?*) ;;
+      *) echo "error: --standing-worktree takes <project>=<absolute-path>, not '$adopt'" >&2; return 1 ;;
     esac
+    SEED_STANDING_ADOPT+=("${adopt%%=*}" "${adopt#*=}")
   done
+  [ "$want_adopt" -eq 0 ] || { echo "error: --standing-worktree needs <project>=<absolute-path>" >&2; return 1; }
+  if [ "${#SEED_STANDING_ADOPT[@]}" -gt 0 ]; then
+    [ "$SEED_STANDING" -eq 1 ] || { echo "error: --standing-worktree applies only to a --standing seed" >&2; return 1; }
+    for ((i = 0; i < ${#SEED_STANDING_ADOPT[@]}; i += 2)); do
+      known=0
+      for arg in ${filtered[@]+"${filtered[@]}"}; do
+        [ "$arg" != "${SEED_STANDING_ADOPT[$i]}" ] || known=1
+      done
+      [ "$known" -eq 1 ] || filtered+=("${SEED_STANDING_ADOPT[$i]}")
+    done
+    [ "$(printf '%s\n' "${SEED_STANDING_ADOPT[@]}" | awk 'NR % 2' | sort | uniq -d)" = "" ] || {
+      echo "error: --standing-worktree names a project more than once" >&2
+      return 1
+    }
+  fi
   if [ "${#filtered[@]}" -gt 0 ]; then
     set -- "${filtered[@]}"
   else
     set --
   fi
   if [ "$SEED_STANDING" -eq 1 ]; then
-    [ "$no_projects" -eq 0 ] && [ $# -eq 1 ] || {
-      echo "error: --standing takes exactly one project: its one hands-on worktree is a copy of that project" >&2
+    [ "$no_projects" -eq 0 ] && [ $# -ge 1 ] || {
+      echo "error: --standing takes one or more projects: each gets one hands-on worktree" >&2
+      return 1
+    }
+    [ "$(printf '%s\n' "$@" | sort | uniq -d)" = "" ] || {
+      echo "error: --standing names a project more than once; each project gets exactly one hands-on worktree" >&2
       return 1
     }
   elif [ "$no_projects" -eq 1 ]; then
@@ -997,9 +1156,12 @@ seed_home() {
   SEED_CHARTER_EXISTED=0
   SEED_MARKER_EXISTED=0
   SEED_STANDING_RECORD_EXISTED=0
-  SEED_STANDING_WT=
-  SEED_STANDING_WT_SRC=
-  SEED_STANDING_WT_ACQUIRED=0
+  SEED_STANDING_PAIRS=()
+  SEED_STANDING_RECORD_CHANGED=0
+  SEED_STANDING_UNDO_WTS=()
+  SEED_STANDING_UNDO_SRCS=()
+  SEED_STANDING_UNDO_NAMES=()
+  SEED_STANDING_UNDO_HOLDERS=()
   if [ -f "$REG" ]; then
     SEED_PARENT_REG_EXISTED=1
     cp "$REG" "$SEED_BACKUP_DIR/parent-secondmates.md"
@@ -1063,6 +1225,10 @@ seed_home() {
     if [ "$no_projects" -eq 1 ]; then
       "$FM_ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects
     elif [ "$SEED_STANDING" -eq 1 ]; then
+      [ $# -eq 1 ] || {
+        echo "error: no filled standing charter brief at $SEED_PARENT_BRIEF; the scaffold names one project, so fill one before seeding several" >&2
+        return 1
+      }
       "$FM_ROOT/bin/fm-brief.sh" "$id" --standing "$@"
     else
       "$FM_ROOT/bin/fm-brief.sh" "$id" --secondmate "$@"
@@ -1084,22 +1250,24 @@ seed_home() {
     return 1
   }
 
-  for project in "$@"; do
-    project_dst=$(validate_project_destination "$home" "$project") || return 1
-    [ -e "$project_dst" ] || printf '%s\n' "$project_dst" >> "$SEED_CREATED_PROJECTS_FILE"
-    clone_project "$project" "$home"
-  done
-  sync_project_registry "$home" "$@"
-  for project in "$@"; do
-    project_dst=$(validate_project_destination "$home" "$project") || return 1
-    if seed_project_was_created "$project_dst"; then
-      initialize_no_mistakes_project "$home" "$project" 1
-    else
-      initialize_no_mistakes_project "$home" "$project" 0
-    fi
-  done
   if [ "$SEED_STANDING" -eq 1 ]; then
-    lease_standing_worktree "$id" "$home" "$1" || return 1
+    # Worktrees come from firstmate's own clones and pool, so the home holds no clone.
+    lease_standing_worktrees "$id" "$home" "$@" || return 1
+  else
+    for project in "$@"; do
+      project_dst=$(validate_project_destination "$home" "$project") || return 1
+      [ -e "$project_dst" ] || printf '%s\n' "$project_dst" >> "$SEED_CREATED_PROJECTS_FILE"
+      clone_project "$project" "$home"
+    done
+    sync_project_registry "$home" "$@"
+    for project in "$@"; do
+      project_dst=$(validate_project_destination "$home" "$project") || return 1
+      if seed_project_was_created "$project_dst"; then
+        initialize_no_mistakes_project "$home" "$project" 1
+      else
+        initialize_no_mistakes_project "$home" "$project" 0
+      fi
+    done
   fi
 
   cp "$SEED_PARENT_BRIEF" "$home/data/charter.md"
@@ -1116,8 +1284,11 @@ seed_home() {
     printf 'parent_home=%s\n' "$(resolved_path "$FM_HOME")"
   } > "$home/$SUB_HOME_PARENT_MARKER.tmp.$$"
   mv -f -- "$home/$SUB_HOME_PARENT_MARKER.tmp.$$" "$home/$SUB_HOME_PARENT_MARKER"
-  if [ "$SEED_STANDING" -eq 1 ]; then
-    fm_standing_record_write "$home" "$id" "$1" "$(resolved_path "$SEED_STANDING_WT")" || return 1
+  if [ "$SEED_STANDING" -eq 1 ] && [ "$SEED_STANDING_RECORD_CHANGED" -eq 1 ]; then
+    if [ "$SEED_STANDING_RECORD_EXISTED" -eq 1 ] && [ "$FM_STANDING_SCHEMA_READ" = "$FM_STANDING_SCHEMA_V1" ]; then
+      echo "notice: rewriting $home/$FM_STANDING_RECORD from $FM_STANDING_SCHEMA_V1 to $FM_STANDING_SCHEMA because its worktrees changed" >&2
+    fi
+    fm_standing_record_write "$home" "$id" "${SEED_STANDING_PAIRS[@]}" || return 1
   fi
   printf '%s\n' "$id" > "$home/$SUB_HOME_MARKER.tmp.$$"
   mv -f -- "$home/$SUB_HOME_MARKER.tmp.$$" "$home/$SUB_HOME_MARKER"

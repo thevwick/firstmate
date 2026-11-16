@@ -2256,6 +2256,7 @@ make_standing_case() {  # <name> -> case dir
   cat > "$case_dir/fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$(dirname "$0")/../treehouse.log"
+pwd -P >> "$(dirname "$0")/../treehouse.cwd"
 exit 0
 SH
   chmod +x "$case_dir/fakebin/treehouse"
@@ -2296,6 +2297,46 @@ test_standing_retirement_is_captain_only_and_returns_its_worktree() {
   expect_code 0 "$rc" "standing-retire-clean: a clean standing agent must retire when the captain asked: $(cat "$case_dir/stderr")"
   assert_grep "return --force $case_dir/wt" "$case_dir/treehouse.log" "standing-retire-clean: the leased worktree was not returned"
   pass "a standing agent retires only when the captain asked, never over unlanded work, and returns its worktree"
+}
+
+# A several-project standing agent: a second leased worktree of the case repo.
+# With stamp=1 the spawn stamp names it too; without, only the record does.
+make_multi_standing_case() {  # <name> <stamp> -> case dir
+  local case_dir
+  case_dir=$(make_standing_case "$1")
+  git -C "$case_dir/project" worktree add -q -b fm/second "$case_dir/wt2" main
+  fm_declare_standing_home "$case_dir/secondmate-home" task-x1 project "$case_dir/wt" second "$case_dir/wt2"
+  [ "$2" -eq 0 ] || printf 'standing_extra_worktree=%s\n' "$case_dir/wt2" >> "$case_dir/state/task-x1.meta"
+  printf '%s\n' "$case_dir"
+}
+
+# Retirement checks and returns every leased worktree, including one the
+# record gained after the agent's last launch stamped its task record.
+test_standing_retirement_checks_and_returns_every_worktree() {
+  local case_dir rc stamp
+  for stamp in 1 0; do
+    case_dir=$(make_multi_standing_case "standing-multi-$stamp" "$stamp")
+    git -C "$case_dir/wt2" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "second repo fix kept local"
+    printf 'draft\n' > "$case_dir/wt/untracked.txt"
+    rc=0
+    run_teardown "$case_dir" --captain-asked > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+    expect_code 1 "$rc" "standing-multi-$stamp: unlanded work in any worktree must refuse"
+    assert_grep "standing worktree $case_dir/wt has uncommitted changes" "$case_dir/stderr" \
+      "standing-multi-$stamp: the refusal did not name the first worktree's uncommitted work"
+    assert_grep "standing worktree $case_dir/wt2 has 1 local commit(s) on no remote" "$case_dir/stderr" \
+      "standing-multi-$stamp: the refusal did not name the second worktree's unlanded commit"
+    [ ! -e "$case_dir/treehouse.log" ] || fail "standing-multi-$stamp: a refused retirement returned a worktree"
+
+    rc=0
+    run_teardown "$case_dir" --captain-asked --force > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+    expect_code 0 "$rc" "standing-multi-$stamp: a captain-approved discard must retire the agent: $(cat "$case_dir/stderr")"
+    grep -qxF "return --force $case_dir/wt" "$case_dir/treehouse.log" || fail "standing-multi-$stamp: the first worktree was not returned"
+    grep -qxF "return --force $case_dir/wt2" "$case_dir/treehouse.log" || fail "standing-multi-$stamp: the second worktree was not returned"
+    assert_equals "$(cd "$case_dir/project" && pwd -P)" "$(sort -u "$case_dir/treehouse.cwd")" \
+      "standing-multi-$stamp: a worktree was not returned through the clone it is linked to"
+    assert_absent "$case_dir/secondmate-home" "standing-multi-$stamp: the standing home was not removed"
+  done
+  pass "a several-project standing agent never retires over unlanded work in any worktree, and returns them all"
 }
 
 # Return succeeds but leaves no readable worktree behind to verify.
@@ -6723,6 +6764,7 @@ test_dirty_return_warns_which_slot_was_lost
 test_dirty_return_warns_even_when_a_later_step_refuses
 test_forced_secondmate_child_scout_nested_clone_returns_clean
 test_standing_retirement_is_captain_only_and_returns_its_worktree
+test_standing_retirement_checks_and_returns_every_worktree
 test_forced_secondmate_dirty_child_return_warns_and_completes
 test_return_that_removes_copy_warns_cannot_verify
 test_scout_ignored_files_survive_scratch_clean
