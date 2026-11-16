@@ -315,6 +315,49 @@ fm_backend_rex_launcher_session() {
   printf '%s' "$REX_SESSION"
 }
 
+# fm_backend_rex_routed_session: the session a task is PINNED to by
+# config/rex-session-routes, or empty when nothing routes it. The captain's
+# own `cpt-` crews live in named sessions he keeps them in, and a spawn that
+# lands them wherever firstmate happens to run makes him move them by hand,
+# so the route is config rather than memory. Format is one `<pattern> <label
+# or session id>` per line, `#` comments and blank lines ignored, first match
+# wins, pattern matched against the bare task id with shell globbing. A label
+# resolves to the single session carrying it; a label matching none or several
+# is reported and the caller falls back rather than guessing a placement.
+fm_backend_rex_routed_session() {  # <task-id>
+  local id=$1 routes pattern target line sid matches count
+  routes="${FM_CONFIG_OVERRIDE:-${CONFIG:-$FM_HOME/config}}/rex-session-routes"
+  [ -f "$routes" ] && [ -r "$routes" ] || return 0
+  [ -n "$id" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    pattern=${line%%[[:space:]]*}
+    target=${line#"$pattern"}
+    target=${target#"${target%%[![:space:]]*}"}
+    [ -n "$target" ] || continue
+    # shellcheck disable=SC2254  # the pattern is a deliberate glob from config
+    case "$id" in
+      $pattern) ;;
+      *) continue ;;
+    esac
+    if fm_backend_rex_id_valid session "$target"; then
+      printf '%s' "$target"
+      return 0
+    fi
+    matches=$(fm_backend_rex_read api call session.list 2>/dev/null \
+      | jq -r --arg l "$target" '.sessions[]? | select(.label == $l) | .session_id' 2>/dev/null)
+    count=$(printf '%s' "$matches" | grep -c . || true)
+    if [ "$count" -eq 1 ]; then
+      sid=$(printf '%s' "$matches" | head -1)
+      printf '%s' "$sid"
+      return 0
+    fi
+    echo "warning: rex session route '$pattern -> $target' matches $count sessions; placing $id by the ordinary rule" >&2
+    return 0
+  done < "$routes"
+  return 0
+}
+
 # fm_backend_rex_session_lock / _unlock: one home-wide lock (the shared
 # stale-owner lock from bin/fm-wake-lib.sh, loaded on demand) that serializes
 # choosing or creating the per-home session plus opening a tab against killing
@@ -374,7 +417,14 @@ fm_backend_rex_create_task() {  # <label> <cwd> [launcher-home|other-home] [spaw
     return 1
   }
   sid=
-  if [ "$relationship" = launcher-home ]; then
+  # A configured route wins over the launcher session, so the captain's own
+  # crews land where he keeps them instead of wherever firstmate is running.
+  sid=$(fm_backend_rex_routed_session "${label#fm-}")
+  if [ -n "$sid" ] && ! fm_backend_rex_session_view "$sid" >/dev/null 2>&1; then
+    echo "warning: routed rex session $sid for '$label' is gone; placing it by the ordinary rule" >&2
+    sid=
+  fi
+  if [ -z "$sid" ] && [ "$relationship" = launcher-home ]; then
     sid=$(fm_backend_rex_launcher_session) || launcher_rc=$?
     [ -z "$sid" ] || launcher_rc=0
     if [ "$launcher_rc" -eq 1 ]; then

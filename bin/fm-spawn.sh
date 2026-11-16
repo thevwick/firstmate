@@ -2695,6 +2695,21 @@ if [ "$RELAUNCH" -eq 1 ]; then
     FM_REX_TASK_WINDOW_ID=$(fm_meta_get "$RELAUNCH_META" rex_window_id)
     FM_REX_TASK_BLOCK_ID=$(fm_meta_get "$RELAUNCH_META" rex_block_id)
     FM_REX_TASK_SERVER=$(fm_meta_get "$RELAUNCH_META" rex_server)
+    # A task routed to a session by config belongs there even when its record
+    # still names the session it was first spawned in, or a relaunch quietly
+    # re-pins it to the old one and the captain moves it by hand again. The
+    # recorded endpoint is dropped WHOLE rather than edited field by field,
+    # because a half-cleared record fails endpoint validation; the ordinary
+    # fresh-placement path then opens the tab in the routed session.
+    if declare -F fm_backend_rex_routed_session >/dev/null 2>&1; then
+      FM_REX_ROUTED_SESSION_ID=$(fm_backend_rex_routed_session "$ID" 2>/dev/null || true)
+      if [ -n "${FM_REX_ROUTED_SESSION_ID:-}" ] \
+        && [ "$FM_REX_ROUTED_SESSION_ID" != "$FM_REX_TASK_SESSION_ID" ]; then
+        FM_REX_TASK_SESSION_ID=
+        FM_REX_TASK_WINDOW_ID=
+        FM_REX_TASK_BLOCK_ID=
+      fi
+    fi
   fi
   # With no explicit harness, a relaunch reuses the harness already recorded
   # for this task. It must NOT fall through to the fresh-spawn config
