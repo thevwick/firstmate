@@ -400,6 +400,13 @@ if [ "$KIND" = ship ] && [ "$MODE" != local-only ] && [ "$PROJECT_DIR_SET" -eq 1
       ;;
   esac
 fi
+# Positionals are read below and under set -u a missing one aborts with a bash
+# internal error instead of saying what was wanted, so check arity first.
+if [ "${#POS[@]}" -eq 0 ]; then
+  echo "error: a task id is required" >&2
+  usage >&2
+  exit 2
+fi
 ID=${POS[0]}
 BRANCH="$BRANCH_PREFIX${FM_BRANCH_SLUG:-$ID}"
 if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
@@ -698,6 +705,11 @@ fi
 exit 0
 fi
 
+if [ "${#POS[@]}" -lt 2 ]; then
+  echo "error: a repo name is required after the task id (--project names a directory, not the repo)" >&2
+  usage >&2
+  exit 2
+fi
 REPO=${POS[1]}
 
 if [ "$HERDR_LAB" -eq 1 ]; then
