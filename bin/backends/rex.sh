@@ -369,9 +369,8 @@ fm_backend_rex_label_sessions() {  # <label>
     | jq -r --arg l "$1" '.sessions[]? | select(.label == $l) | .session_id' 2>/dev/null
 }
 
-# fm_backend_rex_create_task_routed: open a reclaimed task's tab in its routed
-# session, creating a routed label that no session carries yet, and print the
-# triple. Returns 3 when no route applies, 2 when a routed session id is gone.
+# Opens a reclaimed task's tab in its routed session, creating a missing routed
+# label; returns 3 when no route applies and 2 when a routed session id is gone.
 fm_backend_rex_create_task_routed() {  # <task-id> <label> <cwd>
   local id=$1 label=$2 cwd=$3 target sid='' wid='' bid='' matches count out rc=0
   target=$(fm_backend_rex_route_target "$id")
