@@ -65,7 +65,8 @@ T3 Code has no composer and its `/mcp` tools offer no session stop, so `exit` re
 Removing a worktree, closing an endpoint, or discarding work stays with [`bin/fm-teardown.sh`](../bin/fm-teardown.sh), which owns the landed-work test.
 
 **`resume` is not a verb.**
-It is not deterministic across the verified adapters: codex, grok, gemini, devin, commandcode, cortex, and kiro resume only from a session id printed at exit (kiro also has a cwd-scoped `--resume`, and its sessions live under the per-task `KIRO_HOME`), polytoken resumes only from a session id held in its own sessions registry, opencode continues the most recent session for the cwd, and claude, pi, pi-signed, omp, kimi, and agy have no verified general pane-resume contract.
+It is not deterministic across the verified adapters: codex, grok, gemini, devin, commandcode, cortex, and kiro resume only from a session id printed at exit (kiro also has a cwd-scoped `--resume`, and its sessions live under the per-task `KIRO_HOME`), polytoken resumes only from a session id held in its own sessions registry, opencode continues the most recent session for the cwd, and pi, pi-signed, omp, kimi, and agy have no verified general pane-resume contract.
+Claude resumes from the session id Firstmate records at launch; [crash recovery](#crash-recovery-for-claude-on-rex) owns that path, which is a separate command rather than a control verb.
 `relaunch` uses the brief on disk - not a harness-private session - as the durable instruction when the backend can prove the old agent stopped and the composer is empty; Devin on Herdr currently fails that composer check and refuses.
 T3 Code cannot host a fresh replacement agent in a thread, so `relaunch` refuses before stopping anything.
 A relaunch does take one session reference when the endpoint's own runtime recorded it - see [the relaunch transaction](#transactional-relaunch) - but that is a relaunch input, not a caller-facing verb.
@@ -170,6 +171,31 @@ The worktree and the task's records are unaffected either way.
 - A launch failure **after** the agent is stopped restores the prior durable record, keeps the progress note so a later recovery still has it, marks the journal `failed:launching`, and reports plainly that no agent is running and where the work is preserved.
 - If the launch owner already published the new record but no running agent can be confirmed, the new record is kept: the task is recorded on the new harness with no agent confirmed, which is exactly what recovery reconciles.
   Rewriting it back to the old harness would be a second, worse inaccuracy.
+
+## Crash recovery for Claude on Rex
+
+Every Claude launch starts its conversation under a minted id (`claude --session-id <uuid>`) and records it as `claude_session_id=` in the task record; the worker's own SessionStart hook rewrites it when the pane starts a new conversation, such as after `/clear`.
+The native resume form is `claude --resume <uuid>`, which continues the conversation under the same id from its transcript at `~/.claude/projects/<launch-dir-slug>/<uuid>.jsonl`.
+[`bin/fm-recover.sh`](../bin/fm-recover.sh) turns that into one repeatable recovery for every task this home records - ships, scouts, captain crews, secondmates, and standing agents:
+
+- claude still running in its pane is left alone;
+- an idle shell pane gets the exact resume launch, through `fm-spawn.sh <id> --relaunch --resume-session <uuid>` so the recorded model, effort, permission mode, directory grants, settings, and environment are rebuilt by the launch owner rather than retyped;
+- a gone pane is re-created in the task's routed Rex session (`config/rex-session-routes`, creating that labeled session when it is missing), else its recorded session, and the record rebinds to it;
+- a task with no recorded id is matched to the newest transcript in its launch directory that names the task, or reported.
+
+It prints the plan by default and acts only with `--apply`; it never touches a live claude, never tears anything down, and never starts a fresh conversation in place of a missing transcript.
+Resumed workers come back idle at their prompt, so steer each one to continue.
+`--backfill --apply` records ids for workers launched before ids were recorded without touching their panes.
+The session-start digest runs the plan as a dry run whenever a Claude worker's claude is gone and prints the exact `--apply` command; it never applies it.
+A secondmate whose claude is gone is resumed the same way by the secondmate liveness recovery when its transcript is on disk, instead of being respawned fresh.
+
+**After a full crash.**
+Open a terminal and run `bin/fm-recover.sh --primary --apply` from the primary home: it resumes the primary Firstmate conversation recorded in `state/primary-claude-session` in that terminal.
+The resumed primary's session start then prints the fleet plan; run its `--apply` command.
+`bin/fm-recover.sh --primary` alone prints the command instead of running it.
+
+Other harnesses and backends are reported, not resumed.
+A Rex server crash that loses the sessions themselves is reclaimed only as far as the ordinary relaunch placement allows; restoring the captain's whole session layout would need Rex to persist sessions across a server restart.
 
 ## Fail-closed boundaries
 

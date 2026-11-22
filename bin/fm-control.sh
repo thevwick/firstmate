@@ -115,7 +115,8 @@
 # landed-work test.
 #
 # `resume` is not a verb: it is not deterministic across the verified adapters
-# (bin/fm-control-lib.sh's header owns that reasoning). `relaunch` covers the
+# (bin/fm-control-lib.sh's header owns that reasoning); bin/fm-recover.sh owns
+# the Claude crash-recovery resume. `relaunch` covers the
 # same need where the backend can host a replacement because the brief on disk,
 # not a harness-private session, is the durable instruction.
 #
@@ -255,7 +256,7 @@ shift 2
 if ! fm_control_verb_allowed "$VERB"; then
   {
     if [ "$VERB" = resume ]; then
-      echo "error: 'resume' is not a control verb: resuming an exited agent is not deterministic across the verified adapters (codex and grok need a session id printed at exit, opencode continues the most recent session for the cwd, and claude, pi, pi-signed, and kimi have no verified pane-resume contract). Use 'relaunch', which carries the brief plus a progress note into a fresh agent on any adapter."
+      echo "error: 'resume' is not a control verb: resuming an exited agent is not deterministic across the verified adapters (codex and grok need a session id printed at exit, opencode continues the most recent session for the cwd, and pi, pi-signed, and kimi have no verified pane-resume contract). A Claude worker on Rex resumes its recorded conversation through bin/fm-recover.sh; otherwise use 'relaunch', which carries the brief plus a progress note into a fresh agent on any adapter."
     else
       echo "error: '$VERB' is not a control verb"
     fi
