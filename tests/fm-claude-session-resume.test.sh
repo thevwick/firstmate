@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Claude session identity and crash recovery: bin/fm-spawn.sh records and
-# resumes a conversation id, bin/fm-claude-session.sh keeps it current, and
-# bin/fm-recover.sh backfills ids and prints the primary's resume command.
-# Hermetic: a stub tmux pane and throwaway Claude config roots, no real agent.
+# Claude session identity and crash recovery, hermetically: a stub tmux pane and
+# throwaway Claude config roots, no real agent.
 set -u
 
 # shellcheck source=tests/lib.sh
