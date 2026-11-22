@@ -49,11 +49,9 @@ case "${1:-}" in
     exit 0 ;;
   display-message)
     for a in "$@"; do
-      case "$a" in
-        *cursor_y*) printf '1\n'; exit 0 ;;
-        *pane_current_command*) cat "$D/command"; printf '\n'; exit 0 ;;
-        *pane_current_path*) cat "$D/cwd"; printf '\n'; exit 0 ;;
-      esac
+      case "$a" in *cursor_y*) printf '1\n'; exit 0 ;; esac
+      case "$a" in *pane_current_command*) cat "$D/command"; printf '\n'; exit 0 ;; esac
+      case "$a" in *pane_current_path*) cat "$D/cwd"; printf '\n'; exit 0 ;; esac
     done
     printf 'fakepane\n'; exit 0 ;;
   capture-pane) printf '╭────╮\n│    │\n╰────╯\n'; exit 0 ;;
