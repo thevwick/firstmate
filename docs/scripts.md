@@ -148,6 +148,9 @@ The shared no-mistakes gate lifecycle boundary is summarized in [architecture.md
 | `fm-lease.sh`            | Claim, release, inspect, and sweep per-task supervision leases                       |
 | `fm-lease-lib.sh`        | One owner of the supervision lease contract and the main-only role-partition guards  |
 | `fm-control.sh`          | Agent lifecycle control plane: allowlisted `interrupt`, `exit`, and transactional `relaunch` verbs for an exact task id ([agent-control.md](agent-control.md)) |
+| `fm-recover.sh`          | Resume every recorded Claude worker on Rex after a crash or kill, backfill missing session ids, and print the primary's resume command ([agent-control.md](agent-control.md#crash-recovery-for-claude-on-rex)) |
+| `fm-claude-session.sh`   | Claude SessionStart hook that keeps a task record's `claude_session_id` current |
+| `fm-claude-session-lib.sh` | Single owner of Claude session identity: the recorded id, the primary's session record, and transcript lookups |
 | `fm-control-lib.sh`      | One executable owner of the control-plane verb allowlist, per-harness interrupt/exit mechanics, per-backend capability, and the endpoint-absence proof both `exit` and `relaunch` read |
 | `fm-busy-lib.sh`         | Single owner of the semantic busy-state contract: verdicts, source attribution, per-harness sources, and the optional Pi model-stream evidence and ordering contract |
 | `fm-busy-event.sh`       | The only writer of task busy and progress evidence under the contract in `fm-busy-lib.sh`; its header and help own lifecycle and optional stream operations |

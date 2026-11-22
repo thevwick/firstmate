@@ -325,7 +325,27 @@ fm_backend_rex_launcher_session() {
 # resolves to the single session carrying it; a label matching none or several
 # is reported and the caller falls back rather than guessing a placement.
 fm_backend_rex_routed_session() {  # <task-id>
-  local id=$1 routes pattern target line sid matches count
+  local id=$1 target matches count
+  target=$(fm_backend_rex_route_target "$id")
+  [ -n "$target" ] || return 0
+  if fm_backend_rex_id_valid session "$target"; then
+    printf '%s' "$target"
+    return 0
+  fi
+  matches=$(fm_backend_rex_label_sessions "$target")
+  count=$(printf '%s' "$matches" | grep -c . || true)
+  if [ "$count" -eq 1 ]; then
+    printf '%s' "$matches"
+    return 0
+  fi
+  echo "warning: rex session route for $id -> '$target' matches $count sessions; placing $id by the ordinary rule" >&2
+  return 0
+}
+
+# fm_backend_rex_route_target: the first matching route's target, a session id
+# or a session label, or nothing when no route matches.
+fm_backend_rex_route_target() {  # <task-id>
+  local id=$1 routes pattern target line
   routes="${FM_CONFIG_OVERRIDE:-${CONFIG:-$FM_HOME/config}}/rex-session-routes"
   [ -f "$routes" ] && [ -r "$routes" ] || return 0
   [ -n "$id" ] || return 0
@@ -334,28 +354,67 @@ fm_backend_rex_routed_session() {  # <task-id>
     pattern=${line%%[[:space:]]*}
     target=${line#"$pattern"}
     target=${target#"${target%%[![:space:]]*}"}
+    target=${target%"${target##*[![:space:]]}"}
     [ -n "$target" ] || continue
     # shellcheck disable=SC2254  # the pattern is a deliberate glob from config
     case "$id" in
-      $pattern) ;;
-      *) continue ;;
+      $pattern) printf '%s' "$target"; return 0 ;;
     esac
-    if fm_backend_rex_id_valid session "$target"; then
-      printf '%s' "$target"
-      return 0
-    fi
-    matches=$(fm_backend_rex_read api call session.list 2>/dev/null \
-      | jq -r --arg l "$target" '.sessions[]? | select(.label == $l) | .session_id' 2>/dev/null)
-    count=$(printf '%s' "$matches" | grep -c . || true)
-    if [ "$count" -eq 1 ]; then
-      sid=$(printf '%s' "$matches" | head -1)
-      printf '%s' "$sid"
-      return 0
-    fi
-    echo "warning: rex session route '$pattern -> $target' matches $count sessions; placing $id by the ordinary rule" >&2
-    return 0
   done < "$routes"
   return 0
+}
+
+fm_backend_rex_label_sessions() {  # <label>
+  fm_backend_rex_read api call session.list 2>/dev/null \
+    | jq -r --arg l "$1" '.sessions[]? | select(.label == $l) | .session_id' 2>/dev/null
+}
+
+# fm_backend_rex_create_task_routed: open a reclaimed task's tab in its routed
+# session, creating a routed label that no session carries yet, and print the
+# triple. Returns 3 when no route applies, 2 when a routed session id is gone.
+fm_backend_rex_create_task_routed() {  # <task-id> <label> <cwd>
+  local id=$1 label=$2 cwd=$3 target sid='' wid='' bid='' matches count out rc=0
+  target=$(fm_backend_rex_route_target "$id")
+  [ -n "$target" ] || return 3
+  fm_backend_rex_session_lock || {
+    echo "error: could not take the rex session lock; refusing to reclaim '$label'" >&2
+    return 1
+  }
+  if fm_backend_rex_id_valid session "$target"; then
+    sid=$target
+  else
+    matches=$(fm_backend_rex_label_sessions "$target")
+    count=$(printf '%s' "$matches" | grep -c . || true)
+    case "$count" in
+      1) sid=$matches ;;
+      0)
+        if ! out=$(fm_backend_rex_cli new "$target" --window "$label" --cwd "$cwd" --json); then
+          fm_backend_rex_session_unlock
+          echo "error: rex could not create the routed '$target' session for '$label'" >&2
+          return 1
+        fi
+        sid=$(printf '%s' "$out" | jq -r '.session_id // empty' 2>/dev/null)
+        wid=$(printf '%s' "$out" | jq -r '.initial_windows[0].window_id // empty' 2>/dev/null)
+        bid=$(printf '%s' "$out" | jq -r '.initial_windows[0].block_ids[0] // empty' 2>/dev/null)
+        ;;
+      *)
+        fm_backend_rex_session_unlock
+        echo "warning: rex session route for $id -> '$target' matches $count sessions; placing $id by the ordinary rule" >&2
+        return 3
+        ;;
+    esac
+  fi
+  if [ -z "$bid" ]; then
+    fm_backend_rex_open_tab_locked "$sid" "$label" "$cwd" reclaim || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      fm_backend_rex_session_unlock
+      return "$rc"
+    fi
+    wid=$FM_BACKEND_REX_NEW_WINDOW
+    bid=$FM_BACKEND_REX_NEW_BLOCK
+  fi
+  fm_backend_rex_session_unlock
+  fm_backend_rex_finish_tab "$sid" "$wid" "$bid" "$label"
 }
 
 # fm_backend_rex_session_lock / _unlock: one home-wide lock (the shared
@@ -419,7 +478,9 @@ fm_backend_rex_create_task() {  # <label> <cwd> [launcher-home|other-home] [spaw
   sid=
   # A configured route wins over the launcher session, so the captain's own
   # crews land where he keeps them instead of wherever firstmate is running.
-  sid=$(fm_backend_rex_routed_session "${label#fm-}")
+  # The label is the task id itself for an fm- or cpt- id, else fm-<id>.
+  sid=$(fm_backend_rex_routed_session "$label")
+  [ -n "$sid" ] || [ "$label" = "${label#fm-}" ] || sid=$(fm_backend_rex_routed_session "${label#fm-}")
   if [ -n "$sid" ] && ! fm_backend_rex_session_view "$sid" >/dev/null 2>&1; then
     echo "warning: routed rex session $sid for '$label' is gone; placing it by the ordinary rule" >&2
     sid=

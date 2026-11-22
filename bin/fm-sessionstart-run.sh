@@ -42,6 +42,8 @@
 # preflight. A lock another live session holds and a truncated digest are
 # reported inside the digest, while broken GitHub auth arrives through the
 # deferred network result inline or as a wake, for exactly that reason.
+# A Claude payload also records the primary's conversation id in
+# state/primary-claude-session (bin/fm-claude-session-lib.sh), for bin/fm-recover.sh --primary.
 # A fresh clone has no gitignored state dir yet; a root that otherwise
 # qualifies as primary gets one created here before the scope check runs, so
 # the first session takes the helm without a manual `mkdir state`.
@@ -61,6 +63,8 @@ COMPLETION_FILE="$STATE/.session-start-complete"
 . "$SCRIPT_DIR/fm-session-lock-lib.sh"
 # shellcheck source=bin/fm-hook-host-lib.sh
 . "$SCRIPT_DIR/fm-hook-host-lib.sh"
+# shellcheck source=bin/fm-claude-session-lib.sh
+. "$SCRIPT_DIR/fm-claude-session-lib.sh"
 
 SOURCE=
 PI_PREREQUISITE=0
@@ -128,6 +132,7 @@ if [ -z "$SOURCE" ] && [ ! -t 0 ]; then
   if fm_hook_payload_is_foreign_host "$PAYLOAD"; then
     exit 0
   fi
+  fm_claude_primary_record "$STATE" "$PAYLOAD" "$PPID" >/dev/null 2>&1 || true
   SOURCE=$(printf '%s' "$PAYLOAD" | awk '
     BEGIN { RS = "\"" }
     seen == 2 { print; exit }

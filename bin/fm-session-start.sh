@@ -59,6 +59,9 @@
 #                       ceiling is tasks x the per-read bound
 #                       (FM_SESSION_START_ENDPOINT_TIMEOUT, default 10s) and
 #                       can itself reach the digest's runtime bound.
+#                       It ends with bin/fm-recover.sh --digest's dry-run plan
+#                       for Claude workers whose claude is no longer running
+#                       (FM_SESSION_START_RECOVER_TIMEOUT, default 30s).
 #   7. network checks - the result of the deferred network stage started back at
 #                       step 1, harvested WITHOUT waiting for it.
 #   8. context digest - data/projects.md, data/secondmates.md, data/captain.md,
@@ -398,6 +401,8 @@ case "$QUEUED_LIMIT" in ''|*[!0-9]*|0) QUEUED_LIMIT=20 ;; esac
 # becomes that task's endpoint: error line instead of the digest's whole
 # runtime budget.
 ENDPOINT_TIMEOUT=${FM_SESSION_START_ENDPOINT_TIMEOUT:-10}
+RECOVER_TIMEOUT=${FM_SESSION_START_RECOVER_TIMEOUT:-30}
+case "$RECOVER_TIMEOUT" in ''|*[!0-9]*|0) RECOVER_TIMEOUT=30 ;; esac
 case "$ENDPOINT_TIMEOUT" in ''|*[!0-9]*) ENDPOINT_TIMEOUT=10 ;; esac
 [ "$ENDPOINT_TIMEOUT" -gt 0 ] 2>/dev/null || ENDPOINT_TIMEOUT=10
 BACKLOG_FIELDS=blocked_by,hold_kind,hold_reason
@@ -963,6 +968,19 @@ for meta in "$STATE"/*.meta; do
   fi
 done
 [ "$META_FOUND" -eq 1 ] || printf '(none)\n'
+
+# The endpoint lines above prove a pane exists, not that claude still runs in
+# it; after a crash this plan is the one-step recovery. It never applies.
+if [ "$META_FOUND" -eq 1 ]; then
+  recover_rc=0
+  recover_out=$(FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE fm_run_timed "$RECOVER_TIMEOUT" \
+    "$SCRIPT_DIR/fm-recover.sh" --digest 2>&1) || recover_rc=$?
+  if [ -n "$recover_out" ] || [ "$recover_rc" -ne 0 ]; then
+    subsection "Claude recovery (bin/fm-recover.sh)"
+    [ -z "$recover_out" ] || printf '%s\n' "$recover_out"
+    [ "$recover_rc" -eq 0 ] || printf 'recovery plan did not finish (exit %s, bound %ss); run bin/fm-recover.sh for it\n' "$recover_rc" "$RECOVER_TIMEOUT"
+  fi
+fi
 
 subsection "Orphan status logs (state/*.status without matching .meta)"
 ORPHAN_STATUS_FOUND=0

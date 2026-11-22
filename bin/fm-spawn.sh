@@ -99,6 +99,14 @@
 #   rebind is a recovery, never a teardown. Only a crewmate or scout rebinds: a
 #   secondmate whose endpoint is gone is respawned by its own owner
 #   (`--secondmate`, driven by the session-start liveness sweep).
+#        fm-spawn.sh <task-id> --relaunch --resume-session <uuid>
+#   --resume-session makes that relaunch CONTINUE a recorded Claude conversation
+#   (`claude --resume <uuid>`) instead of starting one, with the recorded model,
+#   effort, and account and no launch brief; harness, model, effort, and account
+#   overrides are refused, and a gone secondmate endpoint may rebind because the
+#   respawn path would start a fresh conversation. bin/fm-recover.sh drives it.
+#   Every Claude launch records claude_session_id= (bin/fm-claude-session-lib.sh
+#   owns the field): a fresh one passes `--session-id <minted uuid>`.
 #   Every fresh ship/scout launch and replacement explicitly enters the recorded
 #   worktree immediately before trust setup and brief delivery, and a pre-launch
 #   cwd check refuses any endpoint that still reports another copy; a Herdr shell
@@ -966,6 +974,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-secondmate-nudge-lib.sh"
 # shellcheck source=bin/fm-standing-lib.sh
 . "$SCRIPT_DIR/fm-standing-lib.sh"
+# shellcheck source=bin/fm-claude-session-lib.sh
+. "$SCRIPT_DIR/fm-claude-session-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-kimi-trust-lib.sh
@@ -1039,6 +1049,8 @@ WORKSPACE_SET=0
 ACCOUNT_ARG=
 ACCOUNT_SET=0
 RELAUNCH=0
+RESUME_SESSION=
+RESUME_SESSION_SET=0
 CAPTAIN_ASKED=0
 STANDING_WORKTREE=
 STANDING_WORKTREES=()
@@ -1101,6 +1113,10 @@ for a in "$@"; do
       TRACEPARENT_ARG=$a
       TRACEPARENT_SET=1
       ;;
+    resume-session)
+      RESUME_SESSION=$a
+      RESUME_SESSION_SET=1
+      ;;
     workspace)
       WORKSPACE_ARG=$a
       WORKSPACE_SET=1
@@ -1127,6 +1143,11 @@ for a in "$@"; do
     KIND_SET=1
     ;;
   --relaunch) RELAUNCH=1 ;;
+  --resume-session) want_value=resume-session ;;
+  --resume-session=*)
+    RESUME_SESSION=${a#--resume-session=}
+    RESUME_SESSION_SET=1
+    ;;
   --captain-asked) CAPTAIN_ASKED=1 ;;
   --herdr-resume-lock-wait) HERDR_RESUME_LOCK_WAIT=1 ;;
   --harness) want_value=harness ;;
@@ -1275,6 +1296,20 @@ esac
 # so every axis this block resolves for a fresh spawn instead comes from that
 # task's own durable record below. Contradicting it on the command line is a
 # refusal rather than a silently-ignored flag.
+if [ "$RESUME_SESSION_SET" -eq 1 ]; then
+  [ "$RELAUNCH" -eq 1 ] || {
+    echo "error: --resume-session continues an existing task's conversation; it needs --relaunch" >&2
+    exit 1
+  }
+  fm_claude_uuid_valid "$RESUME_SESSION" || {
+    echo "error: --resume-session needs a lowercase Claude session uuid, not '$RESUME_SESSION'" >&2
+    exit 1
+  }
+  [ "$HARNESS_SET" -eq 0 ] && [ "$MODEL_SET" -eq 0 ] && [ "$EFFORT_SET" -eq 0 ] && [ "$ACCOUNT_SET" -eq 0 ] || {
+    echo "error: --resume-session resumes the recorded profile exactly; --harness, --model, --effort, and --account cannot change it" >&2
+    exit 1
+  }
+fi
 if [ "$RELAUNCH" -eq 1 ]; then
   [ "$BACKEND_SET" -eq 0 ] || {
     echo "error: --relaunch reuses the task's recorded backend; --backend cannot override it" >&2
@@ -2608,9 +2643,20 @@ if [ "$RELAUNCH" -eq 1 ]; then
   # up (bin/fm-bootstrap.sh; the secondmate-provisioning skill). Rebinding one
   # here as well would be a second path to the same outcome, so this refuses
   # and names the one that owns it.
-  if [ "$RELAUNCH_REBIND" -eq 1 ] && [ "$KIND" = secondmate ]; then
+  # A Rex resume is the exception: that respawn would start a fresh conversation.
+  if [ "$RELAUNCH_REBIND" -eq 1 ] && [ "$KIND" = secondmate ] && { [ "$RESUME_SESSION_SET" -eq 0 ] || [ "$BACKEND" != rex ]; }; then
     echo "error: secondmate $ID's recorded endpoint is gone; its recovery is owned by the secondmate respawn path, not by relaunch (run bin/fm-spawn.sh $ID --secondmate, or let the session-start liveness sweep do it)" >&2
     exit 1
+  fi
+  if [ "$RESUME_SESSION_SET" -eq 1 ]; then
+    [ "$RELAUNCH_PRIOR_HARNESS" = claude ] || {
+      echo "error: --resume-session resumes Claude conversations only; task $ID records harness '${RELAUNCH_PRIOR_HARNESS:-none}'" >&2
+      exit 1
+    }
+    MODEL=$(fm_meta_get "$RELAUNCH_META" model)
+    EFFORT=$(fm_meta_get "$RELAUNCH_META" effort)
+    [ "$MODEL" != default ] || MODEL=
+    [ "$EFFORT" != default ] || EFFORT=
   fi
   MODE=$(fm_meta_get "$RELAUNCH_META" mode)
   YOLO=$(fm_meta_get "$RELAUNCH_META" yolo)
@@ -2697,21 +2743,6 @@ if [ "$RELAUNCH" -eq 1 ]; then
     FM_REX_TASK_WINDOW_ID=$(fm_meta_get "$RELAUNCH_META" rex_window_id)
     FM_REX_TASK_BLOCK_ID=$(fm_meta_get "$RELAUNCH_META" rex_block_id)
     FM_REX_TASK_SERVER=$(fm_meta_get "$RELAUNCH_META" rex_server)
-    # A task routed to a session by config belongs there even when its record
-    # still names the session it was first spawned in, or a relaunch quietly
-    # re-pins it to the old one and the captain moves it by hand again. The
-    # recorded endpoint is dropped WHOLE rather than edited field by field,
-    # because a half-cleared record fails endpoint validation; the ordinary
-    # fresh-placement path then opens the tab in the routed session.
-    if declare -F fm_backend_rex_routed_session >/dev/null 2>&1; then
-      FM_REX_ROUTED_SESSION_ID=$(fm_backend_rex_routed_session "$ID" 2>/dev/null || true)
-      if [ -n "${FM_REX_ROUTED_SESSION_ID:-}" ] \
-        && [ "$FM_REX_ROUTED_SESSION_ID" != "$FM_REX_TASK_SESSION_ID" ]; then
-        FM_REX_TASK_SESSION_ID=
-        FM_REX_TASK_WINDOW_ID=
-        FM_REX_TASK_BLOCK_ID=
-      fi
-    fi
   fi
   # With no explicit harness, a relaunch reuses the harness already recorded
   # for this task. It must NOT fall through to the fresh-spawn config
@@ -2990,7 +3021,7 @@ launch_template() {
     # record-backed doorbell: the full envelope is published into the receiving
     # home's state/operational-inbox before launch and only a printable doorbell
     # naming it is passed. A record that cannot be published stops the spawn.
-    printf '%s' '__MODELFLAG____EFFORTFLAG____BRIEFDOORBELL__'
+    printf '%s' '__CLAUDESESSION____MODELFLAG____EFFORTFLAG____BRIEFDOORBELL__'
     ;;
   # --disable hooks (equivalent to -c features.hooks=false) requests that codex
   # turn its whole lifecycle-hook layer off for CREWMATE and SCOUT launches only.
@@ -5081,17 +5112,33 @@ if [ "$RELAUNCH" -eq 1 ]; then
       echo "error: could not read the Rex server endpoint to record for $W" >&2
       exit 1
     }
+    # A configured route places the tab first, because the captain keeps routed
+    # tasks there; a secondmate's placement and lock follow its own home.
+    REX_LABEL_HOME=$FM_HOME
+    REX_LABEL_STATE=$STATE
+    REX_LAUNCHER_RELATIONSHIP=launcher-home
+    if [ "$KIND" = secondmate ]; then
+      REX_LABEL_HOME=$PROJ_ABS
+      REX_LABEL_STATE=$PROJ_ABS/state
+      REX_LAUNCHER_RELATIONSHIP=other-home
+    fi
     rex_rebind_status=0
-    REX_TASK_IDS=$(fm_backend_rex_create_task_in_session "$FM_REX_TASK_SESSION_ID" "$W" "$WT") \
-      || rex_rebind_status=$?
-    case "$rex_rebind_status" in
-      0) ;;
-      2) REX_TASK_IDS=$(fm_backend_rex_create_task "$W" "$WT" launcher-home reclaim) || exit 1 ;;
-      *)
-        echo "error: task $ID's endpoint could not be re-created in its recorded Rex session $FM_REX_TASK_SESSION_ID; see the refusal above for what failed" >&2
-        exit 1
-        ;;
-    esac
+    REX_TASK_IDS=$(FM_HOME="$REX_LABEL_HOME" FM_ROOT="$REX_LABEL_HOME" STATE="$REX_LABEL_STATE" CONFIG="$CONFIG" \
+      fm_backend_rex_create_task_routed "$ID" "$W" "$WT") || rex_rebind_status=$?
+    if [ "$rex_rebind_status" -eq 2 ] || [ "$rex_rebind_status" -eq 3 ]; then
+      rex_rebind_status=0
+      REX_TASK_IDS=$(FM_HOME="$REX_LABEL_HOME" FM_ROOT="$REX_LABEL_HOME" STATE="$REX_LABEL_STATE" \
+        fm_backend_rex_create_task_in_session "$FM_REX_TASK_SESSION_ID" "$W" "$WT") || rex_rebind_status=$?
+      if [ "$rex_rebind_status" -eq 2 ]; then
+        rex_rebind_status=0
+        REX_TASK_IDS=$(FM_HOME="$REX_LABEL_HOME" FM_ROOT="$REX_LABEL_HOME" STATE="$REX_LABEL_STATE" \
+          fm_backend_rex_create_task "$W" "$WT" "$REX_LAUNCHER_RELATIONSHIP" reclaim) || exit 1
+      fi
+    fi
+    if [ "$rex_rebind_status" -ne 0 ]; then
+      echo "error: task $ID's endpoint could not be re-created in its routed or recorded Rex session; see the refusal above for what failed" >&2
+      exit 1
+    fi
     read -r FM_REX_TASK_SESSION_ID FM_REX_TASK_WINDOW_ID FM_REX_TASK_BLOCK_ID <<EOF
 $REX_TASK_IDS
 EOF
@@ -6589,7 +6636,9 @@ BUSY_GEN=
     # undetected->1.x path both provision a busy-state plugin below that needs
     # this gen, so gating the arm on major >= 2 would leave OpenCode 1 without
     # the busy-state wiring it had before the OpenCode 2 port.
-    BUSY_GEN=$("$FM_ROOT/bin/fm-busy-event.sh" arm "$STATE_REAL" "$ID") || {
+    busy_seed=()
+    [ "$RESUME_SESSION_SET" -eq 0 ] || busy_seed=(--state idle --event resume)
+    BUSY_GEN=$("$FM_ROOT/bin/fm-busy-event.sh" arm "$STATE_REAL" "$ID" ${busy_seed[@]+"${busy_seed[@]}"}) || {
       echo "error: failed to arm the busy-state contract for $ID" >&2
       exit 1
     }
@@ -6646,6 +6695,7 @@ BUSY_GEN=
     j_submit=$(json_escape "$busy_cmd_prefix busy $busy_suffix --event user-prompt-submit 2>/dev/null || true")
     j_stopfail=$(json_escape "$busy_cmd_prefix idle $busy_suffix --event stop-failure 2>/dev/null || true")
     j_sessionend=$(json_escape "$busy_cmd_prefix idle $busy_suffix --event session-end 2>/dev/null || true")
+    j_sessionstart=$(json_escape "$(shell_quote "$FM_ROOT/bin/fm-claude-session.sh") record $(shell_quote "$STATE_REAL") $(shell_quote "$ID") 2>/dev/null || true")
     stop_entry=
     if [ "$KIND" = secondmate ] && grep -qF '.fm-busy-stop' "$WT/bin/fm-turnend-guard.sh" 2>/dev/null; then
       {
@@ -6663,7 +6713,7 @@ BUSY_GEN=
       j_stop=$(json_escape "${stop_turnend}$busy_cmd_prefix idle $busy_suffix --event stop 2>/dev/null || true")
       stop_entry="\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_stop\"}]}],"
     fi
-    hooks_json="\"hooks\":{\"UserPromptSubmit\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_submit\"}]}],${stop_entry}\"StopFailure\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_stopfail\"}]}],\"SessionEnd\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_sessionend\"}]}]}"
+    hooks_json="\"hooks\":{\"UserPromptSubmit\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_submit\"}]}],${stop_entry}\"StopFailure\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_stopfail\"}]}],\"SessionEnd\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_sessionend\"}]}],\"SessionStart\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"$j_sessionstart\"}]}]}"
     if [ "$KIND" = secondmate ]; then
       session_keys='"feedbackDrafts":"off",'
       if [ "$KEEP_AI_TRAILERS" != 1 ]; then
@@ -7392,6 +7442,17 @@ else
   fi
 fi
 
+CLAUDE_SESSION_ID=
+if [ "$HARNESS" = claude ] && [ "$RAW_LAUNCH" = 0 ] && [ "$BACKEND" != t3code ]; then
+  if [ "$RESUME_SESSION_SET" -eq 1 ]; then
+    CLAUDE_SESSION_ID=$RESUME_SESSION
+  else
+    CLAUDE_SESSION_ID=$(fm_claude_mint_session_id) || {
+      echo "error: could not mint a Claude session id for $ID" >&2
+      exit 1
+    }
+  fi
+fi
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
 [ "$BACKEND" = t3code ] && META_WINDOW=$W
@@ -7412,7 +7473,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness hermes_profile hermes_home kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential standing standing_worktree standing_extra_worktree", keys, " ")
+      split("window endpoint_task_id worktree project harness hermes_profile hermes_home kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen claude_session_id spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential standing standing_worktree standing_extra_worktree", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -7457,6 +7518,7 @@ preserve_relaunch_meta() {
   [ -z "$OMP_PROFILE_PIN" ] || echo "omp_profile=$OMP_PROFILE_PIN"
   [ "$HARNESS" != hermes ] || { echo "hermes_profile=$HERMES_PROFILE"; echo "hermes_home=$HERMES_PROFILE_HOME"; }
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
+  [ -z "$CLAUDE_SESSION_ID" ] || echo "claude_session_id=$CLAUDE_SESSION_ID"
   echo "spawn_gen=$SPAWN_GEN"
   # Default-off writes no traceparent= line.
   # backend= is written only for a non-default (non-tmux) backend, so the
@@ -7648,6 +7710,14 @@ if [ "$RELAUNCH" -eq 1 ]; then
   RESUME_ARGS=$(relaunch_resume_args "$HARNESS" "$BACKEND" "$T") || RESUME_ARGS=
 fi
 LAUNCH=${LAUNCH//__PIRESUME__/$RESUME_ARGS}
+CLAUDESESSIONFLAG=
+if [ -n "$CLAUDE_SESSION_ID" ] && [ "$RESUME_SESSION_SET" -eq 1 ]; then
+  CLAUDESESSIONFLAG="--resume $CLAUDE_SESSION_ID "
+  LAUNCH=${LAUNCH//__BRIEFDOORBELL__/}
+elif [ -n "$CLAUDE_SESSION_ID" ]; then
+  CLAUDESESSIONFLAG="--session-id $CLAUDE_SESSION_ID "
+fi
+LAUNCH=${LAUNCH//__CLAUDESESSION__/$CLAUDESESSIONFLAG}
 LAUNCH=${LAUNCH//__CLAUDEPERMFLAG__/$CLAUDE_PERM_FLAG}
 CLAUDE_EXCLUDE=
 [ -z "$EXCLUDE_TOOLS" ] || [ "$HARNESS" != claude ] || CLAUDE_EXCLUDE="--disallowedTools $(shell_quote "$EXCLUDE_TOOLS") "

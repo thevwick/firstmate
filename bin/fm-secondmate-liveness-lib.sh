@@ -27,6 +27,8 @@
 # live one - and an unreachable remote host is never evidence of death, so a
 # remote route is never replaced by a local endpoint.
 #
+# A local Rex Claude mate whose recorded session transcript is on disk resumes
+# it through `bin/fm-spawn.sh <id> --relaunch --resume-session` instead.
 # Replacement relaunch goes through `bin/fm-spawn.sh <id> --secondmate` with
 # FM_SPAWN_NO_GUARD=1, the same guarded path every recovery uses. A local mate
 # is pinned to its recorded backend. That path re-resolves placement from the
@@ -281,6 +283,21 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
   return 0
 }
 
+# The recorded Claude session a dead or gone local Rex mate resumes instead of
+# respawning fresh; fails when there is none on disk to continue.
+fm_secondmate_liveness_claude_session() {  # <meta>
+  local meta=$1 sid
+  [ "$(fm_meta_get "$meta" harness)" = claude ] && [ "$(fm_backend_of_meta "$meta")" = rex ] \
+    && [ -z "$(fm_meta_get "$meta" remote_host)" ] || return 1
+  if ! declare -F fm_claude_transcript_path >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-claude-session-lib.sh
+    . "$FM_SM_LIVE_LIB_DIR/fm-claude-session-lib.sh" || return 1
+  fi
+  sid=$(fm_meta_get "$meta" claude_session_id)
+  fm_claude_transcript_path "$(fm_meta_get "$meta" worktree)" "$sid" >/dev/null || return 1
+  printf '%s' "$sid"
+}
+
 # fm_secondmate_liveness_relaunch <meta> <id> [timeout-secs]
 #
 # Acts on a `relaunchable` probe verdict for <id>: takes the per-home relaunch
@@ -324,6 +341,23 @@ fm_secondmate_liveness_relaunch() {  # <meta> <id> [timeout-secs]
     FM_SM_LIVE_REASON="relaunch ledger $STATE/.secondmate-relaunch-$id is unwritable; endpoint left $FM_SM_LIVE_STATE"
     FM_SM_LIVE_RC=1
     return 1
+  fi
+  local resume_sid
+  if resume_sid=$(fm_secondmate_liveness_claude_session "$meta"); then
+    local -a resume_args=("$id" --relaunch --resume-session "$resume_sid")
+    if [ -n "$timeout" ]; then
+      FM_SM_LIVE_OUT=$(FM_SPAWN_NO_GUARD=1 fm_run_timed "$timeout" "$FM_ROOT/bin/fm-spawn.sh" "${resume_args[@]}" 2>&1) || rc=$?
+    else
+      FM_SM_LIVE_OUT=$(FM_SPAWN_NO_GUARD=1 "$FM_ROOT/bin/fm-spawn.sh" "${resume_args[@]}" 2>&1) || rc=$?
+    fi
+    FM_SM_LIVE_RC=$rc
+    if [ "$rc" -eq 0 ]; then
+      fm_secondmate_liveness_ledger_add "$id" relaunched || true
+    else
+      fm_secondmate_liveness_ledger_add "$id" failed || true
+    fi
+    fm_lock_release "$relaunch_lock" || true
+    return "$rc"
   fi
   if [ "$FM_SM_LIVE_KILL" = 1 ]; then
     local backend target window
