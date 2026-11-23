@@ -16,3 +16,8 @@ bin/fm-console/node_modules/
 .claude/settings.local.json
 
 .tools/
+
+# Sitemate-specific skills live in the private firstmate-sitemate repo, symlinked in
+.agents/skills/captain-voice
+.agents/skills/rfc-write
+.agents/skills/smm-ticket-write
