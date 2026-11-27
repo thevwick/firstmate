@@ -9,7 +9,7 @@ Start with the directory layout, then use the setting reference for the behavior
 | --- | --- |
 | Firstmate's code, private files, or project location | [FM_HOME](#fm_home) and [operational home layout](#operational-home-layout-and-state) |
 | Task windows and worker tools | [Runtime backend](#runtime-backend-configbackend--fm_backend) and [harness support](#harness-support) |
-| Worker permissions, accounts, or environment | [Codex approval review](#codex-automatic-approval-review), [Claude permission mode](#claude-permission-mode-configclaude-permission-mode), [Codex permission mode](#codex-permission-mode-configcodex-permission-mode), [persistent managed-policy failover](#persistent-managed-policy-failover), [worker account pin](#worker-account-pin-configclaude-account-configpi-account), [several Claude accounts](#several-claude-accounts-configclaude-accounts), [worker tool exclusions](#worker-tool-exclusions-configcrew-exclude-tools), [worker launch environment](#worker-launch-environment-configlaunch-env-allowlist), and its [Orca environment source](#orca-environment-source-configlaunch-env-tmux-session) |
+| Worker permissions, accounts, or environment | [Codex approval review](#codex-automatic-approval-review), [Claude permission mode](#claude-permission-mode-configclaude-permission-mode), [Codex permission mode](#codex-permission-mode-configcodex-permission-mode), [persistent managed-policy failover](#persistent-managed-policy-failover), [worker account pin](#worker-account-pin-configclaude-account-configpi-account), [several Claude accounts](#several-claude-accounts-configclaude-accounts), [several Codex accounts](#several-codex-accounts-configcodex-accounts), [worker tool exclusions](#worker-tool-exclusions-configcrew-exclude-tools), [worker launch environment](#worker-launch-environment-configlaunch-env-allowlist), and its [Orca environment source](#orca-environment-source-configlaunch-env-tmux-session) |
 | Backlog, preferences, and memory | [Backlog backend](#backlog-backend-taskstoml--configbacklog-backend), [captain preferences](#captain-preferences-datacaptainmd--datacaptain-sharedmd), [external memory tiers](#external-memory-tiers-memory-layering-section), [record export](#record-export-configrecord-export-root), [startup memory budget](#startup-memory-budget-configstartup-memory-budget), and [stow guard](#stow-guard-configstow-guard) |
 | Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), [Codex native Stop park](#codex-native-stop-park-configcodex-stop-park), [warm-cache compaction](#warm-cache-compaction-configwarm-compact), and [Calm preference](#calm-preference-configcalm) |
 | Persistent secondmates | [Secondmate routes](#secondmate-routes-datasecondmatesmd) |
@@ -439,7 +439,10 @@ Removing it stops further retries and leaves the current watcher for the ordinar
 
 Create the empty, home-local `config/codex-stop-park` file to let a Codex primary wait for watcher wakes outside the model between turns.
 The feature is off when the file is absent, and every Codex session then keeps the bounded foreground checkpoint protocol.
-With the file present, only an interactive native Codex session on the verified CLI version that holds this home's session lock parks; every other session keeps the foreground checkpoint.
+The park requires a native interactive Codex session registered through the project SessionStart hook and holding this home's session lock.
+The running Codex executable must report a canonical `codex-cli major.minor.patch` release at or above `0.163.0`, without leading zeroes, prerelease suffixes, or build metadata.
+A version below the minimum, malformed output, or a failed version probe leaves the session on the foreground checkpoint.
+[Runtime verification](verification/runtime-backends.md#native-codex-supervision-park) lists the releases exercised live.
 The supervision protocol is chosen when the session starts, so create or remove the file before starting the Codex session.
 The file is local to each home and is not inherited by secondmate homes.
 [The Codex protocol](supervision-protocols/codex.md) owns the parked operating protocol, and `bin/fm-codex-stop-park.sh` owns version selection, registration, and failure fallback.
@@ -1142,6 +1145,16 @@ The bound is required rather than cosmetic because churn and pane staleness read
 The flag is a home-local supervision-noise preference and is not inherited by secondmate homes, which run their own crew mix.
 [`architecture.md`](architecture.md) owns the triage contract and `bin/fm-watch.sh`'s `signal_turnend_panes_churned` owns the exact evidence and fail-closed boundaries.
 
+## Aborted-run turn-end absorb (config/turnend-abort-absorb)
+
+The optional local, gitignored `config/turnend-abort-absorb` presence flag opts this home into a default-off further form of positive work evidence for a bare turn-end.
+After a worker deliberately aborts a no-mistakes run and keeps working, current state keeps reading the aborted run until a fresh run starts, so every routine turn-end of that worker surfaces.
+With the flag present, a turn-end is absorbed when the task's current-state read is a run-step failed or unknown verdict naming a run that is terminal in the no-mistakes run store with an explicit abort record, and the busy-state verdict is exactly `busy <source>` and its busy-state record has a timestamp newer than that run's last update.
+The abort record is a `cancelled` status with the error `cancelled: aborted by user`, or a `failed` status with the error `step <name>: aborted by user` optionally followed by `: <reason>`, read from structured run-store fields and never from status-line prose.
+A run that failed for any other reason still surfaces, and with the flag absent behavior is unchanged.
+The flag is a home-local supervision-noise preference and is not inherited by secondmate homes.
+`bin/fm-classify-lib.sh`'s `crew_aborted_run_superseded_by_busy` owns the exact evidence and its refusal cases.
+
 ## Parked-gate wait deferral (config/wedge-defer-parked-gate)
 
 The optional local, gitignored `config/wedge-defer-parked-gate` presence flag opts this home into a default-off further form of wait evidence in the watcher's wedge timer.
@@ -1544,7 +1557,7 @@ Enabled primary-session turn-end guard integrations are tracked as repo-level ho
 Kimi remains outside the primary turn-end guard integrations; [`docs/turnend-guard.md`](turnend-guard.md#compatibility-limits) owns its separate captain-approved crew wake hook.
 Primary-session watcher wake protocols are rendered at session start by [`bin/fm-supervision-instructions.sh`](../bin/fm-supervision-instructions.sh) from [`docs/supervision-protocols/`](supervision-protocols/).
 
-Claude uses [hook-owned tokenless re-arm cycles](watcher-continuity.md#claude-stop-hook), Cursor's stop hook parks on the watcher, Grok uses background-notify cycles, Codex uses bounded foreground checkpoints unless the home opts in to its [native Stop park](#codex-native-stop-park-configcodex-stop-park), Pi and pi-signed use the same two tracked primary extensions, omp uses its own two tracked `.omp/extensions/` files with a blocking `session_stop` turn-end hook, and OpenCode uses its TUI plugin.
+Claude uses [hook-owned tokenless re-arm cycles](watcher-continuity.md#claude-stop-hook), Cursor's stop hook parks on the watcher, Grok uses background-notify cycles, Codex selects its mode under the [native Stop park policy](#codex-native-stop-park-configcodex-stop-park), Pi and pi-signed use the same two tracked primary extensions, omp uses its own two tracked `.omp/extensions/` files with a blocking `session_stop` turn-end hook, and OpenCode uses its TUI plugin.
 
 ### Choose the worker harness
 
@@ -1841,8 +1854,30 @@ A task with no recorded account, or one whose account is no longer declared, ref
 
 The list covers Claude ships and scouts only.
 A local secondmate's own agent never draws from it: under a list it needs its own [per-secondmate account pin](#per-secondmate-account-pins), and `--account` refuses for every secondmate, local or remote.
-Other runners ignore the list, and `--account` refuses for them.
+Other runners ignore the list, and `--account` refuses for them unless their own list exists, such as [`config/codex-accounts`](#several-codex-accounts-configcodex-accounts).
 Like the single pin, the list is not inherited into secondmate homes.
+
+### Several Codex accounts (config/codex-accounts)
+
+A Codex login lives in the directory `CODEX_HOME` names, `~/.codex` by default.
+A home with more than one ChatGPT plan can let each Codex ship and scout launch on whichever declared Codex home has quota to spare.
+Create `config/codex-accounts` with one account per line, each `ordinary` (the default `~/.codex`, launched with `CODEX_HOME` unset) or the absolute path of an existing Codex home:
+
+```text
+ordinary
+/home/me/.codex-second
+```
+
+Sign each one in once with `CODEX_HOME=<path> codex login`.
+A Codex home holds that account's whole Codex configuration, not only its login, so give a second home the `config.toml` settings its workers need; Codex asks once per home to trust a repository.
+
+The list follows the [Claude account list](#several-claude-accounts-configclaude-accounts) contract with these Codex specifics:
+
+- File format, opt-in behavior, the required `--account <entry>` on every Codex ship or scout spawn, the refusals, the `account=` record, and relaunch reuse are the same; without the list every Codex launch is unchanged and `--account` refuses.
+- [`bin/fm-codex-account-quota.sh`](../bin/fm-codex-account-quota.sh) measures each entry by running `quota-axi --provider codex --profile-only` under that entry's `CODEX_HOME`, and the [`quota-array-dispatch`](../.agents/skills/quota-array-dispatch/SKILL.md) procedure chooses the entry at intake.
+- The sign-in check is `codex login status`, run with the same stripped environment, and a signed-out entry refuses.
+- The launch sets `CODEX_HOME` to the chosen entry, or unsets it for `ordinary`, and unsets `CODEX_API_KEY` and `CODEX_ACCESS_TOKEN`, which Codex would otherwise spend instead of the stored login; `OPENAI_API_KEY` is not a Codex login and stays.
+- Codex has no single-account pin, so a Codex secondmate's own agent ignores the list and launches as it would without it, while `--account` still refuses for every secondmate.
 
 ### Per-secondmate account pins
 
